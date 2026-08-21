@@ -138,7 +138,8 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             "必须先用 write_todos 建立实现清单；每次只允许一个 in_progress，完成一项就更新为 completed。\n"
             "只能通过文件工具访问已授权路径；授权路径是逐项清单，不等于整个工作区。禁止网络、密钥、主 Harness 数据库和后续题目。\n"
             "源代码必须写入交接中指定的 target_source_path，验证输出只能写入同一 iteration 目录的 outputs 子目录。\n"
-            "完成后必须实际读取源文件并运行必要的本地验证。最终必须使用结构化输出字段 source_path、logical_name、timeout_seconds、expected_validations；不要把源代码放进最终回答。"
+            "交接信息已经包含建模契约和必要路径，不要循环读取报告清单。第一步直接调用 write_code_source 写入完整源代码；写入成功后再调用 python_execute 验证，必要时用 read_file 读取一次源文件。不要在写源代码前连续调用 ls/read_file。"
+            "完成后必须使用结构化输出字段 source_path、logical_name、timeout_seconds、expected_validations；不要把源代码放进最终回答。"
         )
         model_identifier = getattr(self.model, "model_name", None) or getattr(self.model, "model", None)
         if model_identifier:
@@ -152,7 +153,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         try:
             self._agent = create_deep_agent(
                 model=self.model,
-                tools=[self._python_execute_tool()],
+                tools=[self._write_code_source_tool(target_relative), self._python_execute_tool()],
                 backend=backend,
                 permissions=permissions,
                 skills=self.skills or None,
@@ -170,6 +171,43 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             self.close()
             raise DeepAgentsUnavailable(f"failed to compose DeepAgents Code Harness: {exc}") from exc
         return self._agent
+
+    def _write_code_source_tool(self, target_relative: str) -> Any:
+        """Write the one source artifact through a fixed, auditable boundary."""
+        from langchain_core.tools import tool
+        import tempfile
+
+        target = self._resolve_agent_path(target_relative)
+        workspace_root = self.workspace_root
+
+        @tool("write_code_source")
+        def write_code_source(source: str) -> str:
+            """将完整 Python 源码原子写入本轮交接指定的固定路径。"""
+            if not isinstance(source, str) or not source.strip():
+                return json.dumps({"ok": False, "error": "source must be non-empty"}, ensure_ascii=False)
+            if len(source.encode("utf-8")) > 2_000_000:
+                return json.dumps({"ok": False, "error": "source exceeds 2MB"}, ensure_ascii=False)
+            try:
+                _validate_python_policy(source)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                descriptor, temporary_name = tempfile.mkstemp(prefix=".m2h-source-", suffix=".py", dir=target.parent)
+                temporary = Path(temporary_name)
+                try:
+                    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                        stream.write(source)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, target)
+                finally:
+                    temporary.unlink(missing_ok=True)
+                return json.dumps(
+                    {"ok": True, "path": str(target.relative_to(workspace_root).as_posix()), "bytes": target.stat().st_size},
+                    ensure_ascii=False,
+                )
+            except Exception as exc:
+                return json.dumps({"ok": False, "error": str(exc)[:4_000]}, ensure_ascii=False)
+
+        return write_code_source
 
     def _python_execute_tool(self) -> Any:
         """Expose only the fixed local Python boundary to DeepAgents."""
