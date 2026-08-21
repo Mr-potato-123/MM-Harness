@@ -152,7 +152,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             "不要调用 ls、read_file、write_file、edit_file、glob、grep、execute 或 delete；这些文件工具已被运行时移除。"
             "Model→Code 交接契约已经完整放在本次用户消息中，不需要再次读取文件。只能生成一个目标 Python 文件，禁止创建辅助源码文件。"
             "python_execute 的当前工作目录就是目标源码所在的 iteration 目录；使用相对路径检查该文件和 outputs，不要把 Windows 绝对路径传给任何工具。"
-            "源码写入后最多执行一次语法/运行验证；若失败，立即修复并再次写入完整源码，禁止重复读取同一输出或循环诊断。"
+            "源码写入后最多执行四次语法/运行验证；若失败，立即修复并再次写入完整源码，禁止重复读取同一输出或循环诊断。第四次验证工具返回后必须立即输出结构化交接，不得再次调用工具。"
         )
         model_identifier = getattr(self.model, "model_name", None) or getattr(self.model, "model", None)
         if model_identifier:
@@ -167,9 +167,10 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                 ),
             )
         try:
+            todo_write, todo_read = self._todo_tools(target_relative)
             self._agent = create_deep_agent(
                 model=self.model,
-                tools=[self._write_code_source_tool(target_relative), self._python_execute_tool(target_relative)],
+                tools=[todo_write, todo_read, self._write_code_source_tool(target_relative), self._python_execute_tool(target_relative)],
                 backend=backend,
                 permissions=permissions,
                 skills=self.skills or None,
@@ -245,9 +246,66 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                     ensure_ascii=False,
                 )
             except Exception as exc:
-                return json.dumps({"ok": False, "error": str(exc)[:4_000]}, ensure_ascii=False)
+                payload = {"ok": False, "error": str(exc)[:4_000], "call_count": call_count}
+                if call_count >= 4:
+                    payload.update({
+                        "next_action": "return the structured CodeAgentHandoff now; do not call another tool",
+                        "forced_stop": True, "source_path": "/" + target_relative,
+                        "logical_name": Path(target_relative).name,
+                    })
+                return json.dumps(payload, ensure_ascii=False)
 
         return write_code_source
+
+    def _todo_tools(self, target_relative: str) -> tuple[Any, Any]:
+        """Provide the small persistent TODO lane even when no stock middleware is installed."""
+
+        from langchain_core.tools import tool
+
+        todo_path = self._resolve_agent_path(target_relative).parent.parent / "todo.json"
+
+        def _read() -> list[dict[str, Any]]:
+            if not todo_path.is_file() or todo_path.is_symlink():
+                return []
+            try:
+                value = json.loads(todo_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return []
+            return value if isinstance(value, list) else []
+
+        @tool("write_todos")
+        def write_todos(todos: list[dict[str, Any]]) -> str:
+            """写入本轮 Code Agent 的最小 TODO 清单；只能有一个 in_progress 项。"""
+
+            if not isinstance(todos, list) or len(todos) > 20:
+                return json.dumps({"ok": False, "error": "todos must be a list of at most 20 items"}, ensure_ascii=False)
+            normalized: list[dict[str, Any]] = []
+            in_progress = 0
+            for item in todos:
+                if not isinstance(item, dict):
+                    return json.dumps({"ok": False, "error": "each todo must be an object"}, ensure_ascii=False)
+                status = str(item.get("status", "pending"))
+                if status not in {"pending", "in_progress", "completed", "cancelled"}:
+                    return json.dumps({"ok": False, "error": f"invalid todo status: {status}"}, ensure_ascii=False)
+                in_progress += status == "in_progress"
+                normalized.append({
+                    "id": str(item.get("id", len(normalized) + 1))[:120],
+                    "content": str(item.get("content", item.get("task", "")))[:500],
+                    "status": status,
+                })
+            if in_progress > 1:
+                return json.dumps({"ok": False, "error": "only one todo may be in_progress"}, ensure_ascii=False)
+            todo_path.parent.mkdir(parents=True, exist_ok=True)
+            todo_path.write_text(json.dumps(normalized, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            return json.dumps({"ok": True, "path": todo_path.relative_to(self.workspace_root).as_posix(), "todos": normalized}, ensure_ascii=False)
+
+        @tool("read_todos")
+        def read_todos() -> str:
+            """读取本轮 Code Agent 的 TODO 清单。"""
+
+            return json.dumps({"ok": True, "path": todo_path.relative_to(self.workspace_root).as_posix(), "todos": _read()}, ensure_ascii=False)
+
+        return write_todos, read_todos
 
     def _python_execute_tool(self, target_relative: str) -> Any:
         """Expose only the fixed local Python boundary to DeepAgents."""
@@ -256,6 +314,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         sandbox = self.sandbox
         workspace_root = self.workspace_root
         target_directory = self._resolve_agent_path(target_relative).parent
+        call_count = 0
 
         @tool("python_execute")
         def python_execute(code: str, timeout_seconds: int = 120) -> str:
@@ -264,6 +323,8 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                 return json.dumps({"ok": False, "error": "code must be non-empty"}, ensure_ascii=False)
             if not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 600:
                 return json.dumps({"ok": False, "error": "timeout_seconds must be 1..600"}, ensure_ascii=False)
+            nonlocal call_count
+            call_count += 1
             try:
                 _validate_python_policy(code)
                 result = sandbox.run(
@@ -272,16 +333,20 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                     cwd=target_directory,
                     env={"PYTHONIOENCODING": "utf-8", "M2HARNESS_NETWORK": "deny"},
                 )
-                return json.dumps(
-                    {
+                payload = {
                         "ok": result.exit_code == 0 and not result.timed_out,
                         "exit_code": result.exit_code,
                         "timed_out": result.timed_out,
                         "stdout": result.stdout.decode("utf-8", errors="replace")[:200_000],
                         "stderr": result.stderr.decode("utf-8", errors="replace")[:200_000],
-                    },
-                    ensure_ascii=False,
-                )
+                        "call_count": call_count,
+                    }
+                if call_count >= 4:
+                    payload["next_action"] = "return the structured CodeAgentHandoff now; do not call another tool"
+                    payload["forced_stop"] = True
+                    payload["source_path"] = "/" + target_relative
+                    payload["logical_name"] = Path(target_relative).name
+                return json.dumps(payload, ensure_ascii=False)
             except Exception as exc:
                 return json.dumps({"ok": False, "error": str(exc)[:4_000]}, ensure_ascii=False)
 
