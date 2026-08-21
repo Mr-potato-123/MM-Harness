@@ -45,6 +45,22 @@ class CodeAgentHarnessContractTest(unittest.TestCase):
             self.assertFalse(rejected["ok"])
             self.assertIn("1..180", rejected["error"])
 
+    def test_timeout_requires_source_change_before_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / ".m2harness-code" / "q1" / "iteration-1" / "solve_q1.py"
+            target.parent.mkdir(parents=True)
+            target.write_text("while True:\n    pass\n", encoding="utf-8")
+            tool = self._provider(root)._python_execute_tool(
+                ".m2harness-code/q1/iteration-1/solve_q1.py"
+            )
+
+            first = json.loads(tool.invoke({"code": "while True: pass", "timeout_seconds": 1}))
+            self.assertTrue(first["timed_out"])
+            second = json.loads(tool.invoke({"code": "while True: pass", "timeout_seconds": 1}))
+            self.assertFalse(second["ok"])
+            self.assertIn("rewrite the target source", second["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

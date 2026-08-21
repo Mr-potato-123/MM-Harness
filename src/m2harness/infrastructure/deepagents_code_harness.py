@@ -14,6 +14,7 @@ an operator's observation window expires.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import sys
@@ -157,6 +158,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             "python_execute 的当前工作目录就是目标源码所在的 iteration 目录；使用相对路径检查该文件和 outputs，不要把 Windows 绝对路径传给任何工具。"
             "源码写入后最多执行四次语法/运行验证；若失败，立即修复并再次写入完整源码，禁止重复读取同一输出或循环诊断。第四次验证工具返回后必须立即输出结构化交接，不得再次调用工具。"
             "python_execute 已经负责外部超时；Windows 没有 signal.SIGALRM，验证代码禁止自行安装 SIGALRM 或假设 solve_dp 等不存在的函数。验证源码时只运行 import runpy; runpy.run_path('solve_q1.py', run_name='__main__')，并读取其 stdout JSON。"
+            "资源补给不得对三种资源做无界三重数量枚举；必须使用候选边界、需求驱动枚举或支配剪枝，并在超时后改变算法复杂度。"
         )
         model_identifier = getattr(self.model, "model_name", None) or getattr(self.model, "model", None)
         if model_identifier:
@@ -344,20 +346,41 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
 
         sandbox = self.sandbox
         workspace_root = self.workspace_root
-        target_directory = self._resolve_agent_path(target_relative).parent
+        target_path = self._resolve_agent_path(target_relative)
+        target_directory = target_path.parent
         call_count = 0
+        last_source_hash: str | None = None
+        rewrite_required = False
 
         @tool("python_execute")
-        def python_execute(code: str, timeout_seconds: int = 120) -> str:
+        def python_execute(code: str, timeout_seconds: int = 60) -> str:
             """在本地受控沙箱中执行一段 Python 验证代码；不得联网或运行 shell。"""
             if not isinstance(code, str) or not code.strip():
                 return json.dumps({"ok": False, "error": "code must be non-empty"}, ensure_ascii=False)
             if not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 180:
                 return json.dumps({"ok": False, "error": "timeout_seconds must be 1..180"}, ensure_ascii=False)
             nonlocal call_count
+            nonlocal last_source_hash, rewrite_required
             call_count += 1
             try:
                 _validate_python_policy(code)
+                source_hash = hashlib.sha256(target_path.read_bytes()).hexdigest() if target_path.is_file() else "missing"
+                if rewrite_required and source_hash == last_source_hash:
+                    payload = {
+                        "ok": False,
+                        "error": "the previous validation timed out; rewrite the target source before running it again",
+                        "call_count": call_count,
+                        "next_action": "call write_code_source with a materially simpler algorithm, then run python_execute",
+                    }
+                    if call_count >= 4:
+                        payload.update({
+                            "next_action": "return the structured CodeAgentHandoff now; do not call another tool",
+                            "forced_stop": True,
+                            "source_path": "/" + target_relative,
+                            "logical_name": Path(target_relative).name,
+                        })
+                    return json.dumps(payload, ensure_ascii=False)
+                rewrite_required = False
                 result = sandbox.run(
                     (sys.executable, "-I", "-c", code),
                     timeout_seconds=timeout_seconds,
@@ -372,6 +395,8 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                         "stderr": result.stderr.decode("utf-8", errors="replace")[:200_000],
                         "call_count": call_count,
                     }
+                last_source_hash = source_hash
+                rewrite_required = result.timed_out
                 if call_count >= 4:
                     payload["next_action"] = "return the structured CodeAgentHandoff now; do not call another tool"
                     payload["forced_stop"] = True
