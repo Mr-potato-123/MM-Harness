@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: deep-research
+version: 0.1.0
+description: Conduct bounded, evidence-bearing research for a modeling task before committing to a modeling route.
+modelInvocable: true
+userInvocable: false
+contextTokens: 1800
+requiresCapabilities: knowledge.search

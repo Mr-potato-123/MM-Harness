@@ -1,0 +1,9 @@
+apiVersion: m2harness/v1
+name: tabular-analysis
+version: 1.0.0
+description: Profile CSV/JSON/JSONL inputs deterministically before modeling, with schema, missingness, units, and leakage checks.
+entrypoint: SKILL.md
+contextTokens: 1700
+resources: references/profile-checklist.md
+requiresCapabilities: data.profile, artifact.read
+

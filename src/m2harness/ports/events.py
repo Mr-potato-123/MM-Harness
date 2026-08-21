@@ -1,0 +1,23 @@
+"""Persistence ports; implementations may be SQLite, PostgreSQL or remote."""
+
+from __future__ import annotations
+
+from contextlib import AbstractContextManager
+from typing import Protocol
+from uuid import UUID
+
+from m2harness.domain.events import DomainEvent, EventEnvelope
+
+
+class EventStorePort(Protocol):
+    def append(self, aggregate_id: UUID, expected_version: int, event: DomainEvent) -> EventEnvelope: ...
+    def list(self, aggregate_id: UUID) -> list[EventEnvelope]: ...
+    def verify(self) -> int: ...
+
+
+class UnitOfWorkPort(Protocol):
+    def __enter__(self) -> "UnitOfWorkPort": ...
+    def __exit__(self, exc_type, exc, traceback) -> None: ...
+    @property
+    def events(self) -> EventStorePort: ...
+    def commit(self) -> None: ...

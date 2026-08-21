@@ -1,0 +1,9 @@
+apiVersion: m2harness/v1
+name: problem-intake
+version: 1.0.0
+description: Normalize a single production question and its multimodal inputs into a bounded, provenance-preserving problem brief.
+entrypoint: SKILL.md
+contextTokens: 1800
+resources: references/brief-schema.md
+requiresCapabilities: document.read, image.inspect, artifact.read
+

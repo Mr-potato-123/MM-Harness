@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: claim-evidence
+version: 1.0.0
+description: Build a claim-to-artifact ledger so every published statement is traceable, bounded, and reviewable.
+entrypoint: SKILL.md
+contextTokens: 1700
+requiresCapabilities: artifact.read, report.review
+

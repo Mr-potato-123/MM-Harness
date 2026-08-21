@@ -1,0 +1,14 @@
+"""Code proposal contract used by the local Code Harness adapter."""
+
+from __future__ import annotations
+
+from pydantic import Field
+
+from m2harness.models import StrictModel
+
+
+class CodeProposal(StrictModel):
+    source: str = Field(min_length=1, max_length=2 * 1024 * 1024)
+    logical_name: str = Field(default="generated_solution.py", pattern=r"^[A-Za-z0-9._-]+\.py$", max_length=200)
+    timeout_seconds: int = Field(default=300, ge=1, le=600)
+    expected_validations: tuple[str, ...] = ()

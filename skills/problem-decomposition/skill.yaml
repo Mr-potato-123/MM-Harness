@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: problem-decomposition
+version: 1.0.0
+description: Decompose a production modeling question into traceable subproblems, interfaces, and validation checkpoints before coding.
+entrypoint: SKILL.md
+contextTokens: 1800
+resources: references/decomposition-template.md
+

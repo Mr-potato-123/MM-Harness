@@ -7,3 +7,15 @@ __pycache__/
 dist/
 build/
 ref_github/
+
+# Working reports / audits / guides (not core code)
+/M2Harness_*.md
+
+# Competition problem input (not core code)
+/2026B.pdf
+
+# Generated proof deliverables
+/deliverables/
+
+# Working notes on adopting reference implementations
+/docs/reference-adoption.md

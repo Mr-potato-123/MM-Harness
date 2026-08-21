@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: numerical-validation
+version: 1.0.0
+description: Validate numerical model outputs with reproducible checks, residual analysis, sensitivity, and failure diagnostics.
+entrypoint: SKILL.md
+contextTokens: 2200
+resources: references/validation-matrix.md
+requiresCapabilities: validation.numerical, python.execute, artifact.write

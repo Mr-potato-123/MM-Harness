@@ -62,11 +62,13 @@ class ReviewVerdict(StrEnum):
 
 class ArtifactKind(StrEnum):
     PROBLEM = "problem"
+    DAG_TASK_TABLE = "dag_task_table"
     INPUT = "input"
     MODELING_REPORT = "modeling_report"
     CODING_REPORT = "coding_report"
     REVIEW_REPORT = "review_report"
     FINAL_QUESTION_REPORT = "final_question_report"
+    FINAL_LATEX_PAPER = "final_latex_paper"
     SOURCE = "source"
     DATA = "data"
     FIGURE = "figure"
@@ -82,6 +84,10 @@ class HarnessSettings(StrictModel):
     activity_timeout_seconds: int = Field(default=1_800, ge=1, le=86_400)
     max_activity_attempts: int = Field(default=3, ge=1, le=20)
     max_revisions: int = Field(default=3, ge=0, le=20)
+    # Publication is a first-class output contract for the production report
+    # path.  Operators can disable the gate for legacy migrations, but a
+    # normal production run must publish both Markdown and compile-ready TeX.
+    require_latex_publication: bool = True
     executor_command: tuple[str, ...] | None = None
 
 
@@ -128,8 +134,8 @@ class ProducedArtifact(StrictModel):
     logical_name: NonEmptyStr
     kind: ArtifactKind = ArtifactKind.OTHER
     media_type: NonEmptyStr = "text/plain"
-    text: str | None = None
-    base64: str | None = None
+    text: Annotated[str, StringConstraints(max_length=10 * 1024 * 1024)] | None = None
+    base64: Annotated[str, StringConstraints(max_length=20 * 1024 * 1024)] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -140,11 +146,11 @@ class ProducedArtifact(StrictModel):
 
 
 class ReportPayload(StrictModel):
-    title: NonEmptyStr
-    markdown: NonEmptyStr
-    summary: NonEmptyStr
-    claims: list[NonEmptyStr] = Field(default_factory=list)
-    limitations: list[NonEmptyStr] = Field(default_factory=list)
+    title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
+    markdown: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2 * 1024 * 1024)]
+    summary: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=20_000)]
+    claims: list[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=8_000)]] = Field(default_factory=list, max_length=100)
+    limitations: list[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=8_000)]] = Field(default_factory=list, max_length=100)
     structured: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -165,6 +171,12 @@ class CodingStageOutput(StrictModel):
     metrics: dict[str, float | int | str | bool | None] = Field(default_factory=dict)
     artifacts: list[ProducedArtifact] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def successful_execution_requires_evidence(self) -> "CodingStageOutput":
+        if self.execution_succeeded and not self.artifacts:
+            raise ValueError("successful coding execution must include at least one evidence artifact")
+        return self
+
 
 class ReviewStageOutput(StrictModel):
     stage: Literal[StageKind.REVIEW]
@@ -182,6 +194,14 @@ class ReviewStageOutput(StrictModel):
 
 
 class FinalizeStageOutput(StrictModel):
+    """Reviewed report plus the publication artifacts emitted by the final task.
+
+    The Markdown report is materialized by the Harness from ``report``.  The
+    model must provide a separate ``final_latex_paper`` artifact when the
+    production publication gate is enabled; keeping it as an artifact avoids a
+    second provider-specific response field and lets other renderers be added
+    without changing this wire contract.
+    """
     stage: Literal[StageKind.FINALIZE]
     report: ReportPayload
     downstream_outputs: dict[str, Any] = Field(default_factory=dict)
@@ -244,6 +264,20 @@ class EventRecord(StrictModel):
     occurred_at: datetime
     previous_hash: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
     event_hash: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+
+
+class ClaimEvidenceRecord(StrictModel):
+    """A published claim linked to the immutable artifacts available to review."""
+
+    id: UUID
+    project_id: UUID
+    question_id: UUID
+    activity_id: UUID
+    revision: int = Field(ge=0)
+    claim_index: int = Field(ge=0)
+    claim: NonEmptyStr
+    evidence_artifact_ids: tuple[UUID, ...] = ()
+    created_at: datetime
 
 
 class WorkflowStepResult(StrictModel):

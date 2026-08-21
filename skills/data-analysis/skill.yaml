@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: data-analysis
+version: 1.0.0
+description: Inspect tabular inputs, profile schema and quality, and produce auditable analysis artifacts.
+entrypoint: SKILL.md
+contextTokens: 1800
+resources: references/profile-checklist.md
+requiresCapabilities: data.profile, artifact.read, artifact.write

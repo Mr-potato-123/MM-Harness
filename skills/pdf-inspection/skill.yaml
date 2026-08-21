@@ -1,0 +1,9 @@
+apiVersion: m2harness/v1
+name: pdf-inspection
+version: 1.0.0
+description: Inspect PDF inputs safely, preserving page-level provenance and distinguishing extracted text from visual-only evidence.
+entrypoint: SKILL.md
+contextTokens: 1600
+resources: references/pdf-evidence.md
+requiresCapabilities: document.read, artifact.read
+

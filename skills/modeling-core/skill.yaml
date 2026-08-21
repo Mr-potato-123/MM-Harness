@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: modeling-core
+version: 1.0.0
+description: Formalize a modeling question into assumptions, equations, validation contracts, and expected outputs.
+entrypoint: SKILL.md
+contextTokens: 2600
+resources: references/model-contract.md
+requiresCapabilities: modeling.formulate, artifact.read

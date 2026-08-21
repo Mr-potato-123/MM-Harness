@@ -18,6 +18,7 @@ from m2harness.models import (
     ActivityRecord,
     ActivityStatus,
     ArtifactRecord,
+    ClaimEvidenceRecord,
     EventRecord,
     ProjectRecord,
     QuestionRecord,
@@ -102,6 +103,18 @@ class HarnessStore:
                 CREATE INDEX IF NOT EXISTS idx_artifacts_question ON artifacts(question_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_events_question ON events(question_id, seq);
                 CREATE INDEX IF NOT EXISTS idx_activities_question ON activities(question_id, created_at);
+                CREATE TABLE IF NOT EXISTS claim_evidence (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                    question_id TEXT NOT NULL, activity_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL, claim_index INTEGER NOT NULL,
+                    claim TEXT NOT NULL, evidence_artifact_ids TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(activity_id, claim_index),
+                    FOREIGN KEY(project_id) REFERENCES projects(id),
+                    FOREIGN KEY(question_id) REFERENCES questions(id),
+                    FOREIGN KEY(activity_id) REFERENCES activities(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_claim_evidence_question ON claim_evidence(question_id, revision, claim_index);
                 """
             )
             versions = [row["version"] for row in connection.execute("SELECT version FROM schema_meta")]
@@ -202,6 +215,12 @@ class HarnessStore:
     def list_questions(self, project_id: UUID) -> list[QuestionRecord]:
         with self._connect() as connection:
             rows = connection.execute("SELECT * FROM questions WHERE project_id=? ORDER BY created_at", (str(project_id),)).fetchall()
+        return [_load_model(QuestionRecord, row) for row in rows]
+
+    def list_all_questions(self) -> list[QuestionRecord]:
+        """Return every question in deterministic creation order for audits."""
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM questions ORDER BY created_at,id").fetchall()
         return [_load_model(QuestionRecord, row) for row in rows]
 
     def _insert_artifact(self, connection: sqlite3.Connection, artifact: ArtifactRecord) -> None:
@@ -329,7 +348,7 @@ class HarnessStore:
             if row["status"] == ActivityStatus.SUCCEEDED.value:
                 return self._activity(row)
             live = row["status"] == ActivityStatus.RUNNING.value and row["lease_expires_at"] and row["lease_expires_at"] >= now.isoformat()
-            if live and row["worker_id"] != worker_id:
+            if live:
                 raise ConflictError(f"activity is leased by {row['worker_id']}")
             if row["attempt_count"] >= max_attempts:
                 raise ConflictError(f"activity exhausted {max_attempts} attempts")
@@ -340,14 +359,17 @@ class HarnessStore:
             row = connection.execute("SELECT * FROM activities WHERE id=?", (str(activity_id),)).fetchone()
         return self._activity(row)
 
-    def renew_activity_lease(self, activity_id: UUID, worker_id: str, lease_seconds: int) -> None:
+    def renew_activity_lease(self, activity_id: UUID, worker_id: str, lease_seconds: int, attempt_count: int | None = None) -> None:
         now, expires = utc_now(), utc_now() + timedelta(seconds=lease_seconds)
         with self._transaction() as connection:
-            cursor = connection.execute("UPDATE activities SET lease_expires_at=? WHERE id=? AND worker_id=? AND status=? AND lease_expires_at>=?", (expires.isoformat(), str(activity_id), worker_id, ActivityStatus.RUNNING.value, now.isoformat()))
+            if attempt_count is None:
+                cursor = connection.execute("UPDATE activities SET lease_expires_at=? WHERE id=? AND worker_id=? AND status=? AND lease_expires_at>=?", (expires.isoformat(), str(activity_id), worker_id, ActivityStatus.RUNNING.value, now.isoformat()))
+            else:
+                cursor = connection.execute("UPDATE activities SET lease_expires_at=? WHERE id=? AND worker_id=? AND attempt_count=? AND status=? AND lease_expires_at>=?", (expires.isoformat(), str(activity_id), worker_id, attempt_count, ActivityStatus.RUNNING.value, now.isoformat()))
             if cursor.rowcount != 1:
                 raise LeaseLostError("activity lease was lost")
 
-    def complete_activity(self, activity_id: UUID, worker_id: str, result_json: dict[str, Any], artifacts: list[ArtifactRecord]) -> ActivityRecord:
+    def complete_activity(self, activity_id: UUID, worker_id: str, result_json: dict[str, Any], artifacts: list[ArtifactRecord], *, attempt_count: int | None = None) -> ActivityRecord:
         now = utc_now()
         with self._transaction() as connection:
             row = connection.execute("SELECT * FROM activities WHERE id=?", (str(activity_id),)).fetchone()
@@ -355,25 +377,38 @@ class HarnessStore:
                 raise NotFoundError(f"activity not found: {activity_id}")
             if row["status"] == ActivityStatus.SUCCEEDED.value:
                 return self._activity(row)
-            if row["worker_id"] != worker_id or row["status"] != ActivityStatus.RUNNING.value or not row["lease_expires_at"] or row["lease_expires_at"] < now.isoformat():
+            if row["worker_id"] != worker_id or (attempt_count is not None and row["attempt_count"] != attempt_count) or row["status"] != ActivityStatus.RUNNING.value or not row["lease_expires_at"] or row["lease_expires_at"] < now.isoformat():
                 raise LeaseLostError("cannot complete an activity without its live lease")
             for artifact in artifacts:
                 if artifact.activity_id != activity_id or str(artifact.question_id) != row["question_id"]:
                     raise ValueError("artifact provenance does not match activity")
                 self._insert_artifact(connection, artifact)
+            output = result_json.get("output") if isinstance(result_json, dict) else None
+            report = output.get("report") if isinstance(output, dict) else None
+            claims = report.get("claims") if isinstance(report, dict) else None
+            if isinstance(claims, list):
+                prior_ids = [row["id"] for row in connection.execute("SELECT id FROM artifacts WHERE question_id=? ORDER BY created_at,id", (row["question_id"],)).fetchall()]
+                evidence_ids = list(dict.fromkeys([*prior_ids, *[str(item.id) for item in artifacts]]))
+                for index, claim in enumerate(claims):
+                    if not isinstance(claim, str) or not claim.strip():
+                        continue
+                    connection.execute(
+                        "INSERT OR IGNORE INTO claim_evidence(id,project_id,question_id,activity_id,revision,claim_index,claim,evidence_artifact_ids,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (str(new_uuid()), str(row["project_id"]), str(row["question_id"]), str(activity_id), int(row["revision"]), index, claim.strip(), _json(evidence_ids), now.isoformat()),
+                    )
             connection.execute("UPDATE activities SET status=?,result_json=?,worker_id=NULL,lease_expires_at=NULL,updated_at=? WHERE id=?", (ActivityStatus.SUCCEEDED.value, _json(result_json), now.isoformat(), str(activity_id)))
             self._append_event(connection, project_id=UUID(row["project_id"]), question_id=UUID(row["question_id"]), activity_id=activity_id,
                                event_type="activity.succeeded", payload={"artifact_ids": [str(item.id) for item in artifacts]})
             row = connection.execute("SELECT * FROM activities WHERE id=?", (str(activity_id),)).fetchone()
         return self._activity(row)
 
-    def fail_activity(self, activity_id: UUID, worker_id: str, error: str) -> ActivityRecord:
+    def fail_activity(self, activity_id: UUID, worker_id: str, error: str, *, attempt_count: int | None = None) -> ActivityRecord:
         now = utc_now(); error = error[:4000]
         with self._transaction() as connection:
             row = connection.execute("SELECT * FROM activities WHERE id=?", (str(activity_id),)).fetchone()
             if not row:
                 raise NotFoundError(f"activity not found: {activity_id}")
-            if row["worker_id"] != worker_id or row["status"] != ActivityStatus.RUNNING.value:
+            if row["worker_id"] != worker_id or (attempt_count is not None and row["attempt_count"] != attempt_count) or row["status"] != ActivityStatus.RUNNING.value or not row["lease_expires_at"] or row["lease_expires_at"] < now.isoformat():
                 raise LeaseLostError("cannot fail an activity owned by another worker")
             connection.execute("UPDATE activities SET status=?,error=?,worker_id=NULL,lease_expires_at=NULL,updated_at=? WHERE id=?", (ActivityStatus.FAILED.value, error, now.isoformat(), str(activity_id)))
             self._append_event(connection, project_id=UUID(row["project_id"]), question_id=UUID(row["question_id"]), activity_id=activity_id,
@@ -385,6 +420,32 @@ class HarnessStore:
         with self._connect() as connection:
             rows = connection.execute("SELECT * FROM activities WHERE question_id=? ORDER BY created_at", (str(question_id),)).fetchall()
         return [self._activity(row) for row in rows]
+
+    def list_claim_evidence(self, question_id: UUID) -> list[ClaimEvidenceRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM claim_evidence WHERE question_id=? ORDER BY created_at,id",
+                (str(question_id),),
+            ).fetchall()
+        result: list[ClaimEvidenceRecord] = []
+        for row in rows:
+            data = dict(row)
+            data["evidence_artifact_ids"] = tuple(UUID(item) for item in json.loads(data["evidence_artifact_ids"]))
+            result.append(ClaimEvidenceRecord.model_validate(data, strict=False))
+        return result
+
+    def verify_claim_evidence(self, question_id: UUID) -> int:
+        claims = self.list_claim_evidence(question_id)
+        for claim in claims:
+            for artifact_id in claim.evidence_artifact_ids:
+                artifact = self.get_artifact(artifact_id)
+                if artifact.question_id != question_id:
+                    raise ConflictError(f"claim evidence points outside question: {claim.id} -> {artifact_id}")
+        return len(claims)
+
+    def verify_all_claim_evidence(self) -> int:
+        """Verify claim-to-artifact ownership for every question in the DB."""
+        return sum(self.verify_claim_evidence(question.id) for question in self.list_all_questions())
 
     def _activity(self, row: sqlite3.Row) -> ActivityRecord:
         data = dict(row)

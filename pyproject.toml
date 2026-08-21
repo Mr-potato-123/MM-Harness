@@ -10,17 +10,62 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "pydantic>=2.10,<3",
+  "httpx>=0.27,<1",
+]
+
+[project.optional-dependencies]
+media = [
+  "Pillow>=10,<12",
+  "pypdf>=5,<7",
+]
+analytics = [
+  "numpy>=2,<3",
+  "pandas>=2.2,<3",
+  "matplotlib>=3.8,<4",
 ]
 
 [project.scripts]
 m2harness = "m2harness.cli:main"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = {"" = "src", "adapters" = "adapters"}
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "."]
+include = ["m2harness*", "adapters*"]
+
+[tool.setuptools.data-files]
+"share/m2harness/skills/modeling-core" = ["skills/modeling-core/SKILL.md", "skills/modeling-core/skill.yaml"]
+"share/m2harness/skills/modeling-core/references" = ["skills/modeling-core/references/model-contract.md"]
+"share/m2harness/skills/data-analysis" = ["skills/data-analysis/SKILL.md", "skills/data-analysis/skill.yaml"]
+"share/m2harness/skills/data-analysis/references" = ["skills/data-analysis/references/profile-checklist.md"]
+"share/m2harness/skills/numerical-validation" = ["skills/numerical-validation/SKILL.md", "skills/numerical-validation/skill.yaml"]
+"share/m2harness/skills/numerical-validation/references" = ["skills/numerical-validation/references/validation-matrix.md"]
+"share/m2harness/skills/report-review" = ["skills/report-review/SKILL.md", "skills/report-review/skill.yaml"]
+"share/m2harness/skills/report-review/references" = ["skills/report-review/references/review-checklist.md"]
+"share/m2harness/skills/problem-intake" = ["skills/problem-intake/SKILL.md", "skills/problem-intake/skill.yaml"]
+"share/m2harness/skills/problem-intake/references" = ["skills/problem-intake/references/brief-schema.md"]
+"share/m2harness/skills/problem-decomposition" = ["skills/problem-decomposition/SKILL.md", "skills/problem-decomposition/skill.yaml"]
+"share/m2harness/skills/problem-decomposition/references" = ["skills/problem-decomposition/references/decomposition-template.md"]
+"share/m2harness/skills/pdf-inspection" = ["skills/pdf-inspection/SKILL.md", "skills/pdf-inspection/skill.yaml"]
+"share/m2harness/skills/pdf-inspection/references" = ["skills/pdf-inspection/references/pdf-evidence.md"]
+"share/m2harness/skills/tabular-analysis" = ["skills/tabular-analysis/SKILL.md", "skills/tabular-analysis/skill.yaml"]
+"share/m2harness/skills/tabular-analysis/references" = ["skills/tabular-analysis/references/profile-checklist.md"]
+"share/m2harness/skills/model-selection" = ["skills/model-selection/SKILL.md", "skills/model-selection/skill.yaml"]
+"share/m2harness/skills/coding-contract" = ["skills/coding-contract/SKILL.md", "skills/coding-contract/skill.yaml"]
+"share/m2harness/skills/sandbox-execution" = ["skills/sandbox-execution/SKILL.md", "skills/sandbox-execution/skill.yaml"]
+"share/m2harness/skills/claim-evidence" = ["skills/claim-evidence/SKILL.md", "skills/claim-evidence/skill.yaml"]
+"share/m2harness/skills/report-rendering" = ["skills/report-rendering/SKILL.md", "skills/report-rendering/skill.yaml"]
+"share/m2harness/skills/latex-publication" = ["skills/latex-publication/SKILL.md", "skills/latex-publication/skill.yaml"]
+"share/m2harness/skills/latex-publication/references" = ["skills/latex-publication/references/layout-profile.md"]
+"share/m2harness/skills/local-network-policy" = ["skills/local-network-policy/SKILL.md", "skills/local-network-policy/skill.yaml"]
+"share/m2harness/skills/visualization" = ["skills/visualization/SKILL.md", "skills/visualization/skill.yaml"]
+"share/m2harness/skills/visualization/references" = ["skills/visualization/references/figure-contract.md"]
+"share/m2harness/skills/skill-review" = ["skills/skill-review/SKILL.md", "skills/skill-review/skill.yaml"]
+"share/m2harness/skills/skill-review/references" = ["skills/skill-review/references/review-rubric.md"]
+"share/m2harness/skills/skill-review/evals" = ["skills/skill-review/evals/cases.json"]
+"share/m2harness/skills/deep-research" = ["skills/deep-research/SKILL.md", "skills/deep-research/skill.yaml"]
+"share/m2harness/skills/modeling-knowledge" = ["skills/modeling-knowledge/SKILL.md", "skills/modeling-knowledge/skill.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-

@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: local-network-policy
+version: 1.0.0
+description: Keep a run local-first by making model-provider and web-search egress explicit, allowlisted, and auditable.
+entrypoint: SKILL.md
+contextTokens: 1300
+requiresCapabilities: web.search
+

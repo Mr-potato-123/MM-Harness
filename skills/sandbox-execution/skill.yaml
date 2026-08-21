@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: sandbox-execution
+version: 1.0.0
+description: Execute model code inside the configured local sandbox and turn stdout, logs, outputs, and exit status into admissible evidence.
+entrypoint: SKILL.md
+contextTokens: 1700
+requiresCapabilities: python.execute, workspace.write, artifact.write
+

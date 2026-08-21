@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: coding-contract
+version: 1.0.0
+description: Convert a reviewed model into deterministic, inspectable source with explicit inputs, outputs, metrics, and failure behavior.
+entrypoint: SKILL.md
+contextTokens: 1900
+requiresCapabilities: python.execute, artifact.read, artifact.write
+

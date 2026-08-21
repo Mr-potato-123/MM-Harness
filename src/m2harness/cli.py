@@ -3,23 +3,79 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import mimetypes
+import os
+import shutil
 import sys
+import tempfile
+from urllib.parse import urlsplit
 from pathlib import Path
 from uuid import UUID
 
 from m2harness.artifacts import ArtifactStore
-from m2harness.executor import CommandActivityExecutor
+from m2harness.executor import CommandActivityExecutor, SandboxedActivityExecutor
 from m2harness.models import ArtifactKind, HarnessSettings
 from m2harness.store import HarnessStore
 from m2harness.workflow import SingleQuestionWorkflow
+from m2harness.application.runtime_bundle import build_local_runtime, default_skill_root
+from m2harness.infrastructure.db.tool_runs import SQLiteToolAuditStore
+from m2harness.infrastructure.db.sqlite_artifacts import SQLiteArtifactRegistry
+from m2harness.domain.dag import canonical_single_question_dag
+
+MAX_INPUT_FILE_BYTES = 200 * 1024 * 1024
 
 
 def _emit(value: object) -> None:
     if hasattr(value, "model_dump"):
         value = value.model_dump(mode="json")  # type: ignore[union-attr]
     print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def _writable_directory(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix=".m2h-preflight-", dir=path, delete=True):
+            pass
+        return True
+    except OSError:
+        return False
+
+
+def _resolve_adapter_path(value: Path) -> Path:
+    """Resolve a CLI adapter from cwd, then from the source checkout.
+
+    The second lookup keeps an installed/packaged CLI usable when an operator
+    invokes it outside the repository root, while preserving an explicit cwd
+    override for deployment-specific adapters.
+    """
+    candidate = value if value.is_absolute() else (Path.cwd() / value)
+    if candidate.is_file():
+        return candidate.resolve()
+    checkout_candidate = Path(__file__).resolve().parents[2] / value
+    if checkout_candidate.is_file():
+        return checkout_candidate.resolve()
+    if value.as_posix().replace("\\", "/") == "adapters/qwen38_max.py":
+        spec = importlib.util.find_spec("adapters.qwen38_max")
+        if spec is not None and spec.origin and spec.origin not in {"built-in", "frozen"}:
+            bundled = Path(spec.origin)
+            if bundled.is_file():
+                return bundled.resolve()
+    return checkout_candidate.resolve()
+
+
+def _read_input_file(path: Path) -> bytes:
+    path = path.resolve()
+    if not path.is_file():
+        raise FileNotFoundError(str(path))
+    size = path.stat().st_size
+    if size > MAX_INPUT_FILE_BYTES:
+        raise ValueError(f"input file exceeds the {MAX_INPUT_FILE_BYTES} byte Harness budget")
+    data = path.read_bytes()
+    if len(data) != size:
+        raise OSError(f"input file changed while reading: {path}")
+    return data
 
 
 def _settings(args: argparse.Namespace) -> HarnessSettings:
@@ -58,10 +114,24 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("question_id", type=UUID)
     run.add_argument("--worker-id", required=True)
     run.add_argument("--executor", nargs=argparse.REMAINDER, required=True)
+    qwen = commands.add_parser("run-qwen")
+    qwen.add_argument("question_id", type=UUID)
+    qwen.add_argument("--worker-id", required=True)
+    qwen.add_argument("--adapter", type=Path, default=Path("adapters/qwen38_max.py"))
+    qwen.add_argument("--model", default=None)
+    qwen.add_argument("--allow-remote-code-interpreter", action="store_true", help="preliminary provider-only run; remote execution can never satisfy the production evidence gate")
+    commands.add_parser("catalog")
+    preflight = commands.add_parser("preflight")
+    preflight.add_argument("--input", type=Path, default=None)
+    preflight.add_argument("--qwen", action="store_true", help="require the Qwen provider secret for run-qwen")
     status = commands.add_parser("status")
     status.add_argument("question_id", type=UUID)
     verify = commands.add_parser("verify")
     verify.add_argument("--verify-artifacts", action="store_true")
+    export = commands.add_parser("export-audit")
+    export.add_argument("question_id", type=UUID)
+    export.add_argument("output", type=Path)
+    export.add_argument("--overwrite", action="store_true")
     return parser
 
 
@@ -80,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
         _emit(store.create_project(args.name))
         return 0
     if args.command == "add-question":
-        data = args.problem_file.read_bytes()
+        data = _read_input_file(args.problem_file)
         artifact_store = ArtifactStore(settings.artifact_root)
         media_type = mimetypes.guess_type(args.problem_file.name)[0] or "application/octet-stream"
         problem = artifact_store.put_bytes(
@@ -88,35 +158,124 @@ def main(argv: list[str] | None = None) -> int:
             kind=ArtifactKind.PROBLEM, logical_name=args.problem_file.name,
             media_type=media_type,
         )
-        _emit(store.create_question(args.project_id, args.key, args.title, problem))
+        question = store.create_question(args.project_id, args.key, args.title, problem)
+        registry = SQLiteArtifactRegistry(settings.database_path)
+        registry.register(store.get_artifact(question.problem_artifact_id))
+        table = canonical_single_question_dag()
+        dag = artifact_store.put_bytes(
+            table.model_dump_json(indent=2).encode("utf-8"), project_id=question.project_id,
+            question_id=question.id, activity_id=None, kind=ArtifactKind.DAG_TASK_TABLE,
+            logical_name=f"{question.key}-dag-task-table.json", media_type="application/json",
+            metadata={"schema_version": table.schema_version, "terminal_task_id": table.terminal_task_id, "topological_order": table.topological_order()},
+        )
+        registry.register(store.register_artifact(dag))
+        _emit(question)
         return 0
     if args.command == "add-input":
         question = store.get_question(args.question_id)
         artifact_store = ArtifactStore(settings.artifact_root)
         media_type = mimetypes.guess_type(args.input_file.name)[0] or "application/octet-stream"
         artifact = artifact_store.put_bytes(
-            args.input_file.read_bytes(), project_id=question.project_id,
+            _read_input_file(args.input_file), project_id=question.project_id,
             question_id=question.id, activity_id=None, kind=ArtifactKind(args.kind),
             logical_name=args.input_file.name, media_type=media_type,
         )
-        _emit(store.register_artifact(artifact))
+        registered = store.register_artifact(artifact)
+        SQLiteArtifactRegistry(settings.database_path).register(registered)
+        _emit(registered)
         return 0
     if args.command == "run-question":
         if not args.executor:
             raise SystemExit("--executor must be followed by an executable and arguments")
         executor = CommandActivityExecutor(
             args.executor, timeout_seconds=settings.activity_timeout_seconds,
-            pass_env=("DASHSCOPE_API_KEY", "QWEN_BASE_URL", "QWEN_MODEL"),
-            environment={"M2HARNESS_ARTIFACT_ROOT": str(settings.artifact_root.resolve())},
+            pass_env=("DASHSCOPE_API_KEY", "QWEN_BASE_URL", "QWEN_MODEL", "QWEN_MAX_OUTPUT_TOKENS", "M2HARNESS_MODEL_HOSTS", "QWEN_ENABLE_REMOTE_CODE_INTERPRETER"),
+            environment={"M2HARNESS_ARTIFACT_ROOT": str(settings.artifact_root.resolve()), "M2HARNESS_SKILL_ROOT": str(default_skill_root())},
         )
-        workflow = SingleQuestionWorkflow(settings, executor)
+        workflow = SingleQuestionWorkflow(settings, executor, artifact_registry=SQLiteArtifactRegistry(settings.database_path))
         _emit(workflow.run_until_terminal(args.question_id, args.worker_id))
         return 0
+    if args.command == "run-qwen":
+        runtime = build_local_runtime(database_path=settings.database_path, artifact_root=settings.artifact_root, allow_host_sandbox=True)
+        if not runtime.sandbox.available and not args.allow_remote_code_interpreter:
+            raise RuntimeError("local_execution_disabled: set M2HARNESS_SANDBOX_BACKEND=host or configure Docker/VM; --allow-remote-code-interpreter is provider-only and cannot complete a report")
+        if not os.environ.get("DASHSCOPE_API_KEY"):
+            raise RuntimeError("DASHSCOPE_API_KEY is required for run-qwen; inject it through the process environment or a secret provider")
+        adapter = _resolve_adapter_path(args.adapter)
+        if not adapter.is_file():
+            raise FileNotFoundError(f"Qwen adapter not found: {adapter}")
+        environment = {"M2HARNESS_ARTIFACT_ROOT": str(settings.artifact_root.resolve()), "M2HARNESS_SKILL_ROOT": str(default_skill_root())}
+        if args.model:
+            environment["QWEN_MODEL"] = args.model
+        if args.allow_remote_code_interpreter and not runtime.sandbox.available:
+            # This is an explicit preliminary-provider mode.  The workflow's
+            # Qwen evidence gate still prevents a remote result from reaching
+            # APPROVED/COMPLETED.
+            environment["QWEN_ENABLE_REMOTE_CODE_INTERPRETER"] = "1"
+        executor = CommandActivityExecutor(
+            [sys.executable, str(adapter)], timeout_seconds=settings.activity_timeout_seconds,
+            pass_env=("DASHSCOPE_API_KEY", "QWEN_BASE_URL", "QWEN_MODEL", "QWEN_MAX_OUTPUT_TOKENS", "M2HARNESS_MODEL_HOSTS", "QWEN_ENABLE_REMOTE_CODE_INTERPRETER"), environment=environment,
+        )
+        if runtime.sandbox.available:
+            executor = SandboxedActivityExecutor(
+                executor, runtime.sandbox, ArtifactStore(settings.artifact_root),
+                timeout_seconds=min(settings.activity_timeout_seconds, 600),
+                image_digest=getattr(runtime.sandbox, "image_digest", None),
+            )
+        workflow = SingleQuestionWorkflow(settings, executor, artifact_registry=runtime.artifact_registry)
+        _emit(workflow.run_until_terminal(args.question_id, args.worker_id))
+        return 0
+    if args.command == "catalog":
+        runtime = build_local_runtime(database_path=settings.database_path, artifact_root=settings.artifact_root)
+        _emit({
+            "skills": [item.model_dump(mode="json") for item in runtime.skills.list()],
+            "tools": [item.model_dump(mode="json") for item in runtime.tools.catalog()],
+            "capabilities": [item.model_dump(mode="json") for item in runtime.capabilities.list()],
+        })
+        return 0
+    if args.command == "preflight":
+        runtime = build_local_runtime(database_path=settings.database_path, artifact_root=settings.artifact_root)
+        adapter = _resolve_adapter_path(Path("adapters/qwen38_max.py"))
+        provider_url = os.environ.get("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+        provider_parts = urlsplit(provider_url)
+        provider_host = (provider_parts.hostname or "").lower()
+        configured_hosts = {item.strip().lower() for item in os.environ.get("M2HARNESS_MODEL_HOSTS", "dashscope.aliyuncs.com").split(",") if item.strip()}
+        checks = {
+            "database_parent_writable": _writable_directory(settings.database_path.parent.resolve()),
+            "artifact_root_ready": _writable_directory(settings.artifact_root.resolve()),
+            "skills_loaded": len(runtime.skills.list()) > 0,
+            "tools_registered": len(runtime.tools.catalog()) >= 10,
+            "workflow_events_ready": runtime.events.verify() >= 0,
+            "sandbox_available": runtime.sandbox.available,
+            "docker_cli_present": bool(shutil.which("docker")),
+            "qwen_adapter_present": adapter.is_file(),
+            "qwen_api_key_present": bool(os.environ.get("DASHSCOPE_API_KEY")),
+            "qwen_provider_https": provider_parts.scheme == "https" and bool(provider_host),
+            "qwen_provider_allowlisted": provider_host in configured_hosts,
+        }
+        if args.input is not None:
+            checks["input_present"] = args.input.is_file()
+            if args.input.is_file():
+                checks["input_nonempty"] = args.input.stat().st_size > 0
+                if args.input.suffix.lower() == ".pdf":
+                    checks["input_within_qwen_pdf_limit"] = args.input.stat().st_size <= 150 * 1024 * 1024
+                    with args.input.open("rb") as stream:
+                        checks["input_pdf_magic"] = stream.read(4) == b"%PDF"
+        # Docker is optional in the trusted single-machine scope; it becomes
+        # relevant only when the operator explicitly selects the docker
+        # backend. The provider secret is likewise conditional on --qwen.
+        required_checks = {key: value for key, value in checks.items() if key not in {"qwen_api_key_present", "docker_cli_present"}}
+        if os.environ.get("M2HARNESS_SANDBOX_BACKEND", "host").lower() == "docker":
+            required_checks["docker_cli_present"] = checks["docker_cli_present"]
+        structural = all(required_checks.values()) and (not args.qwen or checks["qwen_api_key_present"])
+        _emit({"status": "ready" if structural else "blocked", "checks": checks, "note": "the first-mile Harness uses the trusted local host backend by default; set M2HARNESS_SANDBOX_BACKEND=docker for isolation or =none to fail closed; --qwen makes the provider secret mandatory"})
+        return 0 if structural else 1
     if args.command == "status":
         _emit({
             "question": store.get_question(args.question_id).model_dump(mode="json"),
             "activities": [item.model_dump(mode="json") for item in store.list_activities(args.question_id)],
             "artifacts": [item.model_dump(mode="json") for item in store.list_artifacts(args.question_id)],
+            "claim_evidence": [item.model_dump(mode="json") for item in store.list_claim_evidence(args.question_id)],
             "events": [item.model_dump(mode="json") for item in store.list_events(args.question_id)],
         })
         return 0
@@ -127,7 +286,42 @@ def main(argv: list[str] | None = None) -> int:
             artifact_store = ArtifactStore(settings.artifact_root)
             for artifact in store.list_all_artifacts():
                 artifact_store.read(artifact); artifacts += 1
-        _emit({"event_chain": "valid", "events": events, "artifacts_verified": artifacts})
+        audit = SQLiteToolAuditStore(settings.database_path)
+        runtime_artifacts = SQLiteArtifactRegistry(settings.database_path).verify(ArtifactStore(settings.artifact_root))
+        claims = store.verify_all_claim_evidence()
+        tool_audit_events = audit.verify()
+        _emit({"event_chain": "valid", "events": events, "artifacts_verified": artifacts, "runtime_artifacts_verified": runtime_artifacts, "claim_evidence": "valid", "claim_evidence_records": claims, "tool_audit_chain": "valid", "tool_audit_events": tool_audit_events})
+        return 0
+    if args.command == "export-audit":
+        question = store.get_question(args.question_id)
+        claims = store.list_claim_evidence(args.question_id)
+        claim_count = store.verify_claim_evidence(args.question_id)
+        for claim in claims:
+            for artifact_id in claim.evidence_artifact_ids:
+                ArtifactStore(settings.artifact_root).read(store.get_artifact(artifact_id))
+        payload = {
+            "schema": "m2harness/audit-bundle/v1",
+            "question": question.model_dump(mode="json"),
+            "activities": [item.model_dump(mode="json") for item in store.list_activities(args.question_id)],
+            "artifacts": [item.model_dump(mode="json") for item in store.list_artifacts(args.question_id)],
+            "claim_evidence": [item.model_dump(mode="json") for item in claims],
+            "events": [item.model_dump(mode="json") for item in store.list_events(args.question_id)],
+            "integrity": {"event_chain_events": store.verify_event_chain(), "claim_evidence_records": claim_count},
+        }
+        if args.output.exists() and not args.overwrite:
+            raise FileExistsError(f"audit output exists: {args.output}")
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{args.output.name}.", suffix=".tmp", dir=args.output.parent)
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+                stream.write(json.dumps(payload, ensure_ascii=False, indent=2))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, args.output)
+        finally:
+            temporary.unlink(missing_ok=True)
+        _emit({"output": str(args.output.resolve()), "schema": payload["schema"], "claims": len(claims), "events": len(payload["events"])})
         return 0
     return 2
 

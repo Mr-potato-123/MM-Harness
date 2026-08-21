@@ -1,0 +1,9 @@
+apiVersion: m2harness/v1
+name: latex-publication
+version: 1.0.0
+description: Generate a polished, self-contained LaTeX paper from an approved single-question report while preserving claim parity and local safety boundaries.
+entrypoint: SKILL.md
+contextTokens: 2400
+resources: references/layout-profile.md
+requiresCapabilities: report.publish, artifact.read, artifact.write
+

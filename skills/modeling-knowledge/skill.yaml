@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: modeling-knowledge
+version: 0.1.0
+description: Select and explain candidate mathematical modeling methods from the local HMML knowledge base.
+modelInvocable: true
+userInvocable: false
+contextTokens: 1400
+requiresCapabilities: knowledge.search

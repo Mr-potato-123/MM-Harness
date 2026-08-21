@@ -1,0 +1,9 @@
+apiVersion: m2harness/v1
+name: visualization
+version: 1.0.0
+description: Create evidence-backed charts and figures from registered data with deterministic styling, provenance, and accessibility checks.
+entrypoint: SKILL.md
+contextTokens: 1500
+resources: references/figure-contract.md
+requiresCapabilities: python.execute, artifact.write
+

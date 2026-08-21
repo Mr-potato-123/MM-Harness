@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: report-rendering
+version: 1.0.0
+description: Turn an approved single-question report into deterministic Markdown, HTML, and publication-ready source without changing its claims.
+entrypoint: SKILL.md
+contextTokens: 1600
+requiresCapabilities: report.finalize, report.publish, workspace.write
+

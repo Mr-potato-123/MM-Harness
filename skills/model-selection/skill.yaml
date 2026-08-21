@@ -1,0 +1,7 @@
+apiVersion: m2harness/v1
+name: model-selection
+version: 1.0.0
+description: Choose and document a modeling formulation by comparing plausible alternatives against the question, data, constraints, and validation budget.
+entrypoint: SKILL.md
+contextTokens: 1500
+

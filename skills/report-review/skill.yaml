@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: report-review
+version: 1.0.0
+description: Independently review a single-question report for evidence, validity, reproducibility, and omissions.
+entrypoint: SKILL.md
+contextTokens: 2400
+resources: references/review-checklist.md
+requiresCapabilities: report.review, artifact.read

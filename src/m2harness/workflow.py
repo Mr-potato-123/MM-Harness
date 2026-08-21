@@ -30,6 +30,9 @@ from m2harness.models import (
     utc_now,
 )
 from m2harness.store import HarnessStore
+from m2harness.infrastructure.db.sqlite_artifacts import SQLiteArtifactRegistry
+from m2harness.publication import validate_publication_artifacts
+from m2harness.domain.dag import DAGTaskTable, canonical_single_question_dag
 
 
 REPORT_KINDS = {
@@ -38,12 +41,13 @@ REPORT_KINDS = {
     StageKind.REVIEW: ArtifactKind.REVIEW_REPORT,
     StageKind.FINALIZE: ArtifactKind.FINAL_QUESTION_REPORT,
 }
+MAX_INPUT_FILE_BYTES = 200 * 1024 * 1024
 
 
 class _LeaseHeartbeat:
-    def __init__(self, store: HarnessStore, question_id: UUID, activity_id: UUID, worker_id: str, seconds: int) -> None:
+    def __init__(self, store: HarnessStore, question_id: UUID, activity_id: UUID, worker_id: str, seconds: int, attempt_count: int) -> None:
         self.store, self.question_id, self.activity_id = store, question_id, activity_id
-        self.worker_id, self.seconds = worker_id, seconds
+        self.worker_id, self.seconds, self.attempt_count = worker_id, seconds, attempt_count
         self.stop_event = threading.Event()
         self.error: BaseException | None = None
         self.thread = threading.Thread(target=self._run, name=f"m2h-lease-{activity_id}", daemon=True)
@@ -55,8 +59,8 @@ class _LeaseHeartbeat:
     def _run(self) -> None:
         while not self.stop_event.wait(max(1.0, self.seconds / 3)):
             try:
+                self.store.renew_activity_lease(self.activity_id, self.worker_id, self.seconds, self.attempt_count)
                 self.store.renew_question_lease(self.question_id, self.worker_id, self.seconds)
-                self.store.renew_activity_lease(self.activity_id, self.worker_id, self.seconds)
             except BaseException as exc:
                 self.error = exc
                 self.stop_event.set()
@@ -71,39 +75,91 @@ class _LeaseHeartbeat:
 class SingleQuestionWorkflow:
     """Owns orchestration; agents implement activities, never workflow state."""
 
-    def __init__(self, settings: HarnessSettings, executor: ActivityExecutor) -> None:
+    def __init__(self, settings: HarnessSettings, executor: ActivityExecutor, *, artifact_registry: SQLiteArtifactRegistry | None = None) -> None:
         self.settings = settings
         self.store = HarnessStore(settings.database_path)
         self.artifacts = ArtifactStore(settings.artifact_root)
         self.executor = executor
+        self.artifact_registry = artifact_registry
         self.store.initialize()
 
     def create_project(self, name: str):
         return self.store.create_project(name)
 
     def add_question(self, project_id: UUID, key: str, title: str, problem: str) -> QuestionRecord:
+        encoded_problem = problem.encode("utf-8")
+        if len(encoded_problem) > MAX_INPUT_FILE_BYTES:
+            raise ValueError(f"problem artifact exceeds the {MAX_INPUT_FILE_BYTES} byte Harness budget")
         artifact = self.artifacts.put_bytes(
-            problem.encode("utf-8"), project_id=project_id, question_id=None,
+            encoded_problem, project_id=project_id, question_id=None,
             activity_id=None, kind=ArtifactKind.PROBLEM,
             logical_name=f"{key}-problem.md", media_type="text/markdown",
         )
-        return self.store.create_question(project_id, key, title, artifact)
+        question = self.store.create_question(project_id, key, title, artifact)
+        self._materialize_dag_task_table(question)
+        return question
 
     def add_question_bytes(
         self, project_id: UUID, key: str, title: str, problem: bytes,
         *, logical_name: str, media_type: str,
     ) -> QuestionRecord:
+        if len(problem) > MAX_INPUT_FILE_BYTES:
+            raise ValueError(f"problem artifact exceeds the {MAX_INPUT_FILE_BYTES} byte Harness budget")
         artifact = self.artifacts.put_bytes(
             problem, project_id=project_id, question_id=None, activity_id=None,
             kind=ArtifactKind.PROBLEM, logical_name=logical_name, media_type=media_type,
         )
-        return self.store.create_question(project_id, key, title, artifact)
+        question = self.store.create_question(project_id, key, title, artifact)
+        self._materialize_dag_task_table(question)
+        return question
+
+    def _materialize_dag_task_table(self, question: QuestionRecord) -> ArtifactRecord:
+        """Persist the canonical DAG as a first-class, auditable input."""
+
+        table = canonical_single_question_dag()
+        artifact = self.artifacts.put_bytes(
+            table.model_dump_json(indent=2).encode("utf-8"),
+            project_id=question.project_id, question_id=question.id,
+            activity_id=None, kind=ArtifactKind.DAG_TASK_TABLE,
+            logical_name=f"{question.key}-dag-task-table.json",
+            media_type="application/json",
+            metadata={"schema_version": table.schema_version, "terminal_task_id": table.terminal_task_id, "topological_order": table.topological_order()},
+        )
+        registered = self.store.register_artifact(artifact)
+        if self.artifact_registry is not None:
+            self.artifact_registry.register(registered)
+        return registered
+
+    def _ensure_valid_dag_task_table(self, question: QuestionRecord) -> DAGTaskTable:
+        """Ensure every executable question has exactly one valid mainline DAG.
+
+        Questions created by older database/CLI versions may predate the
+        first-class DAG artifact.  Backfilling that immutable artifact is safe;
+        accepting a malformed or substituted graph is not, because it would
+        let an activity silently bypass the publication terminal.
+        """
+
+        tables = [item for item in self.store.list_artifacts(question.id) if item.kind == ArtifactKind.DAG_TASK_TABLE]
+        if not tables:
+            self._materialize_dag_task_table(question)
+            tables = [item for item in self.store.list_artifacts(question.id) if item.kind == ArtifactKind.DAG_TASK_TABLE]
+        if len(tables) != 1:
+            raise ConflictError(f"question must have exactly one DAG task table; found {len(tables)}")
+        try:
+            table = DAGTaskTable.model_validate_json(self.artifacts.read(tables[0]), strict=False)
+        except Exception as exc:
+            raise ConflictError(f"invalid DAG task table: {exc}") from exc
+        if table.terminal_task_id != "publish-paper":
+            raise ConflictError("mainline DAG terminal task must be publish-paper")
+        return table
 
     def add_input(
         self, question_id: UUID, data: bytes, *, logical_name: str,
         media_type: str, kind: ArtifactKind = ArtifactKind.INPUT,
     ) -> ArtifactRecord:
         question = self.store.get_question(question_id)
+        if len(data) > MAX_INPUT_FILE_BYTES:
+            raise ValueError(f"input artifact exceeds the {MAX_INPUT_FILE_BYTES} byte Harness budget")
         artifact = self.artifacts.put_bytes(
             data, project_id=question.project_id, question_id=question.id,
             activity_id=None, kind=kind, logical_name=logical_name, media_type=media_type,
@@ -112,9 +168,12 @@ class SingleQuestionWorkflow:
 
     def run_step(self, question_id: UUID, worker_id: str) -> WorkflowStepResult:
         question = self.store.acquire_question_lease(question_id, worker_id, self.settings.lease_seconds)
+        result: WorkflowStepResult | None = None
         try:
             if question.state in (QuestionState.COMPLETED, QuestionState.FAILED):
-                return WorkflowStepResult(question=question, terminal=True)
+                result = WorkflowStepResult(question=question, terminal=True)
+                return result
+            self._ensure_valid_dag_task_table(question)
             question, stage = self._enter_stage(question, worker_id)
             activity = self.store.get_or_create_activity(question, stage)
             if activity.status == ActivityStatus.SUCCEEDED:
@@ -128,31 +187,40 @@ class SingleQuestionWorkflow:
                         self.settings.max_activity_attempts, request.model_dump(mode="json"),
                     )
                 except ConflictError as exc:
+                    if "leased by" in str(exc):
+                        raise
                     failed = self.store.transition(
                         question.id, worker_id, [question.state], QuestionState.FAILED,
                         failure_reason=str(exc),
                     )
-                    return WorkflowStepResult(question=failed, activity=activity, terminal=True)
+                    result = WorkflowStepResult(question=failed, activity=activity, terminal=True)
+                    return result
                 request = request.model_copy(update={"attempt": activity.attempt_count})
                 try:
-                    with _LeaseHeartbeat(self.store, question.id, activity.id, worker_id, self.settings.lease_seconds):
+                    with _LeaseHeartbeat(self.store, question.id, activity.id, worker_id, self.settings.lease_seconds, activity.attempt_count):
                         response = self.executor.execute(request)
                     published = self._materialize_response(question, activity.id, response)
                     activity = self.store.complete_activity(
-                        activity.id, worker_id, response.model_dump(mode="json"), published)
+                        activity.id, worker_id, response.model_dump(mode="json"), published, attempt_count=activity.attempt_count)
                 except Exception as exc:
                     try:
-                        self.store.fail_activity(activity.id, worker_id, str(exc))
+                        self.store.fail_activity(activity.id, worker_id, str(exc), attempt_count=activity.attempt_count)
                     except Exception:
                         pass
                     raise ActivityExecutionError(f"{stage.value} activity failed: {exc}") from exc
             question = self._complete_stage(question, worker_id, response)
-            return WorkflowStepResult(
+            result = WorkflowStepResult(
                 question=question, activity=activity, published_artifacts=published,
                 terminal=question.state in (QuestionState.COMPLETED, QuestionState.FAILED),
             )
+            return result
         finally:
             self.store.release_question_lease(question_id, worker_id)
+            # The returned object is an operator-facing snapshot.  Refresh it
+            # after lease release so a successful step cannot look locked until
+            # the next status query.
+            if result is not None:
+                result.question = self.store.get_question(question_id)
 
     def run_until_terminal(self, question_id: UUID, worker_id: str, max_steps: int = 100) -> WorkflowStepResult:
         result: WorkflowStepResult | None = None
@@ -190,13 +258,14 @@ class SingleQuestionWorkflow:
         project = self.store.get_project(question.project_id)
         inputs = self._inputs_for(question, stage)
         instructions = {
-            StageKind.MODELING: ["Produce an auditable modeling report and explicit validation contract."],
+            StageKind.MODELING: ["Follow the canonical DAG task table; produce an auditable modeling report and explicit validation contract."],
             StageKind.CODING: ["Implement and execute the model; report evidence, metrics, and generated artifacts."],
             StageKind.REVIEW: ["Independently review assumptions, execution evidence, validations, and claims."],
-            StageKind.FINALIZE: ["Produce the final self-contained single-question report using only reviewed evidence."],
+            StageKind.FINALIZE: ["This is the terminal DAG task: produce the final self-contained single-question report and one polished final_latex_paper artifact using only reviewed evidence."],
         }[stage]
         if question.revision:
             instructions.append(f"This is controlled revision {question.revision}; resolve the latest review instructions.")
+            instructions.extend(self._revision_instructions(question))
         return ActivityRequest(
             activity_id=activity_id, idempotency_key=key, project=project,
             question=question, stage=stage, attempt=attempt, revision=question.revision,
@@ -204,11 +273,25 @@ class SingleQuestionWorkflow:
             deadline=utc_now() + timedelta(seconds=self.settings.activity_timeout_seconds),
         )
 
+    def _revision_instructions(self, question: QuestionRecord) -> list[str]:
+        """Return the last committed review's concrete revision instructions."""
+        reviews = [item for item in self.store.list_activities(question.id) if item.stage == StageKind.REVIEW and item.status == ActivityStatus.SUCCEEDED and item.result_json]
+        if not reviews:
+            return []
+        latest = max(reviews, key=lambda item: (item.revision, item.updated_at))
+        try:
+            output = ActivityResponse.model_validate(latest.result_json, strict=False).output
+        except Exception:
+            return []
+        if not isinstance(output, ReviewStageOutput):
+            return []
+        return [f"Review instruction: {instruction}" for instruction in output.revision_instructions]
+
     def _inputs_for(self, question: QuestionRecord, stage: StageKind) -> list[ArtifactRecord]:
         artifacts = self.store.list_artifacts(question.id)
         allowed = {
-            StageKind.MODELING: {ArtifactKind.PROBLEM, ArtifactKind.INPUT, ArtifactKind.SOURCE},
-            StageKind.CODING: {ArtifactKind.PROBLEM, ArtifactKind.INPUT, ArtifactKind.SOURCE, ArtifactKind.MODELING_REPORT, ArtifactKind.CODING_REPORT, ArtifactKind.REVIEW_REPORT, ArtifactKind.DATA, ArtifactKind.OUTPUT},
+            StageKind.MODELING: {ArtifactKind.PROBLEM, ArtifactKind.DAG_TASK_TABLE, ArtifactKind.INPUT, ArtifactKind.SOURCE},
+            StageKind.CODING: {ArtifactKind.PROBLEM, ArtifactKind.DAG_TASK_TABLE, ArtifactKind.INPUT, ArtifactKind.SOURCE, ArtifactKind.MODELING_REPORT, ArtifactKind.CODING_REPORT, ArtifactKind.REVIEW_REPORT, ArtifactKind.DATA, ArtifactKind.OUTPUT, ArtifactKind.LOG, ArtifactKind.FIGURE},
             StageKind.REVIEW: set(ArtifactKind) - {ArtifactKind.FINAL_QUESTION_REPORT},
             StageKind.FINALIZE: set(ArtifactKind) - {ArtifactKind.FINAL_QUESTION_REPORT},
         }[stage]
@@ -216,6 +299,14 @@ class SingleQuestionWorkflow:
 
     def _materialize_response(self, question: QuestionRecord, activity_id: UUID, response: ActivityResponse) -> list[ArtifactRecord]:
         output = response.output
+        if isinstance(output, FinalizeStageOutput) and self.settings.require_latex_publication:
+            # Validate before writing any final bytes.  A malformed publication
+            # is therefore retryable and cannot leave a misleading "completed"
+            # report in the immutable artifact store.
+            try:
+                validate_publication_artifacts(output.artifacts)
+            except ValueError as exc:
+                raise ActivityExecutionError(str(exc)) from exc
         report = ProducedArtifact(
             logical_name=f"{output.stage.value}-r{question.revision}-report.md",
             kind=REPORT_KINDS[output.stage], media_type="text/markdown",
@@ -225,6 +316,9 @@ class SingleQuestionWorkflow:
         records = [self.artifacts.put_produced(report, project_id=question.project_id, question_id=question.id, activity_id=activity_id)]
         for produced in output.artifacts:
             records.append(self.artifacts.put_produced(produced, project_id=question.project_id, question_id=question.id, activity_id=activity_id))
+        if self.artifact_registry is not None:
+            for record in records:
+                self.artifact_registry.register(record)
         return records
 
     def _complete_stage(self, question: QuestionRecord, worker_id: str, response: ActivityResponse) -> QuestionRecord:
@@ -260,9 +354,22 @@ class SingleQuestionWorkflow:
         if not modeling or not coding or not modeling.result_json or not coding.result_json:
             return "review approval lacks committed modeling or coding evidence"
         model_output = ActivityResponse.model_validate(modeling.result_json, strict=False).output
-        code_output = ActivityResponse.model_validate(coding.result_json, strict=False).output
+        coding_response = ActivityResponse.model_validate(coding.result_json, strict=False)
+        code_output = coding_response.output
         if not isinstance(model_output, ModelingStageOutput) or not isinstance(code_output, CodingStageOutput):
             return "review approval references incompatible evidence stages"
+        execution_backend = coding_response.executor_metadata.get("execution_backend")
+        # Qwen is a model provider, not an execution authority.  Its claimed
+        # execution/validation fields become admissible only after the
+        # SandboxedActivityExecutor has replaced them with evidence from the
+        # configured local Sandbox.  Keep the legacy process adapter usable for
+        # deterministic contract tests, but never allow a Qwen provider or a
+        # remote code interpreter to close a production report without this
+        # boundary.
+        if coding_response.executor_metadata.get("provider") == "qwen" and execution_backend != "local-sandbox":
+            return "review approval requires local Sandbox evidence for Qwen coding output"
+        if execution_backend == "remote-code-interpreter":
+            return "review approval requires local Sandbox evidence; remote code interpreter output is preliminary only"
         if not code_output.execution_succeeded:
             return "review approved an unsuccessful execution"
         failed = [name for name in model_output.required_validations if code_output.validations.get(name) is not True]

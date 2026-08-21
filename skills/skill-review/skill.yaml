@@ -1,0 +1,9 @@
+apiVersion: m2harness/v1
+name: skill-review
+version: 1.0.0
+description: Review a local Skill package for discoverability, safety, resource integrity, and behavioral readiness before it is used in production prompts.
+entrypoint: SKILL.md
+contextTokens: 1800
+resources: references/review-rubric.md, evals/cases.json
+modelInvocable: false
+
