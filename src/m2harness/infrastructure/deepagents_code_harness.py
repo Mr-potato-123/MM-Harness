@@ -147,19 +147,29 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             "交接信息已经包含建模契约和必要路径，不要循环读取报告清单。第一步直接调用 write_code_source 写入完整源代码（尽量不超过 350 行）；若工具返回 complete=false，必须用 append=true 继续写后续源码块，直到 complete=true，再调用 python_execute 验证。必要时用 read_file 读取一次源文件，不要在写源代码前连续调用 ls/read_file。"
             "完成后必须使用结构化输出字段 source_path、logical_name、timeout_seconds、expected_validations；不要把源代码放进最终回答。"
         )
+        system_prompt += (
+            "\n\nM2Harness 运行约束：本 Code Agent 只可使用 write_todos、write_code_source 和 python_execute。"
+            "不要调用 ls、read_file、write_file、edit_file、glob、grep、execute 或 delete；这些文件工具已被运行时移除。"
+            "Model→Code 交接契约已经完整放在本次用户消息中，不需要再次读取文件。只能生成一个目标 Python 文件，禁止创建辅助源码文件。"
+            "python_execute 的当前工作目录就是目标源码所在的 iteration 目录；使用相对路径检查该文件和 outputs，不要把 Windows 绝对路径传给任何工具。"
+            "源码写入后最多执行一次语法/运行验证；若失败，立即修复并再次写入完整源码，禁止重复读取同一输出或循环诊断。"
+        )
         model_identifier = getattr(self.model, "model_name", None) or getattr(self.model, "model", None)
         if model_identifier:
             register_harness_profile(
                 f"openai:{model_identifier}",
                 HarnessProfile(
-                    excluded_tools=frozenset({"execute"}),
+                    excluded_tools=frozenset({
+                        "execute", "ls", "read_file", "write_file", "edit_file",
+                        "delete", "glob", "grep",
+                    }),
                     general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
                 ),
             )
         try:
             self._agent = create_deep_agent(
                 model=self.model,
-                tools=[self._write_code_source_tool(target_relative), self._python_execute_tool()],
+                tools=[self._write_code_source_tool(target_relative), self._python_execute_tool(target_relative)],
                 backend=backend,
                 permissions=permissions,
                 skills=self.skills or None,
@@ -239,12 +249,13 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
 
         return write_code_source
 
-    def _python_execute_tool(self) -> Any:
+    def _python_execute_tool(self, target_relative: str) -> Any:
         """Expose only the fixed local Python boundary to DeepAgents."""
         from langchain_core.tools import tool
 
         sandbox = self.sandbox
         workspace_root = self.workspace_root
+        target_directory = self._resolve_agent_path(target_relative).parent
 
         @tool("python_execute")
         def python_execute(code: str, timeout_seconds: int = 120) -> str:
@@ -258,7 +269,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                 result = sandbox.run(
                     (sys.executable, "-I", "-c", code),
                     timeout_seconds=timeout_seconds,
-                    cwd=workspace_root,
+                    cwd=target_directory,
                     env={"PYTHONIOENCODING": "utf-8", "M2HARNESS_NETWORK": "deny"},
                 )
                 return json.dumps(
@@ -290,17 +301,45 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             # This is an agent-loop safety ceiling, not a model output-token
             # cap.  It prevents a malformed tool loop from running forever;
             # an observation timeout never terminates the active process.
-            "recursion_limit": int(os.environ.get("M2HARNESS_DEEPAGENTS_RECURSION_LIMIT", "64")),
+            "recursion_limit": int(os.environ.get("M2HARNESS_DEEPAGENTS_RECURSION_LIMIT", "32")),
         }
         event_path.parent.mkdir(parents=True, exist_ok=True)
         final_state: dict[str, Any] | None = None
         sequence = 0
+        seen_message_ids: set[str] = set()
+        repeated_tool_results: dict[tuple[str, str], int] = {}
         try:
             for state in agent.stream({"messages": [{"role": "user", "content": prompt}]}, config=config, stream_mode="values"):
                 if not isinstance(state, dict):
                     continue
                 final_state = state
                 sequence += 1
+                for message in state.get("messages", ()) if isinstance(state.get("messages"), (list, tuple)) else ():
+                    role = getattr(message, "type", None) or (message.get("role") if isinstance(message, dict) else None)
+                    if role != "tool":
+                        continue
+                    message_id = getattr(message, "id", None) or (message.get("id") if isinstance(message, dict) else None)
+                    content = getattr(message, "content", None) or (message.get("content") if isinstance(message, dict) else "")
+                    if isinstance(content, list):
+                        content = "".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
+                    identity = str(message_id or f"{len(state.get('messages', ()))}:{str(content)[:400]}")
+                    if identity in seen_message_ids:
+                        continue
+                    seen_message_ids.add(identity)
+                    tool_name = str(getattr(message, "name", None) or (message.get("name") if isinstance(message, dict) else "tool"))
+                    signature = (tool_name, str(content)[:800])
+                    repeated_tool_results[signature] = repeated_tool_results.get(signature, 0) + 1
+                    if repeated_tool_results[signature] >= 3:
+                        error = f"repeated tool result loop detected: {tool_name} (three identical results)"
+                        self._append_event(event_path, {
+                            "seq": sequence + 1,
+                            "occurred_at": datetime.now(UTC).isoformat(),
+                            "task_id": task.task_id,
+                            "iteration": iteration,
+                            "kind": "loop_guard",
+                            "error": error,
+                        })
+                        raise ActivityExecutionError(error)
                 self._append_event(event_path, {
                     "seq": sequence,
                     "occurred_at": datetime.now(UTC).isoformat(),
