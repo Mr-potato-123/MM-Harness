@@ -290,7 +290,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             # This is an agent-loop safety ceiling, not a model output-token
             # cap.  It prevents a malformed tool loop from running forever;
             # an observation timeout never terminates the active process.
-            "recursion_limit": int(os.environ.get("M2HARNESS_DEEPAGENTS_RECURSION_LIMIT", "200")),
+            "recursion_limit": int(os.environ.get("M2HARNESS_DEEPAGENTS_RECURSION_LIMIT", "64")),
         }
         event_path.parent.mkdir(parents=True, exist_ok=True)
         final_state: dict[str, Any] | None = None
