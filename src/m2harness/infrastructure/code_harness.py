@@ -40,10 +40,15 @@ def _validate_python_policy(source: str) -> None:
     blocked_modules = {"socket", "subprocess", "ctypes", "multiprocessing", "requests", "httpx", "urllib", "ftplib"}
     blocked_calls = {"system", "popen", "spawn", "fork", "execv", "execve", "__import__", "eval", "exec", "compile"}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import) and any(alias.name.split(".", 1)[0] in blocked_modules for alias in node.names):
-            raise PermissionError("generated code imports a blocked network/process module")
-        if isinstance(node, ast.ImportFrom) and node.module and node.module.split(".", 1)[0] in blocked_modules:
-            raise PermissionError("generated code imports a blocked network/process module")
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".", 1)[0]
+                if root in blocked_modules:
+                    raise PermissionError(f"generated code imports blocked module: {root}")
+        if isinstance(node, ast.ImportFrom) and node.module:
+            root = node.module.split(".", 1)[0]
+            if root in blocked_modules:
+                raise PermissionError(f"generated code imports blocked module: {root}")
         if isinstance(node, ast.Call):
             name = node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id if isinstance(node.func, ast.Name) else None
             if name in blocked_calls:

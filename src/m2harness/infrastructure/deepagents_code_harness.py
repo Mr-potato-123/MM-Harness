@@ -156,6 +156,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             "Model→Code 交接契约已经完整放在本次用户消息中，不需要再次读取文件。只能生成一个目标 Python 文件，禁止创建辅助源码文件。"
             "python_execute 的当前工作目录就是目标源码所在的 iteration 目录；使用相对路径检查该文件和 outputs，不要把 Windows 绝对路径传给任何工具。"
             "源码写入后最多执行四次语法/运行验证；若失败，立即修复并再次写入完整源码，禁止重复读取同一输出或循环诊断。第四次验证工具返回后必须立即输出结构化交接，不得再次调用工具。"
+            "python_execute 已经负责外部超时；Windows 没有 signal.SIGALRM，验证代码禁止自行安装 SIGALRM 或假设 solve_dp 等不存在的函数。验证源码时只运行 import runpy; runpy.run_path('solve_q1.py', run_name='__main__')，并读取其 stdout JSON。"
         )
         model_identifier = getattr(self.model, "model_name", None) or getattr(self.model, "model", None)
         if model_identifier:
