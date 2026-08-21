@@ -39,7 +39,9 @@ class M2AgentAuditMiddleware(AgentMiddleware):
     def _emit(self, kind: str, runtime: Any, state: Any = None, **extra: Any) -> None:
         metadata = self._metadata(runtime)
         task_id = str(metadata.get("m2h_task_id", "unscoped"))
-        path = self.event_root / f"{task_id}.ndjson"
+        run_id = str(metadata.get("m2h_run_id", "unscoped"))
+        safe_run_id = "".join(char if char.isalnum() or char in "_.-" else "_" for char in run_id)
+        path = self.event_root / f"{safe_run_id}-{task_id}.ndjson"
         payload: dict[str, Any] = {
             "occurred_at": datetime.now(UTC).isoformat(),
             "kind": f"middleware.{kind}",

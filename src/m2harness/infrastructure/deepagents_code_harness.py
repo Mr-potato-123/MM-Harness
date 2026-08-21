@@ -71,6 +71,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         self.event_root.mkdir(parents=True, exist_ok=True)
         self.skills = skills or []
         self._agent: Any | None = None
+        self._agent_target: str | None = None
         self._checkpoint_context: Any | None = None
         self._checkpointer: Any | None = None
 
@@ -80,7 +81,9 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
         prompt = self._build_prompt(task, context, modeling, iteration=iteration, target_relative=target_relative)
         prompt_path.write_text(prompt, encoding="utf-8")
-        event_path = self.event_root / f"{task.task_id}.ndjson"
+        run_id = str(context.metadata.get("run_id", "unscoped")) if isinstance(context.metadata, dict) else "unscoped"
+        safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
+        event_path = self.event_root / f"{safe_run_id}-{task.task_id}.ndjson"
         final_state = self._run_agent(task, context, modeling, iteration=iteration, prompt=prompt, event_path=event_path)
         handoff = self._handoff_from_state(final_state)
         target = self._resolve_agent_path(handoff.source_path)
@@ -96,7 +99,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             expected_validations=tuple(dict.fromkeys(handoff.expected_validations or modeling.required_validations)),
             metadata={
                 "agent_runtime": "deepagents",
-                "session_id": self._session_id(task),
+                "session_id": self._session_id(task, context),
                 "event_log": str(event_path.relative_to(self.workspace_root).as_posix()),
                 "prompt_file": str(prompt_path.relative_to(self.workspace_root).as_posix()),
             },
@@ -109,9 +112,11 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             self._checkpoint_context.__exit__(None, None, None)
             self._checkpoint_context = None
             self._checkpointer = None
+            self._agent = None
+            self._agent_target = None
 
     def _ensure_agent(self, context: SolveProblemContext, target_relative: str) -> Any:
-        if self._agent is not None:
+        if self._agent is not None and self._agent_target == target_relative:
             return self._agent
         try:
             from deepagents import (
@@ -129,9 +134,10 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
 
         backend = FilesystemBackend(root_dir=self.workspace_root, virtual_mode=True)
         permissions = self._permissions(context, target_relative, FilesystemPermission)
-        self._checkpoint_context = SqliteSaver.from_conn_string(str(self.checkpoint_path))
-        self._checkpointer = self._checkpoint_context.__enter__()
-        self._checkpointer.setup()
+        if self._checkpointer is None:
+            self._checkpoint_context = SqliteSaver.from_conn_string(str(self.checkpoint_path))
+            self._checkpointer = self._checkpoint_context.__enter__()
+            self._checkpointer.setup()
         system_prompt = (
             "你是 M2Harness 的 Code Agent。全流程使用中文。\n"
             "你只负责当前题目当前迭代的代码实现，不负责建模、不负责审查、不负责发布，也不能改变 Main Harness 的 DAG/TODO。\n"
@@ -167,6 +173,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                 subagents=[],
                 name="m2h-code-agent",
             )
+            self._agent_target = target_relative
         except Exception as exc:
             self.close()
             raise DeepAgentsUnavailable(f"failed to compose DeepAgents Code Harness: {exc}") from exc
@@ -250,8 +257,13 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         target_relative = self._target_path(task, iteration)
         agent = self._ensure_agent(context, target_relative)
         config = {
-            "configurable": {"thread_id": self._session_id(task)},
-            "metadata": {"m2h_task_id": task.task_id, "m2h_iteration": iteration, "m2h_runtime": "deepagents"},
+            "configurable": {"thread_id": self._session_id(task, context)},
+            "metadata": {
+                "m2h_task_id": task.task_id,
+                "m2h_iteration": iteration,
+                "m2h_run_id": str(context.metadata.get("run_id", "unscoped")) if isinstance(context.metadata, dict) else "unscoped",
+                "m2h_runtime": "deepagents",
+            },
             # This is an agent-loop safety ceiling, not a model output-token
             # cap.  It prevents a malformed tool loop from running forever;
             # an observation timeout never terminates the active process.
@@ -367,8 +379,12 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         return str(Path(".m2harness-code") / task.task_id / f"iteration-{iteration}" / logical).replace("\\", "/")
 
     @staticmethod
-    def _session_id(task: SolveProblemTask) -> str:
-        return f"m2h-deepagents-code-{task.task_id}"
+    def _session_id(task: SolveProblemTask, context: SolveProblemContext | None = None) -> str:
+        run_id = "unscoped"
+        if context is not None and isinstance(context.metadata, dict):
+            run_id = str(context.metadata.get("run_id", run_id))
+        safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
+        return f"m2h-deepagents-code-{safe_run_id}-{task.task_id}"
 
     def _build_prompt(self, task: SolveProblemTask, context: SolveProblemContext, modeling: UnifiedModelingReport, *, iteration: int, target_relative: str) -> str:
         payload = {
