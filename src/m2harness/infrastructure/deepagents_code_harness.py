@@ -46,7 +46,12 @@ class CodeAgentHandoff(BaseModel):
     # job.  The model may still return arbitrarily large source/output, but a
     # single local validation must yield control to the harness in 180s.
     timeout_seconds: int = Field(default=120, ge=1, le=180)
-    expected_validations: tuple[str, ...] = ()
+    # JSON structured-output providers emit arrays, not Python tuples.  Keep
+    # the wire contract JSON-native here and normalize to a tuple at the
+    # domain boundary in ``propose``.  ``strict=True`` is intentional for the
+    # scalar fields, but a tuple would make an otherwise valid handoff fail
+    # Pydantic validation with ``input_type=list``.
+    expected_validations: list[str] = Field(default_factory=list)
 
 
 class DeepAgentsCodeProposalProvider(CodeProposalProvider):

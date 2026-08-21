@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from m2harness.infrastructure.deepagents_code_harness import DeepAgentsCodeProposalProvider
+from m2harness.infrastructure.deepagents_code_harness import CodeAgentHandoff
 from m2harness.infrastructure.local_sandbox import LocalSandboxClient
 
 
@@ -60,6 +61,15 @@ class CodeAgentHarnessContractTest(unittest.TestCase):
             second = json.loads(tool.invoke({"code": "while True: pass", "timeout_seconds": 1}))
             self.assertFalse(second["ok"])
             self.assertIn("rewrite the target source", second["error"])
+
+    def test_structured_handoff_accepts_json_validation_array(self) -> None:
+        handoff = CodeAgentHandoff.model_validate({
+            "source_path": ".m2harness-code/q1/iteration-1/solve_q1.py",
+            "logical_name": "solve_q1.py",
+            "timeout_seconds": 120,
+            "expected_validations": ["V1-初始条件", "V2-资源非负"],
+        })
+        self.assertEqual(handoff.expected_validations, ["V1-初始条件", "V2-资源非负"])
 
 
 if __name__ == "__main__":
