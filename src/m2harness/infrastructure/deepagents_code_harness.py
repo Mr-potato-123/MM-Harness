@@ -429,13 +429,29 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         sequence = 0
         seen_message_ids: set[str] = set()
         repeated_tool_results: dict[tuple[str, str], int] = {}
+        baseline_initialized = False
         try:
             for state in agent.stream({"messages": [{"role": "user", "content": prompt}]}, config=config, stream_mode="values"):
                 if not isinstance(state, dict):
                     continue
                 final_state = state
                 sequence += 1
-                for message in state.get("messages", ()) if isinstance(state.get("messages"), (list, tuple)) else ():
+                messages = state.get("messages", ()) if isinstance(state.get("messages"), (list, tuple)) else ()
+                # A durable LangGraph thread includes all previous iterations.
+                # Seed the identity set from the first snapshot so historical
+                # tool failures cannot trip this iteration's loop guard.
+                if not baseline_initialized:
+                    for index, message in enumerate(messages):
+                        role = getattr(message, "type", None) or (message.get("role") if isinstance(message, dict) else None)
+                        if role != "tool":
+                            continue
+                        message_id = getattr(message, "id", None) or (message.get("id") if isinstance(message, dict) else None)
+                        content = getattr(message, "content", None) or (message.get("content") if isinstance(message, dict) else "")
+                        if isinstance(content, list):
+                            content = "".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
+                        seen_message_ids.add(str(message_id or f"{index}:{str(content)[:400]}"))
+                    baseline_initialized = True
+                for index, message in enumerate(messages):
                     role = getattr(message, "type", None) or (message.get("role") if isinstance(message, dict) else None)
                     if role != "tool":
                         continue
@@ -443,7 +459,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                     content = getattr(message, "content", None) or (message.get("content") if isinstance(message, dict) else "")
                     if isinstance(content, list):
                         content = "".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
-                    identity = str(message_id or f"{len(state.get('messages', ()))}:{str(content)[:400]}")
+                    identity = str(message_id or f"{index}:{str(content)[:400]}")
                     if identity in seen_message_ids:
                         continue
                     seen_message_ids.add(identity)
