@@ -251,7 +251,12 @@ def main(argv: list[str] | None = None) -> int:
         _emit(workflow.run_until_terminal(args.question_id, args.worker_id))
         return 0
     if args.command == "run-main-qwen":
-        from adapters.qwen_solve_problem import QwenChatClient, QwenPaperComposer, build_qwen_solve_problem_service
+        from adapters.qwen_solve_problem import (
+            QwenChatClient,
+            QwenPaperComposer,
+            build_qwen_solve_problem_service,
+            build_dsh_solve_problem_service,
+        )
 
         data = _read_input_file(args.input)
         if not (os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")):
@@ -279,7 +284,8 @@ def main(argv: list[str] | None = None) -> int:
             base_url=os.environ.get("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
             model=args.model or os.environ.get("QWEN_MODEL", "qwen3.8-max"),
         )
-        service = build_qwen_solve_problem_service(
+        service_builder = build_dsh_solve_problem_service if args.code_agent == "dsh" else build_qwen_solve_problem_service
+        service = service_builder(
             sandbox=runtime.sandbox, workspace_root=runtime.tool_environment.workspace_root,
             research_agent=runtime.research_service, skills=runtime.skills,
             tool_runtime=runtime.tool_runtime, capabilities=runtime.capabilities,
@@ -292,13 +298,6 @@ def main(argv: list[str] | None = None) -> int:
             "Each solve_problem call must analyze exactly its own question scope and must not solve, summarize, "
             "formulate, code, validate, or report results for later questions. Previous-question results arrive "
             "only through the compressed dependency context."
-        )
-        state = runtime.main_harness.start(
-            scope_prompt,
-            canonical_main_harness_dag(
-                scope=args.scope, task_problem=scope_prompt,
-                question_count=args.question_count,
-            ),
         )
         base_context = SolveProblemContext(
             multimodal_inputs=(multimodal,),
@@ -313,27 +312,18 @@ def main(argv: list[str] | None = None) -> int:
                 "scope": args.scope,
             },
         )
-        # Main Harness advances one ready TODO at a time.  Each dispatch gets
-        # the original source allowlist plus dependency projection; it never
-        # receives the previous Agent's full conversation or raw report tree.
-        while True:
-            ready = runtime.main_harness.ready_tasks(state)
-            solve_ready = [
-                item.id for item in state.dag.tasks
-                if item.id in ready and item.kind.value == "solve_problem"
-            ]
-            if not solve_ready:
-                break
-            for task_id in solve_ready:
-                state = runtime.main_harness.dispatch(
-                    state, task_id, context=base_context,
-                    max_iterations=args.max_iterations,
-                )
-                task_state = next(item for item in state.tasks if item.task_id == task_id)
-                if task_state.status.value != "completed":
-                    _emit(runtime.main_harness.todo_view(state))
-                    return 1
-        state = runtime.main_harness.generate_paper(state, QwenPaperComposer(client, skills=runtime.skills))
+        from m2harness.application.langgraph_main_harness import LangGraphMainHarness
+        graph_runner = LangGraphMainHarness(
+            runtime.main_harness,
+            checkpoint_path=runtime.tool_environment.workspace_root.parent / "main-harness-checkpoints.sqlite",
+            context_for_task=lambda _task_id, _state: base_context,
+        )
+        state = graph_runner.run(
+            scope_prompt,
+            canonical_main_harness_dag(scope=args.scope, task_problem=scope_prompt, question_count=args.question_count),
+            composer=QwenPaperComposer(client, skills=runtime.skills),
+            max_iterations=args.max_iterations,
+        )
         if state.final_report is None or state.final_latex_paper is None:
             raise RuntimeError("Main Harness paper composer returned no final publication")
         render_definition = runtime.tools.get("report_render")
@@ -355,7 +345,12 @@ def main(argv: list[str] | None = None) -> int:
         _emit({"todo": runtime.main_harness.todo_view(state), "published_files": rendered.output})
         return 0
     if args.command == "resume-main-qwen":
-        from adapters.qwen_solve_problem import QwenChatClient, QwenPaperComposer, build_qwen_solve_problem_service
+        from adapters.qwen_solve_problem import (
+            QwenChatClient,
+            QwenPaperComposer,
+            build_qwen_solve_problem_service,
+            build_dsh_solve_problem_service,
+        )
 
         if not (os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")):
             raise RuntimeError("DASHSCOPE_API_KEY or DEEPSEEK_API_KEY is required for resume-main-qwen; inject it through the process environment or a secret provider")
@@ -385,7 +380,8 @@ def main(argv: list[str] | None = None) -> int:
             base_url=os.environ.get("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
             model=args.model or os.environ.get("QWEN_MODEL", "qwen3.8-max"),
         )
-        service = build_qwen_solve_problem_service(
+        service_builder = build_dsh_solve_problem_service if args.code_agent == "dsh" else build_qwen_solve_problem_service
+        service = service_builder(
             sandbox=runtime.sandbox, workspace_root=runtime.tool_environment.workspace_root,
             research_agent=runtime.research_service, skills=runtime.skills,
             tool_runtime=runtime.tool_runtime, capabilities=runtime.capabilities,
@@ -452,23 +448,18 @@ def main(argv: list[str] | None = None) -> int:
             "metadata": {"scope": "question-1"},
             "instructions": (),
         })
-        state = runtime.main_harness.start(
+        from m2harness.application.langgraph_main_harness import LangGraphMainHarness
+        graph_runner = LangGraphMainHarness(
+            runtime.main_harness,
+            checkpoint_path=runtime.tool_environment.workspace_root.parent / "main-harness-checkpoints.sqlite",
+            context_for_task=lambda task_id, _state: resume_context if task_id == "q1" else normal_context,
+        )
+        state = graph_runner.run(
             scope_prompt,
             canonical_main_harness_dag(scope="question-1", task_problem=scope_prompt, question_count=4),
+            composer=QwenPaperComposer(client, skills=runtime.skills),
+            max_iterations=args.max_iterations,
         )
-        while True:
-            ready = runtime.main_harness.ready_tasks(state)
-            solve_ready = [item.id for item in state.dag.tasks if item.id in ready and item.kind.value == "solve_problem"]
-            if not solve_ready:
-                break
-            for task_id in solve_ready:
-                dispatch_context = resume_context if task_id == "q1" else normal_context
-                state = runtime.main_harness.dispatch(state, task_id, context=dispatch_context, max_iterations=args.max_iterations)
-                task_state = next(item for item in state.tasks if item.task_id == task_id)
-                if task_state.status.value != "completed":
-                    _emit(runtime.main_harness.todo_view(state))
-                    return 1
-        state = runtime.main_harness.generate_paper(state, QwenPaperComposer(client, skills=runtime.skills))
         if state.final_report is None or state.final_latex_paper is None:
             raise RuntimeError("Main Harness paper composer returned no final publication")
         render_definition = runtime.tools.get("report_render")

@@ -15,6 +15,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -672,11 +673,12 @@ class QwenModelAgent(ModelAgentPort):
 
 
 class QwenCodeProposalProvider(CodeProposalProvider):
-    def __init__(self, client: QwenChatClient, skills=None, *, tool_runtime: ToolRuntime | None = None, capabilities: CapabilityRegistry | None = None) -> None:
+    def __init__(self, client: QwenChatClient, skills=None, *, tool_runtime: ToolRuntime | None = None, capabilities: CapabilityRegistry | None = None, workspace_root: Path | None = None) -> None:
         self.client = client
         self.skills = skills
         self.tool_runtime = tool_runtime
         self.capabilities = capabilities
+        self.workspace_root = workspace_root.resolve() if workspace_root is not None else None
 
     def propose(self, task, context, modeling, *, iteration):
         system = build_agent_system_prompt(
@@ -719,7 +721,7 @@ class QwenCodeProposalProvider(CodeProposalProvider):
                         },
                     },
                 }, ensure_ascii=False)
-                bridge = MainHarnessToolBridge(self.tool_runtime, self.capabilities, workspace_root=getattr(self.tool_runtime, "workspace_root", None))
+                bridge = MainHarnessToolBridge(self.tool_runtime, self.capabilities, workspace_root=self.workspace_root)
                 value = self.client.tool_agent_json(
                     system=system + "\nThis Code Agent has a Main Harness tool lane. Never claim a file was written unless a workspace_write tool result confirms it.",
                     content=_content_parts(context, tool_prompt, deepseek=bool(getattr(self.client, "_deepseek_mode", False))), schema=CodeProposal.model_json_schema(),
@@ -793,7 +795,7 @@ def build_qwen_solve_problem_service(*, sandbox, workspace_root, research_agent=
     from m2harness.infrastructure.code_harness import LocalPythonCodeHarness
 
     model_agent = QwenModelAgent(qwen, skills=skills)
-    code_harness = LocalPythonCodeHarness(QwenCodeProposalProvider(qwen, skills=skills, tool_runtime=tool_runtime, capabilities=capabilities), sandbox, workspace_root)
+    code_harness = LocalPythonCodeHarness(QwenCodeProposalProvider(qwen, skills=skills, tool_runtime=tool_runtime, capabilities=capabilities, workspace_root=Path(workspace_root)), sandbox, workspace_root)
     return SolveProblemService(
         model_agent, code_harness, max_iterations=max_iterations,
         research_agent=research_agent,
@@ -803,20 +805,23 @@ def build_qwen_solve_problem_service(*, sandbox, workspace_root, research_agent=
 
 
 def build_dsh_solve_problem_service(*, sandbox, workspace_root, research_agent=None, skills=None, client: QwenChatClient | None = None, max_iterations: int = 3, archive_writer: SolveProblemArchivePort | None = None, dsh_config=None) -> SolveProblemService:
-    """Compose Model Agent + DSH Code Agent for the production path.
+    """Compose the production LangGraph/DeepAgents Code Harness.
 
-    DSH owns only the Code Agent session and its tool/event loop.  The Model
-    Agent, review gate, local execution and Main Harness remain the same ports
-    as the Qwen-compatible path.  ``dsh_config`` is intentionally optional so
-    deployments can select an explicit runtime command without making DSH a
-    hard Python dependency.
+    ``dsh`` remains the stable CLI selector for compatibility with existing
+    runs, but the default implementation is now the maintained DeepAgents
+    runtime.  The old JSON-RPC adapter is retained only as an explicit legacy
+    integration and is never selected implicitly.
     """
     qwen = client or QwenChatClient()
     from m2harness.infrastructure.code_harness import LocalPythonCodeHarness
-    from m2harness.infrastructure.dsh_code_harness import DshCodeProposalProvider
+    from m2harness.infrastructure.deepagents_code_harness import DeepAgentsCodeProposalProvider
 
     model_agent = QwenModelAgent(qwen, skills=skills)
-    provider = DshCodeProposalProvider(Path(workspace_root), config=dsh_config)
+    provider = DeepAgentsCodeProposalProvider(
+        Path(workspace_root), sandbox,
+        base_url=qwen.base_url, model_name=qwen.model, api_key=qwen.api_key,
+        skills=_deepagents_skill_paths(skills, Path(workspace_root)),
+    )
     code_harness = LocalPythonCodeHarness(provider, sandbox, Path(workspace_root))
     return SolveProblemService(
         model_agent, code_harness, max_iterations=max_iterations,
@@ -824,6 +829,42 @@ def build_dsh_solve_problem_service(*, sandbox, workspace_root, research_agent=N
         file_reader=WorkspaceReadOnlyFileReader(Path(workspace_root)),
         archive_writer=archive_writer,
     )
+
+
+def build_deepagents_solve_problem_service(**kwargs: Any) -> SolveProblemService:
+    """Named alias for callers that want to make the runtime explicit."""
+    return build_dsh_solve_problem_service(**kwargs)
+
+
+def _deepagents_skill_paths(skills: Any, workspace_root: Path) -> list[str]:
+    """Stage registry skills inside the Code Agent's virtual workspace.
+
+    DeepAgents intentionally resolves skills relative to its backend root.  We
+    therefore copy the immutable, digest-checked skill bodies into a dedicated
+    read-only-by-contract lane instead of handing the agent arbitrary host
+    paths.  This preserves progressive disclosure while keeping the Code
+    Agent's filesystem permission boundary meaningful.
+    """
+    staged_root = workspace_root.resolve() / ".m2harness-code" / "skills"
+    staged_root.mkdir(parents=True, exist_ok=True)
+    paths: list[str] = []
+    if hasattr(skills, "list") and hasattr(skills, "get"):
+        summaries = skills.list(model_invocable=True)
+        for summary in summaries:
+            definition = skills.get(summary.name)
+            if definition is None:
+                continue
+            source = Path(definition.source).resolve()
+            target = staged_root / summary.name
+            target.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target / "SKILL.md")
+            paths.append("/.m2harness-code/skills/" + summary.name + "/")
+        return paths
+    for item in skills or ():
+        path = getattr(item, "path", None) or getattr(item, "source_path", None)
+        if path:
+            paths.append(str(path).replace("\\", "/"))
+    return paths
 
 
 def _compact_solve_report(report: Any) -> dict[str, Any]:

@@ -21,6 +21,7 @@ from m2harness.application.solve_problem import CommandSolveProblemRunner, Solve
 from m2harness.application.knowledge import EmptyKnowledgeBase, HMMLKnowledgeBase, KnowledgeBasePort
 from m2harness.application.research import DeepResearchService, ResearchAgentPort
 from m2harness.application.compact import ContextCompactor, ContextCompactorPort, compact_text, estimate_tokens
+from m2harness.application.langgraph_main_harness import LangGraphMainHarness, MainHarnessGraphState
 from m2harness.application.report_store import ReportFileRecord, RunReportStore
 from m2harness.domain.dag import DAGTaskKind, DAGTaskNode, DAGTaskTable, canonical_main_harness_dag, canonical_single_question_dag
 from m2harness.domain.solve_problem import (
@@ -47,6 +48,8 @@ from m2harness.domain.code import CodeProposal
 from m2harness.domain.media import MultimodalInput
 from m2harness.infrastructure.code_harness import CodeProposalProvider, LocalPythonCodeHarness
 from m2harness.infrastructure.dsh_code_harness import DshCodeProposalProvider, DshRuntimeConfig, DshRuntimeError
+from m2harness.infrastructure.deepagents_code_harness import CodeAgentHandoff, DeepAgentsCodeProposalProvider, DeepAgentsUnavailable
+from m2harness.infrastructure.agent_middleware import M2AgentAuditMiddleware
 
 __all__ = [
     "ActivityExecutor",
@@ -115,6 +118,8 @@ __all__ = [
     "ContextCompactorPort",
     "compact_text",
     "estimate_tokens",
+    "LangGraphMainHarness",
+    "MainHarnessGraphState",
     "ReportFileRecord",
     "RunReportStore",
     "KnowledgeEntry",
@@ -133,4 +138,8 @@ __all__ = [
     "DshCodeProposalProvider",
     "DshRuntimeConfig",
     "DshRuntimeError",
+    "CodeAgentHandoff",
+    "DeepAgentsCodeProposalProvider",
+    "DeepAgentsUnavailable",
+    "M2AgentAuditMiddleware",
 ]

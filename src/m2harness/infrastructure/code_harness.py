@@ -152,9 +152,11 @@ class LocalPythonCodeHarness:
         # Mature Code Agent runtimes expose their durable event stream as an
         # ordinary review artifact.  Only provider-declared relative paths are
         # admitted; arbitrary metadata cannot grant filesystem access.
-        event_path = (metadata or {}).get("event_log")
-        if event_path:
-            candidate = (self.workspace_root / event_path).resolve()
+        for metadata_key in ("event_log", "prompt_file"):
+            declared_path = (metadata or {}).get(metadata_key)
+            if not declared_path:
+                continue
+            candidate = (self.workspace_root / declared_path).resolve()
             if self.workspace_root == candidate or self.workspace_root in candidate.parents:
                 candidates.append(candidate)
         if not candidates:
