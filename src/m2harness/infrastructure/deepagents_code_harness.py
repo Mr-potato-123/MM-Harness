@@ -41,7 +41,10 @@ class CodeAgentHandoff(BaseModel):
 
     source_path: str = Field(min_length=1, max_length=1_000)
     logical_name: str = Field(pattern=r"^[A-Za-z0-9._-]+\.py$", max_length=200)
-    timeout_seconds: int = Field(default=300, ge=1, le=600)
+    # A code validation is a bounded evidence probe, not an unbounded batch
+    # job.  The model may still return arbitrarily large source/output, but a
+    # single local validation must yield control to the harness in 180s.
+    timeout_seconds: int = Field(default=120, ge=1, le=180)
     expected_validations: tuple[str, ...] = ()
 
 
@@ -198,6 +201,17 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         target = self._resolve_agent_path(target_relative)
         workspace_root = self.workspace_root
 
+        def previous_revision() -> Path | None:
+            """Return the immediately previous iteration's source, if any."""
+
+            match = re.fullmatch(r"iteration-(\d+)", target.parent.name)
+            if match is None:
+                return None
+            number = int(match.group(1))
+            if number <= 1:
+                return None
+            return target.parent.parent / f"iteration-{number - 1}" / target.name
+
         @tool("write_code_source")
         def write_code_source(source: str, append: bool = False) -> str:
             """将 Python 源码首块或后续块写入本轮交接指定的固定路径。"""
@@ -217,6 +231,22 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                     if target.stat().st_size > 2_000_000:
                         return json.dumps({"ok": False, "error": "assembled source exceeds 2MB"}, ensure_ascii=False)
                 else:
+                    previous = previous_revision()
+                    if (
+                        previous is not None
+                        and previous.is_file()
+                        and previous.read_text(encoding="utf-8").replace("\r\n", "\n")
+                        == source.replace("\r\n", "\n")
+                    ):
+                        return json.dumps(
+                            {
+                                "ok": False,
+                                "error": "source is identical to the previous iteration after newline normalization; apply the Review instructions and write a changed source before validating",
+                                "previous_path": previous.relative_to(workspace_root).as_posix(),
+                                "next_action": "rewrite the complete source with an observable algorithm or output change",
+                            },
+                            ensure_ascii=False,
+                        )
                     descriptor, temporary_name = tempfile.mkstemp(prefix=".m2h-source-", suffix=".py", dir=target.parent)
                     temporary = Path(temporary_name)
                     try:
@@ -321,8 +351,8 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             """在本地受控沙箱中执行一段 Python 验证代码；不得联网或运行 shell。"""
             if not isinstance(code, str) or not code.strip():
                 return json.dumps({"ok": False, "error": "code must be non-empty"}, ensure_ascii=False)
-            if not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 600:
-                return json.dumps({"ok": False, "error": "timeout_seconds must be 1..600"}, ensure_ascii=False)
+            if not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 180:
+                return json.dumps({"ok": False, "error": "timeout_seconds must be 1..180"}, ensure_ascii=False)
             nonlocal call_count
             call_count += 1
             try:
