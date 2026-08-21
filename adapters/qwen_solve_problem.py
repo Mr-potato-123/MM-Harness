@@ -315,6 +315,12 @@ class QwenChatClient:
     timeout_seconds: float = 1_800.0
 
     def __post_init__(self) -> None:
+        # DeepSeek's public catalog names the vision-capable experimental
+        # model ``deepseek-v4-flash-vision-exp``.  Keep the shorter name that
+        # appeared in early deployment notes as a compatibility alias, while
+        # sending only the provider-accepted identifier on the wire.
+        if self.model == "deepseek-v4-vision-exp":
+            self.model = "deepseek-v4-flash-vision-exp"
         parsed = urlsplit(self.base_url)
         provider_is_deepseek = bool(parsed.hostname and parsed.hostname.lower().endswith("deepseek.com"))
         preferred_key_name = "DEEPSEEK_API_KEY" if provider_is_deepseek else "DASHSCOPE_API_KEY"
@@ -563,7 +569,14 @@ class QwenChatClient:
                 # fallback; some OpenAI-compatible endpoints ignore response_schema.
                 return value
             except httpx.HTTPStatusError as exc:
-                last_error = exc
+                body = ""
+                try:
+                    body = exc.response.text[:4_000]
+                except Exception:
+                    body = ""
+                last_error = RuntimeError(
+                    f"HTTP {exc.response.status_code}: {body}" if body else str(exc)
+                )
                 if exc.response.status_code not in {408, 409, 425, 429} and exc.response.status_code < 500:
                     break
             except json.JSONDecodeError as exc:
