@@ -164,6 +164,8 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             "源码写入后最多执行四次语法/运行验证；若失败，立即修复并再次写入完整源码，禁止重复读取同一输出或循环诊断。第四次验证工具返回后必须立即输出结构化交接，不得再次调用工具。"
             "python_execute 已经负责外部超时；Windows 没有 signal.SIGALRM，验证代码禁止自行安装 SIGALRM 或假设 solve_dp 等不存在的函数。验证源码时只运行 import runpy; runpy.run_path('solve_q1.py', run_name='__main__')，并读取其 stdout JSON。"
             "资源补给不得对三种资源做无界三重数量枚举；必须使用候选边界、需求驱动枚举或支配剪枝，并在超时后改变算法复杂度。"
+            "最终脚本 stdout 必须只输出一个 JSON 对象，且必须包含 validations、validation_evidence、all_valid；validation_evidence 必须为每个 required_validations 提供非空、可复现的中文说明，all_valid 只有在所有校验和证据齐全时才可为 true。"
+            "必须把可审查结果 JSON 写入当前 iteration 的 outputs/result.json（或等价的 outputs/*.json），其中包含完整路径、每日状态、目标值和校验证据；不要只打印摘要或只返回 all_valid。"
         )
         model_identifier = getattr(self.model, "model_name", None) or getattr(self.model, "model", None)
         if model_identifier:
@@ -610,7 +612,13 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             "required_validations": list(modeling.required_validations),
             "expected_outputs": list(modeling.expected_outputs),
         }
-        return "当前为第 %d 轮 Code Agent 实现。继续复用本任务的 LangGraph thread/session；只读清单之外的路径不得打开。以下是本轮 Model→Code 结构化交接：\n\n%s" % (iteration, json.dumps(payload, ensure_ascii=False, indent=2))
+        return (
+            "当前为第 %d 轮 Code Agent 实现。继续复用本任务的 LangGraph thread/session；只读清单之外的路径不得打开。"
+            "以下是本轮 Model→Code 结构化交接：\n\n%s\n\n"
+            "验收硬契约：脚本必须以 exit_code=0 结束，并在 stdout 输出一个 JSON 对象；该对象的 validations 必须覆盖并通过全部 required_validations，"
+            "validation_evidence 必须逐项提供非空且可复现的中文证据，all_valid 必须为 true；同时把完整结果（路径、每日行动与 O/H/F/M/Z、目标值、"
+            "验证证据）写入当前 iteration 的 outputs/*.json。若运行结果显示 all_valid=false 或缺少 evidence，必须修改源代码后再运行，不能原样重复运行。"
+        ) % (iteration, json.dumps(payload, ensure_ascii=False, indent=2))
 
     @staticmethod
     def _append_event(path: Path, event: dict[str, Any]) -> None:
