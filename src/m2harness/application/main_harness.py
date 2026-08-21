@@ -31,6 +31,8 @@ from m2harness.domain.solve_problem import (
     SolveProblemReport,
     SolveProblemStatus,
     SolveProblemTask,
+    MAX_REVISION_ROUNDS,
+    ModelReviewDecision,
 )
 from m2harness.domain.tool import ToolCall
 from m2harness.models import ArtifactKind, ProducedArtifact, ReportPayload, StrictModel, utc_now
@@ -133,6 +135,35 @@ class MainHarness:
                 result.append(node.id)
         return tuple(result)
 
+    def todo_view(self, state: MainHarnessState) -> dict[str, object]:
+        """Return the intentionally small operator-facing TODO projection.
+
+        Durable state still retains typed reports and file indexes for audit,
+        but the Main Harness display is a plan/status view rather than a dump
+        of every Model/Code/Review payload.
+        """
+
+        by_id = {item.task_id: item for item in state.tasks}
+        return {
+            "run_id": str(state.run_id),
+            "todo": [
+                {
+                    "task_id": node.id,
+                    "title": node.title,
+                    "kind": node.kind.value,
+                    "status": by_id[node.id].status.value,
+                    "depends_on": list(node.depends_on),
+                    "scope": node.metadata.get("scope"),
+                    "ready": node.id in self.ready_tasks(state),
+                }
+                for node in state.dag.tasks
+            ],
+            "next_ready": list(self.ready_tasks(state)),
+            "report_file_count": len(state.report_files),
+            "terminal": state.terminal,
+            "version": state.version,
+        }
+
     def dispatch(
         self,
         state: MainHarnessState,
@@ -152,6 +183,10 @@ class MainHarness:
         record = by_id[task_id]
         if record.status not in {MainTaskStatus.READY, MainTaskStatus.REVISION_REQUIRED}:
             raise ValueError(f"DAG task {task_id} is not ready: {record.status.value}")
+        if record.status == MainTaskStatus.REVISION_REQUIRED and self._revision_rounds_consumed(state, task_id) >= MAX_REVISION_ROUNDS:
+            raise ValueError(
+                f"DAG task {task_id} exhausted the maximum of {MAX_REVISION_ROUNDS} review-driven revision rounds"
+            )
         if not all(by_id[dependency].status == MainTaskStatus.COMPLETED for dependency in node.depends_on):
             raise ValueError(f"DAG task {task_id} has incomplete dependencies")
         definition = self.tool_runtime.registry.get("solve_problem")
@@ -176,6 +211,13 @@ class MainHarness:
             revision=attempt - 1, metadata=node.metadata,
         )
         solve_context = self._context_for_dispatch(state, node.id, node.depends_on, context)
+        solve_context = solve_context.model_copy(update={
+            "metadata": {
+                **solve_context.metadata,
+                "run_id": str(state.run_id),
+                "task_attempt": attempt,
+            },
+        })
         call = ToolCall(
             call_id=uuid4(), tool_name=definition.name, tool_version=definition.version,
             activity_id=uuid4(), session_id=uuid4(),
@@ -355,6 +397,20 @@ class MainHarness:
         return state.model_copy(update={"tasks": tuple(by_id[item.id] for item in state.dag.tasks), "updated_at": utc_now()})
 
     @staticmethod
+    def _revision_rounds_consumed(state: MainHarnessState, task_id: str) -> int:
+        """Count durable non-approval review decisions across resumed dispatches."""
+
+        consumed = 0
+        for report in state.reports:
+            if report.task_id != task_id:
+                continue
+            consumed += sum(
+                1 for iteration in report.iterations
+                if iteration.review.decision in {ModelReviewDecision.REVISE, ModelReviewDecision.REJECT}
+            )
+        return consumed
+
+    @staticmethod
     def _replace_task(state: MainHarnessState, task: MainHarnessTask) -> MainHarnessState:
         tasks = tuple(task if item.task_id == task.task_id else item for item in state.tasks)
         return state.model_copy(update={"tasks": tasks, "updated_at": utc_now()})
@@ -395,7 +451,11 @@ class MainHarness:
                 item.as_readonly() for item in state.report_files
                 if item.task_id == dependency
                 and item.attempt == dependency_task.attempts
-                and (item.role == ReadOnlyFileRole.DEPENDENCY_SOLUTION or item.iteration == report.iteration_count)
+                and (
+                    item.role == ReadOnlyFileRole.DEPENDENCY_SOLUTION
+                    or item.iteration == report.iteration_count
+                    or "/exchanges/" in item.relative_path.replace("\\", "/")
+                )
                 and item.role in {
                     ReadOnlyFileRole.DEPENDENCY_SOLUTION,
                     ReadOnlyFileRole.DEPENDENCY_OUTPUT,

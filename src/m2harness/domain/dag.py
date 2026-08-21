@@ -153,31 +153,71 @@ def canonical_single_question_dag() -> DAGTaskTable:
     )
 
 
-def canonical_main_harness_dag(task_id: str = "q1") -> DAGTaskTable:
-    """Return the minimal Main Harness graph for one problem.
+def canonical_main_harness_dag(
+    task_id: str = "q1",
+    *,
+    scope: str = "question-1",
+    task_problem: str | None = None,
+    question_count: int = 1,
+) -> DAGTaskTable:
+    """Return a TODO graph whose solve nodes are independently scoped.
 
     Unlike the legacy stage graph above, this is the graph the top-level Agent
-    should normally construct: one or more ``solve_problem`` nodes followed
-    by the Harness-owned publication terminal.  The planner may replace this
-    serial graph with a validated dependency DAG at runtime.
+    should normally construct: one or more serial ``solve_problem`` nodes
+    followed by the Harness-owned publication terminal. ``question_count=1``
+    preserves the compatibility graph used by the unit tests; the production
+    Qwen CLI uses four nodes so the four numbered questions are solved one at a
+    time, with each node receiving only the previous node's compressed output.
     """
 
     if not task_id:
         raise ValueError("task_id cannot be empty")
+    if not scope.strip():
+        raise ValueError("scope cannot be empty")
+    if question_count < 1 or question_count > 4:
+        raise ValueError("question_count must be between 1 and 4")
+    if question_count > 1 and task_id != "q1":
+        raise ValueError("multi-question canonical graph requires task_id='q1'")
+    metadata: dict[str, Any] = {
+        "scope": scope.strip(),
+        "todo": f"Solve only {scope.strip()} and return its reviewed solve_problem_report.",
+        "question_number": 1 if scope.strip().lower() in {"question-1", "question 1", "first-question", "first question"} else None,
+        "exploration_mode": "auto",
+        "difficulty": 1,
+    }
+    if task_problem is not None:
+        if not task_problem.strip():
+            raise ValueError("task_problem cannot be empty when provided")
+        metadata["problem"] = task_problem
+    solve_nodes: list[DAGTaskNode] = []
+    for index in range(1, question_count + 1):
+        node_id = task_id if question_count == 1 else f"q{index}"
+        node_scope = scope.strip() if question_count == 1 else f"question-{index}"
+        node_metadata = dict(metadata)
+        node_metadata["scope"] = node_scope
+        node_metadata["question_number"] = index
+        node_metadata["todo"] = f"Solve only {node_scope} and return its reviewed solve_problem_report."
+        if task_problem is not None:
+            node_metadata["problem"] = (
+                task_problem if question_count == 1 else
+                task_problem + f"\n\nSCOPE LOCK: analyze only {node_scope}; do not solve or summarize any other numbered question."
+            )
+        solve_nodes.append(DAGTaskNode(
+            id=node_id,
+            title="解决问题" if question_count == 1 else f"解决第 {index} 问",
+            kind=DAGTaskKind.SOLVE_PROBLEM,
+            depends_on=(() if index == 1 else (f"q{index - 1}",)),
+            output_contract="solve_problem_report",
+            required_capabilities=("problem.solve",),
+            metadata=node_metadata,
+        ))
+    last_id = solve_nodes[-1].id
     return DAGTaskTable(
-        tasks=(
-            DAGTaskNode(
-                id=task_id, title="Solve problem", kind=DAGTaskKind.SOLVE_PROBLEM,
-                output_contract="solve_problem_report",
-                required_capabilities=("problem.solve",),
-                metadata={"exploration_mode": "auto", "difficulty": 1},
-            ),
-            DAGTaskNode(
-                id="publish-paper", title="Synthesize final question report and LaTeX paper",
-                kind=DAGTaskKind.PUBLISH_LATEX, depends_on=(task_id,), terminal=True,
-                output_contract="final_question_report+final_latex_paper",
-                required_capabilities=("report.finalize", "report.publish"),
-            ),
-        ),
+        tasks=(*solve_nodes, DAGTaskNode(
+            id="publish-paper", title="汇总最终报告与 LaTeX 论文",
+            kind=DAGTaskKind.PUBLISH_LATEX, depends_on=(last_id,), terminal=True,
+            output_contract="final_question_report+final_latex_paper",
+            required_capabilities=("report.finalize", "report.publish"),
+        )),
         terminal_task_id="publish-paper",
     )

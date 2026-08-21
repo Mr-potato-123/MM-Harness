@@ -5,6 +5,7 @@ import unittest
 import json
 from pathlib import Path
 from uuid import uuid4
+from unittest.mock import patch
 
 from m2harness import (
     CodingHarnessReport,
@@ -32,7 +33,8 @@ from m2harness.domain.knowledge import KnowledgeQuery
 from m2harness.domain.code import CodeProposal
 from m2harness.infrastructure.code_harness import LocalPythonCodeHarness
 from m2harness.application.solve_problem import WorkspaceReadOnlyFileReader
-from adapters.qwen_solve_problem import QwenCodeProposalProvider, QwenModelAgent, QwenPaperComposer, _content_parts
+from m2harness.application.report_store import RunReportStore
+from adapters.qwen_solve_problem import MainHarnessToolBridge, QwenChatClient, QwenCodeProposalProvider, QwenModelAgent, QwenPaperComposer, _content_parts
 from m2harness.domain.media import MultimodalInput
 import base64
 import hashlib
@@ -116,6 +118,15 @@ class FakeQwenClient:
 
 
 class SolveProblemHarnessTest(unittest.TestCase):
+    def test_main_harness_can_build_serial_question_todos_with_scopes(self) -> None:
+        dag = canonical_main_harness_dag(question_count=4, task_problem="BASE")
+        self.assertEqual(dag.topological_order(), ("q1", "q2", "q3", "q4", "publish-paper"))
+        self.assertEqual(tuple(node.metadata["scope"] for node in dag.tasks[:4]), (
+            "question-1", "question-2", "question-3", "question-4",
+        ))
+        self.assertEqual(dag.tasks[1].depends_on, ("q1",))
+        self.assertIn("question-4", dag.tasks[3].metadata["problem"])
+
     def test_solve_problem_is_a_bounded_report_loop(self) -> None:
         model = FakeModelAgent()
         service = SolveProblemService(model, FakeCodeHarness(), max_iterations=2)
@@ -303,6 +314,153 @@ class SolveProblemHarnessTest(unittest.TestCase):
             self.assertTrue(model.disclosed_seen)
             self.assertGreaterEqual(model.explore_calls, 2)
 
+    def test_generated_code_becomes_allowlisted_review_evidence(self) -> None:
+        class GeneratedCodeHarness(FakeCodeHarness):
+            def __init__(self, root):
+                self.root = root
+
+            def execute(self, task, context, modeling, *, iteration):
+                path = self.root / ".m2harness-code" / task.task_id / f"iteration-{iteration}" / "solve.py"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                data = b"print('evidence')\n"
+                path.write_bytes(data)
+                return CodingHarnessReport(
+                    report=_report("code"), execution_succeeded=True,
+                    validations={"sanity": True},
+                    validation_evidence={"sanity": "deterministic"},
+                    artifacts=[ProducedArtifact(logical_name="evidence.json", text="{}")],
+                    generated_files=(ReadOnlyFileReference(
+                        relative_path=path.relative_to(self.root).as_posix(),
+                        purpose="Generated source", role=ReadOnlyFileRole.GENERATED,
+                        sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
+                    ),),
+                )
+
+        class ReviewingModel(FakeModelAgent):
+            def __init__(self):
+                super().__init__()
+                self.review_context = None
+
+            def review(self, task, context, modeling, coding, *, iteration):
+                self.review_context = context
+                return SolveProblemReview(decision=ModelReviewDecision.APPROVE, rationale="source is reviewable")
+
+            def compose_final_report(self, task, context, modeling, coding, review, *, iteration):
+                return _report("final")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            model = ReviewingModel()
+            result = SolveProblemService(
+                model, GeneratedCodeHarness(root), max_iterations=1,
+                file_reader=WorkspaceReadOnlyFileReader(root),
+            ).solve(SolveProblemTask(task_id="q1", title="Q", problem="P"))
+            self.assertEqual(result.status, SolveProblemStatus.COMPLETED)
+            assert model.review_context is not None
+            self.assertTrue(any(item.role == ReadOnlyFileRole.GENERATED for item in model.review_context.readonly_files))
+
+    def test_each_model_code_review_revision_is_archived_before_next_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_id = uuid4()
+            result = SolveProblemService(
+                FakeModelAgent(), FakeCodeHarness(), max_iterations=2,
+                archive_writer=RunReportStore(root),
+            ).solve(
+                SolveProblemTask(task_id="q1", title="Q", problem="P"),
+                SolveProblemContext(metadata={"run_id": str(run_id)}),
+            )
+            self.assertEqual(result.status, SolveProblemStatus.COMPLETED)
+            self.assertGreaterEqual(len(result.archive_files), 7)
+            exchange_root = root / "reports" / "runs" / str(run_id) / "tasks" / "q1" / "attempt-1" / "exchanges"
+            expected = {
+                "preliminary-route-0.md", "modeling_report.md", "coding_report.md",
+                "review_report.md", "revision_instructions.md",
+            }
+            names = {path.name for path in exchange_root.rglob("*.md")}
+            self.assertTrue(expected.issubset(names), names)
+            self.assertGreaterEqual(len(list(exchange_root.rglob("*.md"))), 7)
+            model_to_code = next(exchange_root.rglob("model-to-code.md"))
+            code_to_review = next(exchange_root.rglob("code-to-review.md"))
+            self.assertLess(model_to_code.stat().st_size, 12_000)
+            self.assertLess(code_to_review.stat().st_size, 12_000)
+            self.assertIn("输出", model_to_code.read_text(encoding="utf-8"))
+            self.assertIn("输出", code_to_review.read_text(encoding="utf-8"))
+            model_to_code_text = model_to_code.read_text(encoding="utf-8")
+            code_to_review_text = code_to_review.read_text(encoding="utf-8")
+            review_to_next = next(exchange_root.rglob("review-to-next-stage.md")).read_text(encoding="utf-8")
+            self.assertIn("转接理由", model_to_code_text)
+            self.assertIn("转接理由", code_to_review_text)
+            self.assertIn("转接理由", review_to_next)
+            self.assertIn("返修上限", review_to_next)
+            persisted = RunReportStore(root).persist(run_id, result, attempt=1)
+            self.assertTrue(any("/exchanges/" in item.relative_path.replace("\\", "/") for item in persisted))
+
+    def test_solve_problem_caps_revisions_at_two_rounds(self) -> None:
+        class AlwaysReviseModel(FakeModelAgent):
+            def review(self, task, context, modeling, coding, *, iteration):
+                self.reviews += 1
+                return SolveProblemReview(
+                    decision=ModelReviewDecision.REVISE,
+                    rationale="evidence remains incomplete",
+                    revision_instructions=("produce the missing evidence",),
+                )
+
+        model = AlwaysReviseModel()
+        result = SolveProblemService(model, FakeCodeHarness(), max_iterations=20).solve(
+            SolveProblemTask(task_id="q1", title="Q", problem="P"),
+        )
+        self.assertEqual(result.status, SolveProblemStatus.REVISION_REQUIRED)
+        self.assertEqual(result.iteration_count, 3)
+        self.assertEqual(len(result.iterations), 3)
+        self.assertEqual(model.reviews, 3)
+
+    def test_solve_problem_can_resume_from_serialized_modeling_at_code_stage(self) -> None:
+        model = FakeModelAgent()
+        task = SolveProblemTask(task_id="q1", title="Q", problem="P")
+        preliminary = PreliminaryModelingReport(
+            branch_id="route-0", report=_report("route"), candidate_scheme="scheme", expected_outputs=("result",)
+        )
+        modeling = UnifiedModelingReport(
+            report=_report("model"), selected_branch_ids=("route-0",), main_scheme="scheme",
+            required_validations=("sanity",), expected_outputs=("result",), coding_instructions=("emit evidence",),
+        )
+        context = SolveProblemContext(metadata={
+            "resume_iteration": 2,
+            "resume_modeling": modeling.model_dump(mode="json"),
+            "resume_preliminary": [preliminary.model_dump(mode="json")],
+            "resume_revision_target": "code",
+        })
+        result = SolveProblemService(model, FakeCodeHarness(), max_iterations=3).solve(task, context)
+        self.assertEqual(result.status, SolveProblemStatus.COMPLETED)
+        self.assertEqual(result.iteration_count, 3)
+        self.assertEqual(len(result.iterations), 2)
+        self.assertEqual(model.explorations, [])
+
+    def test_main_harness_caps_resumed_revision_rounds_at_two(self) -> None:
+        class AlwaysReviseModel(FakeModelAgent):
+            def review(self, task, context, modeling, coding, *, iteration):
+                self.reviews += 1
+                return SolveProblemReview(
+                    decision=ModelReviewDecision.REVISE,
+                    rationale="evidence remains incomplete",
+                    revision_instructions=("produce the missing evidence",),
+                )
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = build_local_runtime(
+                workspace_root=root / "w", artifact_root=root / "a", database_path=root / "r.db",
+                solve_problem_service=SolveProblemService(AlwaysReviseModel(), FakeCodeHarness(), max_iterations=1),
+            )
+            state = bundle.main_harness.start("P", canonical_main_harness_dag())
+            state = bundle.main_harness.dispatch(state, "q1", max_iterations=1)
+            self.assertEqual(state.tasks[0].status.value, "revision_required")
+            state = bundle.main_harness.dispatch(state, "q1", max_iterations=1)
+            self.assertEqual(state.tasks[0].status.value, "revision_required")
+            with self.assertRaisesRegex(ValueError, "maximum of 2"):
+                bundle.main_harness.dispatch(state, "q1", max_iterations=1)
+
     def test_reference_hmml_is_searchable_and_report_first(self) -> None:
         hmml = Path(__file__).parents[1] / "ref_github" / "LLM-MM-Agent" / "MMAgent" / "HMML" / "HMML.json"
         self.assertTrue(hmml.is_file())
@@ -362,6 +520,13 @@ class SolveProblemHarnessTest(unittest.TestCase):
             self.assertTrue(coding.validation_evidence["sanity"])
             self.assertEqual(len(coding.artifacts), 2)
 
+            pretty = LocalPythonCodeHarness(
+                FakeCodeProposalProvider("import json; print(json.dumps({'validations': {'sanity': True}, 'validation_evidence': {'sanity': 'pretty-json-evidence'}}, indent=2))"),
+                bundle.sandbox, root / "w",
+            ).execute(SolveProblemTask(task_id="q1", title="Q", problem="P"), SolveProblemContext(), modeling, iteration=3)
+            self.assertTrue(pretty.execution_succeeded)
+            self.assertEqual(pretty.validation_evidence["sanity"], "pretty-json-evidence")
+
             self_reported = LocalPythonCodeHarness(
                 FakeCodeProposalProvider("import json; print(json.dumps({'validations': {'sanity': True}}))"),
                 bundle.sandbox, root / "w",
@@ -403,6 +568,111 @@ class SolveProblemHarnessTest(unittest.TestCase):
             self.assertEqual(final.title, "final")
             self.assertEqual(proposal.logical_name, "generated_solution.py")
             self.assertGreaterEqual(len(client.calls), 5)
+
+    def test_qwen_client_retries_truncated_json_without_synthetic_repair(self) -> None:
+        class Response:
+            status_code = 200
+
+            def __init__(self, body):
+                self.body = body
+
+            def json(self):
+                return self.body
+
+            def raise_for_status(self):
+                raise AssertionError("unexpected HTTP error")
+
+        class Client:
+            payloads = []
+            responses = [
+                {"choices": [{"finish_reason": "length", "message": {"content": '{"title":"cut'}}]},
+                {"choices": [{"finish_reason": "stop", "message": {"content": '{"ok":true}'}}]},
+            ]
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def post(self, url, *, headers, json):
+                self.payloads.append(json)
+                return Response(self.responses.pop(0))
+
+        with patch("adapters.qwen_solve_problem.httpx.Client", Client):
+            with patch.dict("os.environ", {"QWEN_MAX_OUTPUT_TOKENS": "4000", "QWEN_STREAM": "0"}, clear=False):
+                value = QwenChatClient(api_key="test-key", timeout_seconds=1).json(
+                    system="system", content=[{"type": "text", "text": "prompt"}], schema={}
+                )
+        self.assertEqual(value, {"ok": True})
+        self.assertEqual(len(Client.payloads), 2)
+        self.assertFalse(Client.payloads[1]["enable_thinking"])
+        self.assertEqual(Client.payloads[1]["max_tokens"], 8000)
+        self.assertIn("previous response was truncated", Client.payloads[1]["messages"][1]["content"][-1]["text"])
+
+    def test_qwen_client_consumes_sse_stream(self) -> None:
+        class Response:
+            status_code = 200
+            headers = {"content-type": "text/event-stream"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def iter_lines(self):
+                yield 'data: {"choices":[{"delta":{"content":"{\\"ok\\":"}}]}'
+                yield 'data: {"choices":[{"delta":{"content":"true}"},"finish_reason":"stop"}]}'
+                yield "data: [DONE]"
+
+            def raise_for_status(self):
+                raise AssertionError("unexpected HTTP error")
+
+        class Client:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def stream(self, *args, **kwargs):
+                return Response()
+
+        with patch("adapters.qwen_solve_problem.httpx.Client", Client):
+            with patch.dict("os.environ", {"QWEN_STREAM": "1", "QWEN_STREAM_PROGRESS": "0"}, clear=False):
+                value = QwenChatClient(api_key="test-key", timeout_seconds=1).json(
+                    system="system", content=[{"type": "text", "text": "prompt"}], schema={}
+                )
+        self.assertEqual(value, {"ok": True})
+
+    def test_code_agent_tool_bridge_projects_and_audits_main_harness_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = build_local_runtime(workspace_root=root / "workspace", artifact_root=root / "artifacts", database_path=root / "runtime.db")
+            target = root / "workspace" / "sample.py"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("alpha = 1\n", encoding="utf-8")
+            bridge = MainHarnessToolBridge(bundle.tool_runtime, bundle.capabilities)
+            names = {item["function"]["name"] for item in bridge.definitions()}
+            self.assertTrue({"workspace_read", "workspace_write", "workspace_edit", "workspace_search", "python_execute"}.issubset(names))
+            result = bridge.execute("workspace_search", {"pattern": "alpha", "path": "."}, task_id="q1", iteration=1, turn=1)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["output"]["matches"][0]["path"], "sample.py")
+            first = bridge.execute("workspace_write", {"path": "chunks.txt", "content": "one\n", "overwrite": True}, task_id="q1", iteration=1, turn=1)
+            second = bridge.execute("workspace_write", {"path": "chunks.txt", "content": "two\n", "append": True}, task_id="q1", iteration=1, turn=2)
+            self.assertTrue(first["ok"] and second["ok"])
+            read_back = bridge.execute("workspace_read", {"path": "chunks.txt"}, task_id="q1", iteration=1, turn=3)
+            self.assertEqual(read_back["output"]["content"], "one\ntwo\n")
+            denied = bridge.execute("report_render", {"markdown": "bad"}, task_id="q1", iteration=1, turn=1)
+            self.assertFalse(denied["ok"])
+            self.assertEqual(denied["error_code"], "tool_not_allowed")
 
     def test_runtime_can_attach_provider_after_sandbox_composition(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

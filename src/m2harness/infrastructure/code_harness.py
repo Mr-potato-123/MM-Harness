@@ -95,14 +95,17 @@ class LocalPythonCodeHarness:
                 issues.append("one or more required validations lacked reproducible evidence")
             metrics = parsed.get("metrics", {}) if isinstance(parsed, dict) and isinstance(parsed.get("metrics", {}), dict) else {}
             log = json.dumps({"exit_code": output.exit_code, "timed_out": output.timed_out, "stdout": stdout, "stderr": stderr}, ensure_ascii=False, indent=2)
-            generated_files = self._generated_files(task, iteration)
+            generated_files = self._generated_files(
+                task, iteration, script_path=script_path,
+                metadata=proposal.metadata,
+            )
             return CodingHarnessReport(
                 report=ReportPayload(title="Local Code Harness execution", summary="Execution evidence captured locally.", markdown="# Code Harness\n\nExecution evidence was captured locally.", claims=["Source was parsed and executed by the configured local sandbox."], limitations=issues),
                 execution_succeeded=succeeded, validations=validations,
                 validation_evidence=validation_evidence,
                 metrics={key: value for key, value in metrics.items() if isinstance(value, (str, int, float, bool))},
                 issues=tuple(issues), artifacts=[
-                    ProducedArtifact(logical_name=proposal.logical_name, kind=ArtifactKind.OUTPUT, media_type="text/x-python", text=proposal.source, metadata={"workspace_script": str(script_path.relative_to(self.workspace_root).as_posix()), "task_id": task.task_id, "iteration": iteration}),
+                    ProducedArtifact(logical_name=proposal.logical_name, kind=ArtifactKind.OUTPUT, media_type="text/x-python", text=proposal.source, metadata={"workspace_script": str(script_path.relative_to(self.workspace_root).as_posix()), "task_id": task.task_id, "iteration": iteration, **proposal.metadata}),
                     ProducedArtifact(logical_name=proposal.logical_name.removesuffix(".py") + ".execution.json", kind=ArtifactKind.LOG, media_type="application/json", text=log),
                 ], generated_files=generated_files,
             )
@@ -132,12 +135,35 @@ class LocalPythonCodeHarness:
                 os.unlink(temporary)
         return target
 
-    def _generated_files(self, task: SolveProblemTask, iteration: int) -> tuple[ReadOnlyFileReference, ...]:
-        output_dir = (self.workspace_root / ".m2harness-code" / task.task_id / f"iteration-{iteration}" / "outputs").resolve()
-        if not output_dir.is_dir():
-            return ()
+    def _generated_files(self, task: SolveProblemTask, iteration: int, *, script_path: Path | None = None, metadata: dict[str, str] | None = None) -> tuple[ReadOnlyFileReference, ...]:
         result: list[ReadOnlyFileReference] = []
-        for path in sorted(output_dir.rglob("*")):
+        if script_path is not None and script_path.is_file() and not script_path.is_symlink():
+            data = script_path.read_bytes()
+            result.append(ReadOnlyFileReference(
+                relative_path=script_path.relative_to(self.workspace_root).as_posix(),
+                purpose=f"Code Agent source generated for {task.task_id} iteration {iteration}; read-only review evidence.",
+                role=ReadOnlyFileRole.GENERATED, owner_task_id=task.task_id,
+                media_type="text/x-python", sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
+            ))
+        output_dir = (self.workspace_root / ".m2harness-code" / task.task_id / f"iteration-{iteration}" / "outputs").resolve()
+        candidates: list[Path] = []
+        if output_dir.is_dir():
+            candidates.extend(sorted(output_dir.rglob("*")))
+        # Mature Code Agent runtimes expose their durable event stream as an
+        # ordinary review artifact.  Only provider-declared relative paths are
+        # admitted; arbitrary metadata cannot grant filesystem access.
+        event_path = (metadata or {}).get("event_log")
+        if event_path:
+            candidate = (self.workspace_root / event_path).resolve()
+            if self.workspace_root == candidate or self.workspace_root in candidate.parents:
+                candidates.append(candidate)
+        if not candidates:
+            return tuple(result)
+        seen: set[Path] = set()
+        for path in candidates:
+            if path in seen:
+                continue
+            seen.add(path)
             if not path.is_file() or path.is_symlink():
                 continue
             data = path.read_bytes()
@@ -154,11 +180,26 @@ class LocalPythonCodeHarness:
 
     @staticmethod
     def _parse_json(stdout: str) -> dict | None:
-        lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-        if not lines:
+        text = stdout.strip()
+        if not text:
             return None
         try:
-            value = json.loads(lines[-1])
+            value = json.loads(text)
+            return value if isinstance(value, dict) else None
         except json.JSONDecodeError:
-            return None
-        return value if isinstance(value, dict) else None
+            pass
+
+        # Generated scripts commonly pretty-print their final JSON object.
+        # The old implementation parsed only the last physical line (often
+        # just ``}``), incorrectly converting valid evidence into a failure.
+        decoder = json.JSONDecoder()
+        for index in range(len(text) - 1, -1, -1):
+            if text[index] != "{":
+                continue
+            try:
+                value, _ = decoder.raw_decode(text[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                return value
+        return None

@@ -42,6 +42,37 @@ class RunReportStore:
         self.workspace_root = workspace_root.resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
 
+    def archive_markdown(
+        self,
+        run_id: UUID,
+        *,
+        task_id: str,
+        attempt: int,
+        iteration: int,
+        stage: str,
+        name: str,
+        markdown: str,
+        purpose: str,
+        role: ReadOnlyFileRole,
+    ) -> ReadOnlyFileReference:
+        """Persist one live Agent exchange before the next stage is called."""
+
+        if stage == "modeling":
+            relative = Path("reports") / "runs" / str(run_id) / "tasks" / task_id / f"attempt-{attempt}" / "exchanges" / f"iteration-{iteration}" / "modeling" / (self._safe_name(name) + ".md")
+        elif stage == "coding":
+            relative = Path("reports") / "runs" / str(run_id) / "tasks" / task_id / f"attempt-{attempt}" / "exchanges" / f"iteration-{iteration}" / "coding" / (self._safe_name(name) + ".md")
+        elif stage == "review":
+            relative = Path("reports") / "runs" / str(run_id) / "tasks" / task_id / f"attempt-{attempt}" / "exchanges" / f"iteration-{iteration}" / "review" / (self._safe_name(name) + ".md")
+        elif stage == "handoff":
+            relative = Path("reports") / "runs" / str(run_id) / "tasks" / task_id / f"attempt-{attempt}" / "exchanges" / f"iteration-{iteration}" / "handoff" / (self._safe_name(name) + ".md")
+        else:
+            raise ValueError(f"unknown solve_problem archive stage: {stage}")
+        record = self._write(
+            relative, markdown, purpose=purpose, role=role, task_id=task_id,
+            attempt=attempt, iteration=iteration, media_type="text/markdown",
+        )
+        return record.as_readonly()
+
     def persist(self, run_id: UUID, report: SolveProblemReport, *, attempt: int) -> tuple[ReportFileRecord, ...]:
         base = Path("reports") / "runs" / str(run_id) / "tasks" / report.task_id / f"attempt-{attempt}"
         records: list[ReportFileRecord] = []
@@ -82,6 +113,41 @@ class RunReportStore:
                     generated, task_id=report.task_id, attempt=attempt,
                     iteration=snapshot.iteration,
                 ))
+            review_dir = base / "review" / f"iteration-{snapshot.iteration}"
+            if snapshot.review.decision.value == "approve":
+                transfer_reason = "审查已批准且证据满足门槛；交给最终报告阶段，只能使用已审查声明。"
+            else:
+                transfer_reason = (
+                    f"审查未批准当前产物；按最窄目标 `{snapshot.review.revision_target.value}` "
+                    "转回返修，并执行下方具体指令。"
+                )
+            records.append(self._write(
+                review_dir / "review_report.md", "\n".join([
+                    f"# Review Agent 审查决定：{snapshot.review.decision.value}", "",
+                    "## 转接理由", "", transfer_reason,
+                    "## 理由", "", snapshot.review.rationale,
+                    "", "## 返修目标", "", f"`{snapshot.review.revision_target.value}`",
+                    "", "## 已接受声明", "", *(f"- {item}" for item in snapshot.review.accepted_claims),
+                    "", "## 返修指令", "", *(f"- {item}" for item in snapshot.review.revision_instructions),
+                    "", "## 请求读取的只读文件", "", *(f"- `{item}`" for item in snapshot.review.requested_file_paths),
+                ]).strip() + "\n",
+                purpose=f"Review Agent decision for {report.task_id}, iteration {snapshot.iteration}.",
+                role=ReadOnlyFileRole.REFERENCE, task_id=report.task_id,
+                attempt=attempt, iteration=snapshot.iteration, media_type="text/markdown",
+            ))
+            if snapshot.review.revision_instructions:
+                records.append(self._write(
+                    review_dir / "revision_instructions.md",
+                    "# Review Agent 返修指令\n\n" + "\n".join(f"- {item}" for item in snapshot.review.revision_instructions) + "\n",
+                    purpose=f"Review Agent 在 {report.task_id} 第 {snapshot.iteration} 轮后的返修指令。",
+                    role=ReadOnlyFileRole.REFERENCE, task_id=report.task_id,
+                    attempt=attempt, iteration=snapshot.iteration, media_type="text/markdown",
+                ))
+        for archive in report.archive_files:
+            records.append(self._index_existing(
+                archive, task_id=report.task_id, attempt=attempt,
+                iteration=_archive_iteration(archive.relative_path),
+            ))
         if report.final_report is not None:
             records.append(self._write(
                 base / "final" / "solution_report.md", report.final_report.markdown,
@@ -138,7 +204,7 @@ class RunReportStore:
             sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data), **metadata,
         )
 
-    def _index_existing(self, reference: ReadOnlyFileReference, *, task_id: str, attempt: int, iteration: int) -> ReportFileRecord:
+    def _index_existing(self, reference: ReadOnlyFileReference, *, task_id: str, attempt: int, iteration: int | None) -> ReportFileRecord:
         target = (self.workspace_root / reference.relative_path).resolve()
         if self.workspace_root not in target.parents or not target.is_file() or target.is_symlink():
             raise ValueError(f"generated output is not a safe workspace file: {reference.relative_path}")
@@ -157,3 +223,8 @@ class RunReportStore:
         name = Path(value).name
         sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
         return sanitized[:200] or "artifact"
+
+
+def _archive_iteration(relative_path: str) -> int | None:
+    match = re.search(r"/exchanges/iteration-(\d+)/", "/" + relative_path.replace("\\", "/"))
+    return int(match.group(1)) if match else None

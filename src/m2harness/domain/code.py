@@ -12,3 +12,7 @@ class CodeProposal(StrictModel):
     logical_name: str = Field(default="generated_solution.py", pattern=r"^[A-Za-z0-9._-]+\.py$", max_length=200)
     timeout_seconds: int = Field(default=300, ge=1, le=600)
     expected_validations: tuple[str, ...] = ()
+    # Provider-neutral runtime metadata.  The execution contract never trusts
+    # this field for correctness, but it lets a mature agent runtime expose
+    # its session/event artifacts to independent review.
+    metadata: dict[str, str] = Field(default_factory=dict)

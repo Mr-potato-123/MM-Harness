@@ -46,6 +46,7 @@ from m2harness.domain.research import ResearchFinding, ResearchReport, ResearchS
 from m2harness.domain.code import CodeProposal
 from m2harness.domain.media import MultimodalInput
 from m2harness.infrastructure.code_harness import CodeProposalProvider, LocalPythonCodeHarness
+from m2harness.infrastructure.dsh_code_harness import DshCodeProposalProvider, DshRuntimeConfig, DshRuntimeError
 
 __all__ = [
     "ActivityExecutor",
@@ -129,4 +130,7 @@ __all__ = [
     "MultimodalInput",
     "CodeProposalProvider",
     "LocalPythonCodeHarness",
+    "DshCodeProposalProvider",
+    "DshRuntimeConfig",
+    "DshRuntimeError",
 ]

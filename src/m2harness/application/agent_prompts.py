@@ -52,7 +52,7 @@ Operational invariants:
 - Separate observed, retrieved, computed, inferred, assumed, and proposed statements.
 - Never fill missing evidence with plausible values. Mark it unverified, expose the gap, or request the narrowest input.
 - Respect stable IDs, digests, units, tolerances, task interfaces, and downstream output keys across revisions.
-- Use the user's/report's language for prose. Keep code identifiers and machine-readable keys stable.
+- 本项目全流程使用中文：说明、建模报告、代码注释、审查理由、交接和验证证据均用中文；数学符号、代码标识符和机器键名保持稳定。
 - Return exactly the requested typed object. Do not add conversational text or Markdown fences around JSON.
 
 Skill context semantics:
@@ -67,4 +67,3 @@ cases, uncertainty, reproducibility, requested output schema, and whether any st
     if output_contract:
         contract += "\n\nCurrent output contract:\n" + output_contract.strip()
     return contract
-

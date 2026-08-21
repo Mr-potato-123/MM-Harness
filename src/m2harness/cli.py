@@ -103,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lease-seconds", type=int, default=300)
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--max-attempts", type=int, default=3)
-    parser.add_argument("--max-revisions", type=int, default=3)
+    parser.add_argument("--max-revisions", type=int, default=2, help="最多允许两轮审查返修")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("init")
     project = commands.add_parser("create-project")
@@ -129,9 +129,22 @@ def build_parser() -> argparse.ArgumentParser:
     qwen.add_argument("--allow-remote-code-interpreter", action="store_true", help="preliminary provider-only run; remote execution can never satisfy the production evidence gate")
     main_qwen = commands.add_parser("run-main-qwen", help="run the target Main Harness -> solve_problem -> paper path")
     main_qwen.add_argument("input", type=Path, help="PDF/image/video input selected for the problem")
-    main_qwen.add_argument("--problem", default="Solve the attached single mathematical-modeling problem and produce an auditable report.")
+    main_qwen.add_argument("--problem", default="请解决所附数学建模题并产出可审计报告；各编号问题必须按 TODO 串行处理。")
+    main_qwen.add_argument("--scope", default="question-1", help="scope label used by a one-question graph; multi-question runs use question-1..question-N")
+    main_qwen.add_argument("--question-count", type=int, default=4, help="number of numbered questions to solve serially (default: 4)")
     main_qwen.add_argument("--model", default=None)
-    main_qwen.add_argument("--max-iterations", type=int, default=3)
+    main_qwen.add_argument("--code-agent", choices=("dsh", "qwen"), default=os.environ.get("M2HARNESS_CODE_AGENT", "dsh"), help="Code Agent 运行时；默认使用持久 DSH Session")
+    main_qwen.add_argument("--max-iterations", type=int, default=3, help="总迭代上限：初始实现轮 + 最多两轮返修")
+    resume_qwen = commands.add_parser("resume-main-qwen", help="从已归档的 Model→Code 交接恢复主 Harness")
+    resume_qwen.add_argument("input", type=Path, help="原始 PDF/图片输入")
+    resume_qwen.add_argument("--run-root", type=Path, required=True, help="已有运行根目录")
+    resume_qwen.add_argument("--source-run-id", default=None, help="历史归档的 run_id；省略时取运行目录中最近的归档")
+    resume_qwen.add_argument("--resume-payload", type=Path, required=True, help="序列化的建模契约与初步路线")
+    resume_qwen.add_argument("--resume-iteration", type=int, default=2, help="恢复开始的 solve_problem 迭代号")
+    resume_qwen.add_argument("--problem", default="请继续完成 2026B 数学建模题；从已有 q1 返修交接恢复，之后按 q1→q2→q3→q4 串行处理。")
+    resume_qwen.add_argument("--model", default=None)
+    resume_qwen.add_argument("--code-agent", choices=("dsh", "qwen"), default=os.environ.get("M2HARNESS_CODE_AGENT", "dsh"), help="Code Agent 运行时；默认使用持久 DSH Session")
+    resume_qwen.add_argument("--max-iterations", type=int, default=3, help="总迭代上限：初始实现轮 + 最多两轮返修")
     commands.add_parser("catalog")
     preflight = commands.add_parser("preflight")
     preflight.add_argument("--input", type=Path, default=None)
@@ -201,7 +214,7 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("--executor must be followed by an executable and arguments")
         executor = CommandActivityExecutor(
             args.executor, timeout_seconds=settings.activity_timeout_seconds,
-            pass_env=("DASHSCOPE_API_KEY", "QWEN_BASE_URL", "QWEN_MODEL", "QWEN_MAX_OUTPUT_TOKENS", "M2HARNESS_MODEL_HOSTS", "QWEN_ENABLE_REMOTE_CODE_INTERPRETER"),
+            pass_env=("DASHSCOPE_API_KEY", "DEEPSEEK_API_KEY", "QWEN_BASE_URL", "QWEN_MODEL", "QWEN_MAX_OUTPUT_TOKENS", "M2HARNESS_MODEL_HOSTS", "QWEN_ENABLE_REMOTE_CODE_INTERPRETER"),
             environment={"M2HARNESS_ARTIFACT_ROOT": str(settings.artifact_root.resolve()), "M2HARNESS_SKILL_ROOT": str(default_skill_root())},
         )
         workflow = SingleQuestionWorkflow(settings, executor, artifact_registry=SQLiteArtifactRegistry(settings.database_path))
@@ -211,8 +224,8 @@ def main(argv: list[str] | None = None) -> int:
         runtime = build_local_runtime(database_path=settings.database_path, artifact_root=settings.artifact_root, allow_host_sandbox=True)
         if not runtime.sandbox.available and not args.allow_remote_code_interpreter:
             raise RuntimeError("local_execution_disabled: set M2HARNESS_SANDBOX_BACKEND=host or configure Docker/VM; --allow-remote-code-interpreter is provider-only and cannot complete a report")
-        if not os.environ.get("DASHSCOPE_API_KEY"):
-            raise RuntimeError("DASHSCOPE_API_KEY is required for run-qwen; inject it through the process environment or a secret provider")
+        if not (os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")):
+            raise RuntimeError("DASHSCOPE_API_KEY or DEEPSEEK_API_KEY is required for run-qwen; inject it through the process environment or a secret provider")
         adapter = _resolve_adapter_path(args.adapter)
         if not adapter.is_file():
             raise FileNotFoundError(f"Qwen adapter not found: {adapter}")
@@ -226,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
             environment["QWEN_ENABLE_REMOTE_CODE_INTERPRETER"] = "1"
         executor = CommandActivityExecutor(
             [sys.executable, str(adapter)], timeout_seconds=settings.activity_timeout_seconds,
-            pass_env=("DASHSCOPE_API_KEY", "QWEN_BASE_URL", "QWEN_MODEL", "QWEN_MAX_OUTPUT_TOKENS", "M2HARNESS_MODEL_HOSTS", "QWEN_ENABLE_REMOTE_CODE_INTERPRETER"), environment=environment,
+            pass_env=("DASHSCOPE_API_KEY", "DEEPSEEK_API_KEY", "QWEN_BASE_URL", "QWEN_MODEL", "QWEN_MAX_OUTPUT_TOKENS", "M2HARNESS_MODEL_HOSTS", "QWEN_ENABLE_REMOTE_CODE_INTERPRETER"), environment=environment,
         )
         if runtime.sandbox.available:
             executor = SandboxedActivityExecutor(
@@ -241,10 +254,12 @@ def main(argv: list[str] | None = None) -> int:
         from adapters.qwen_solve_problem import QwenChatClient, QwenPaperComposer, build_qwen_solve_problem_service
 
         data = _read_input_file(args.input)
-        if not os.environ.get("DASHSCOPE_API_KEY"):
-            raise RuntimeError("DASHSCOPE_API_KEY is required for run-main-qwen; inject it through the process environment or a secret provider")
+        if not (os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")):
+            raise RuntimeError("DASHSCOPE_API_KEY or DEEPSEEK_API_KEY is required for run-main-qwen; inject it through the process environment or a secret provider")
         if args.max_iterations < 1 or args.max_iterations > 20:
             raise ValueError("--max-iterations must be between 1 and 20")
+        if args.question_count < 1 or args.question_count > 4:
+            raise ValueError("--question-count must be between 1 and 4")
         media_type = mimetypes.guess_type(args.input.name)[0] or "application/octet-stream"
         if media_type == "application/pdf" and len(data) > 150 * 1024 * 1024:
             raise ValueError("Qwen PDF input exceeds the 150MB provider limit")
@@ -260,31 +275,64 @@ def main(argv: list[str] | None = None) -> int:
         staged_path = runtime.tool_environment.resolve_workspace(Path("inputs") / staged_name)
         staged_path.parent.mkdir(parents=True, exist_ok=True)
         staged_path.write_bytes(data)
-        client = QwenChatClient(model=args.model or os.environ.get("QWEN_MODEL", "qwen3.8-max"))
+        client = QwenChatClient(
+            base_url=os.environ.get("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            model=args.model or os.environ.get("QWEN_MODEL", "qwen3.8-max"),
+        )
         service = build_qwen_solve_problem_service(
             sandbox=runtime.sandbox, workspace_root=runtime.tool_environment.workspace_root,
             research_agent=runtime.research_service, skills=runtime.skills,
+            tool_runtime=runtime.tool_runtime, capabilities=runtime.capabilities,
+            archive_writer=runtime.main_harness.report_store,
             client=client, max_iterations=args.max_iterations,
         )
         runtime = runtime.attach_solve_problem_service(service)
-        state = runtime.main_harness.start(args.problem, canonical_main_harness_dag())
-        state = runtime.main_harness.dispatch(
-            state, "q1",
-            context=SolveProblemContext(
-                multimodal_inputs=(multimodal,),
-                readonly_files=(ReadOnlyFileReference(
-                    relative_path=str((Path("inputs") / staged_name).as_posix()),
-                    purpose="Original problem statement or source file selected by the user; read-only input for this solve.",
-                    role=ReadOnlyFileRole.PROBLEM, media_type=media_type,
-                    sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
-                ),),
-                metadata={"staged_input_relative_path": str(Path("inputs") / staged_name)},
-            ),
-            max_iterations=args.max_iterations,
+        scope_prompt = (
+            f"{args.problem}\n\nThe Main Harness owns a serial TODO list of {args.question_count} numbered questions. "
+            "Each solve_problem call must analyze exactly its own question scope and must not solve, summarize, "
+            "formulate, code, validate, or report results for later questions. Previous-question results arrive "
+            "only through the compressed dependency context."
         )
-        if not state.reports or state.reports[-1].status.value != "completed":
-            _emit(state)
-            return 1
+        state = runtime.main_harness.start(
+            scope_prompt,
+            canonical_main_harness_dag(
+                scope=args.scope, task_problem=scope_prompt,
+                question_count=args.question_count,
+            ),
+        )
+        base_context = SolveProblemContext(
+            multimodal_inputs=(multimodal,),
+            readonly_files=(ReadOnlyFileReference(
+                relative_path=str((Path("inputs") / staged_name).as_posix()),
+                purpose="Original problem statement or source file selected by the user; read-only input for this solve.",
+                role=ReadOnlyFileRole.PROBLEM, media_type=media_type,
+                sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
+            ),),
+            metadata={
+                "staged_input_relative_path": str(Path("inputs") / staged_name),
+                "scope": args.scope,
+            },
+        )
+        # Main Harness advances one ready TODO at a time.  Each dispatch gets
+        # the original source allowlist plus dependency projection; it never
+        # receives the previous Agent's full conversation or raw report tree.
+        while True:
+            ready = runtime.main_harness.ready_tasks(state)
+            solve_ready = [
+                item.id for item in state.dag.tasks
+                if item.id in ready and item.kind.value == "solve_problem"
+            ]
+            if not solve_ready:
+                break
+            for task_id in solve_ready:
+                state = runtime.main_harness.dispatch(
+                    state, task_id, context=base_context,
+                    max_iterations=args.max_iterations,
+                )
+                task_state = next(item for item in state.tasks if item.task_id == task_id)
+                if task_state.status.value != "completed":
+                    _emit(runtime.main_harness.todo_view(state))
+                    return 1
         state = runtime.main_harness.generate_paper(state, QwenPaperComposer(client, skills=runtime.skills))
         if state.final_report is None or state.final_latex_paper is None:
             raise RuntimeError("Main Harness paper composer returned no final publication")
@@ -304,7 +352,142 @@ def main(argv: list[str] | None = None) -> int:
         rendered = runtime.tool_runtime.execute(render_call, render_resolution)
         if not rendered.ok:
             raise RuntimeError(f"final report rendering failed: {rendered.error_message}")
-        _emit({"state": state, "published_files": rendered.output})
+        _emit({"todo": runtime.main_harness.todo_view(state), "published_files": rendered.output})
+        return 0
+    if args.command == "resume-main-qwen":
+        from adapters.qwen_solve_problem import QwenChatClient, QwenPaperComposer, build_qwen_solve_problem_service
+
+        if not (os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")):
+            raise RuntimeError("DASHSCOPE_API_KEY or DEEPSEEK_API_KEY is required for resume-main-qwen; inject it through the process environment or a secret provider")
+        if args.resume_iteration < 1 or args.resume_iteration > 3:
+            raise ValueError("--resume-iteration must be between 1 and 3")
+        if args.max_iterations < args.resume_iteration or args.max_iterations > 20:
+            raise ValueError("--max-iterations must cover the resume iteration and be at most 20")
+        payload = json.loads(args.resume_payload.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or not isinstance(payload.get("modeling"), dict) or not isinstance(payload.get("preliminary"), list):
+            raise ValueError("resume payload must contain modeling and preliminary objects")
+        data = _read_input_file(args.input)
+        media_type = mimetypes.guess_type(args.input.name)[0] or "application/octet-stream"
+        run_root = args.run_root.resolve()
+        runtime = build_local_runtime(
+            workspace_root=run_root / ".m2harness" / "workspace",
+            artifact_root=run_root / ".m2harness" / "artifacts",
+            database_path=run_root / ".m2harness" / "state.db",
+            allow_host_sandbox=True,
+        )
+        if not runtime.sandbox.available:
+            raise RuntimeError("local_execution_disabled: resume-main-qwen requires the trusted local host sandbox")
+        staged_name = Path(args.input.name).name
+        staged_path = runtime.tool_environment.resolve_workspace(Path("inputs") / staged_name)
+        staged_path.parent.mkdir(parents=True, exist_ok=True)
+        staged_path.write_bytes(data)
+        client = QwenChatClient(
+            base_url=os.environ.get("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            model=args.model or os.environ.get("QWEN_MODEL", "qwen3.8-max"),
+        )
+        service = build_qwen_solve_problem_service(
+            sandbox=runtime.sandbox, workspace_root=runtime.tool_environment.workspace_root,
+            research_agent=runtime.research_service, skills=runtime.skills,
+            tool_runtime=runtime.tool_runtime, capabilities=runtime.capabilities,
+            archive_writer=runtime.main_harness.report_store,
+            client=client, max_iterations=args.max_iterations,
+        )
+        runtime = runtime.attach_solve_problem_service(service)
+        workspace_root = runtime.tool_environment.workspace_root
+        source_run_id = getattr(args, "source_run_id", None)
+        if not source_run_id:
+            candidates = sorted((workspace_root / "reports" / "runs").glob("*"), key=lambda item: item.stat().st_mtime if item.exists() else 0)
+            source_run_id = candidates[-1].name if candidates else ""
+        q1_prefix = f"reports/runs/{source_run_id}/tasks/q1/attempt-1/exchanges"
+
+        def resume_reference(relative_path: str, role: ReadOnlyFileRole, purpose: str) -> ReadOnlyFileReference | None:
+            target = (workspace_root / relative_path).resolve()
+            if not target.is_file() or target.is_symlink() or workspace_root not in target.parents:
+                return None
+            raw = target.read_bytes()
+            return ReadOnlyFileReference(
+                relative_path=relative_path, purpose=purpose, role=role, owner_task_id="q1",
+                media_type=mimetypes.guess_type(target.name)[0] or "application/octet-stream",
+                sha256=hashlib.sha256(raw).hexdigest(), size_bytes=len(raw),
+            )
+
+        readonly: list[ReadOnlyFileReference] = []
+        original_ref = ReadOnlyFileReference(
+            relative_path=f"inputs/{staged_name}", purpose="原始题目输入；恢复流程只读使用。",
+            role=ReadOnlyFileRole.PROBLEM, media_type=media_type,
+            sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
+        )
+        readonly.append(original_ref)
+        for relative_path, role, purpose in (
+            (f"{q1_prefix}/iteration-1/modeling/modeling_report.md", ReadOnlyFileRole.REFERENCE, "上一轮已接受的完整建模报告。"),
+            (f"{q1_prefix}/iteration-1/modeling/preliminary-q1-mip-baseline.md", ReadOnlyFileRole.REFERENCE, "上一轮初步路线报告。"),
+            (f"{q1_prefix}/iteration-1/review/review_report.md", ReadOnlyFileRole.REFERENCE, "上一轮 Review 决定与理由。"),
+            (f"{q1_prefix}/iteration-1/review/revision_instructions.md", ReadOnlyFileRole.REFERENCE, "上一轮 Review 的具体返修指令。"),
+            (f"{q1_prefix}/iteration-1/handoff/review-to-next-stage.md", ReadOnlyFileRole.REFERENCE, "上一轮 Review→返修交接。"),
+            (f"{q1_prefix}/iteration-2/handoff/model-to-code.md", ReadOnlyFileRole.REFERENCE, "已保存的第 2 轮 Model→Code 交接。"),
+            (".m2harness-code/q1/iteration-2/solve_q1.py", ReadOnlyFileRole.GENERATED, "第 2 轮已生成的待返修源文件。"),
+        ):
+            reference = resume_reference(relative_path, role, purpose)
+            if reference is not None:
+                readonly.append(reference)
+        multimodal = MultimodalInput(
+            logical_name=staged_name, media_type=media_type,
+            data_base64=base64.b64encode(data).decode("ascii"),
+            sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
+        )
+        scope_prompt = (
+            f"{args.problem}\n\nMain Harness 维护 q1→q2→q3→q4 串行 TODO。"
+            "当前只恢复 q1 第 2 轮 Code 阶段；不得重新建模，不得处理后续问题。"
+        )
+        resume_context = SolveProblemContext(
+            multimodal_inputs=(multimodal,), readonly_files=tuple(readonly),
+            instructions=("Review 已接受建模，仅执行 code 返修；完成后交给 Review 验收。",),
+            metadata={
+                "scope": "question-1", "resume_iteration": args.resume_iteration,
+                "resume_modeling": payload["modeling"], "resume_preliminary": payload["preliminary"],
+                "resume_revision_target": payload.get("revision_target", "code"),
+            },
+        )
+        normal_context = resume_context.model_copy(update={
+            "metadata": {"scope": "question-1"},
+            "instructions": (),
+        })
+        state = runtime.main_harness.start(
+            scope_prompt,
+            canonical_main_harness_dag(scope="question-1", task_problem=scope_prompt, question_count=4),
+        )
+        while True:
+            ready = runtime.main_harness.ready_tasks(state)
+            solve_ready = [item.id for item in state.dag.tasks if item.id in ready and item.kind.value == "solve_problem"]
+            if not solve_ready:
+                break
+            for task_id in solve_ready:
+                dispatch_context = resume_context if task_id == "q1" else normal_context
+                state = runtime.main_harness.dispatch(state, task_id, context=dispatch_context, max_iterations=args.max_iterations)
+                task_state = next(item for item in state.tasks if item.task_id == task_id)
+                if task_state.status.value != "completed":
+                    _emit(runtime.main_harness.todo_view(state))
+                    return 1
+        state = runtime.main_harness.generate_paper(state, QwenPaperComposer(client, skills=runtime.skills))
+        if state.final_report is None or state.final_latex_paper is None:
+            raise RuntimeError("Main Harness paper composer returned no final publication")
+        render_definition = runtime.tools.get("report_render")
+        if render_definition is None:
+            raise RuntimeError("report_render tool is not registered")
+        render_resolution = runtime.capabilities.resolve([
+            CapabilityRequirement(capability=render_definition.required_capability, reason="Main Harness final publication"),
+        ])
+        render_call = ToolCall(
+            call_id=uuid4(), tool_name=render_definition.name, tool_version=render_definition.version,
+            activity_id=uuid4(), session_id=state.run_id,
+            idempotency_key=f"main-harness:{state.run_id}:publish-paper",
+            arguments={"markdown": state.final_report.markdown, "title": state.final_report.title, "path": "reports/final-question-report.md", "latex": state.final_latex_paper.text, "latex_path": "reports/final-question-paper.tex", "overwrite": True},
+            requested_at=utc_now(),
+        )
+        rendered = runtime.tool_runtime.execute(render_call, render_resolution)
+        if not rendered.ok:
+            raise RuntimeError(f"final report rendering failed: {rendered.error_message}")
+        _emit({"todo": runtime.main_harness.todo_view(state), "published_files": rendered.output})
         return 0
     if args.command == "catalog":
         runtime = build_local_runtime(database_path=settings.database_path, artifact_root=settings.artifact_root)
@@ -320,7 +503,8 @@ def main(argv: list[str] | None = None) -> int:
         provider_url = os.environ.get("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
         provider_parts = urlsplit(provider_url)
         provider_host = (provider_parts.hostname or "").lower()
-        configured_hosts = {item.strip().lower() for item in os.environ.get("M2HARNESS_MODEL_HOSTS", "dashscope.aliyuncs.com").split(",") if item.strip()}
+        configured_hosts = {item.strip().lower() for item in os.environ.get("M2HARNESS_MODEL_HOSTS", "dashscope.aliyuncs.com,api.deepseek.com").split(",") if item.strip()}
+        provider_is_deepseek = provider_host.endswith("deepseek.com")
         checks = {
             "database_parent_writable": _writable_directory(settings.database_path.parent.resolve()),
             "artifact_root_ready": _writable_directory(settings.artifact_root.resolve()),
@@ -330,9 +514,9 @@ def main(argv: list[str] | None = None) -> int:
             "sandbox_available": runtime.sandbox.available,
             "docker_cli_present": bool(shutil.which("docker")),
             "qwen_adapter_present": adapter.is_file(),
-            "qwen_api_key_present": bool(os.environ.get("DASHSCOPE_API_KEY")),
-            "qwen_provider_https": provider_parts.scheme == "https" and bool(provider_host),
-            "qwen_provider_allowlisted": provider_host in configured_hosts,
+            "model_api_key_present": bool(os.environ.get("DEEPSEEK_API_KEY") if provider_is_deepseek else os.environ.get("DASHSCOPE_API_KEY")),
+            "model_provider_https": provider_parts.scheme == "https" and bool(provider_host),
+            "model_provider_allowlisted": provider_host in configured_hosts,
         }
         if args.input is not None:
             checks["input_present"] = args.input.is_file()
@@ -345,10 +529,10 @@ def main(argv: list[str] | None = None) -> int:
         # Docker is optional in the trusted single-machine scope; it becomes
         # relevant only when the operator explicitly selects the docker
         # backend. The provider secret is likewise conditional on --qwen.
-        required_checks = {key: value for key, value in checks.items() if key not in {"qwen_api_key_present", "docker_cli_present"}}
+        required_checks = {key: value for key, value in checks.items() if key not in {"model_api_key_present", "docker_cli_present"}}
         if os.environ.get("M2HARNESS_SANDBOX_BACKEND", "host").lower() == "docker":
             required_checks["docker_cli_present"] = checks["docker_cli_present"]
-        structural = all(required_checks.values()) and (not args.qwen or checks["qwen_api_key_present"])
+        structural = all(required_checks.values()) and (not args.qwen or checks["model_api_key_present"])
         _emit({"status": "ready" if structural else "blocked", "checks": checks, "note": "the first-mile Harness uses the trusted local host backend by default; set M2HARNESS_SANDBOX_BACKEND=docker for isolation or =none to fail closed; --qwen makes the provider secret mandatory"})
         return 0 if structural else 1
     if args.command == "status":

@@ -83,7 +83,8 @@ class HarnessSettings(StrictModel):
     lease_seconds: int = Field(default=300, ge=10, le=86_400)
     activity_timeout_seconds: int = Field(default=1_800, ge=1, le=86_400)
     max_activity_attempts: int = Field(default=3, ge=1, le=20)
-    max_revisions: int = Field(default=3, ge=0, le=20)
+    # A task may return to a prior stage at most twice after its initial run.
+    max_revisions: int = Field(default=2, ge=0, le=2)
     # Publication is a first-class output contract for the production report
     # path.  Operators can disable the gate for legacy migrations, but a
     # normal production run must publish both Markdown and compile-ready TeX.

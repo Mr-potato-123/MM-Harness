@@ -222,6 +222,46 @@ def _workspace_list(env: LocalToolEnvironment, args: dict[str, Any]) -> dict[str
     return {"root": args.get("path", "."), "entries": entries, "truncated": len(entries) >= int(args.get("limit", 500))}
 
 
+def _workspace_search(env: LocalToolEnvironment, args: dict[str, Any]) -> dict[str, Any]:
+    """Bounded grep-like search exposed to coding agents through ToolRuntime."""
+
+    needle = str(args["pattern"])
+    if not needle or len(needle) > 500:
+        raise ValueError("search pattern must contain 1-500 characters")
+    root = env.resolve_workspace(args.get("path", "."), allow_root=True)
+    regex = bool(args.get("regex", False))
+    flags = 0 if bool(args.get("case_sensitive", True)) else re.IGNORECASE
+    matcher = re.compile(needle, flags) if regex else None
+    limit = max(1, min(int(args.get("max_matches", 200)), 2_000))
+    per_file = max(1_000, min(int(args.get("max_bytes_per_file", 256_000)), env.max_read_bytes))
+    matches: list[dict[str, Any]] = []
+    files_scanned = 0
+    candidates = [root] if root.is_file() else sorted(root.rglob("*"))
+    for path in candidates:
+        if len(matches) >= limit:
+            break
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            resolved = path.resolve()
+            if env.workspace_root not in resolved.parents:
+                continue
+            raw = _read(path, per_file)
+            text = raw.decode(args.get("encoding", "utf-8"), errors="strict")
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        files_scanned += 1
+        relative = path.relative_to(env.workspace_root).as_posix()
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            hit = bool(matcher.search(line)) if matcher is not None else ((needle in line) if bool(args.get("case_sensitive", True)) else (needle.casefold() in line.casefold()))
+            if not hit:
+                continue
+            matches.append({"path": relative, "line": line_number, "text": line[:2_000]})
+            if len(matches) >= limit:
+                break
+    return {"pattern": needle, "matches": matches, "files_scanned": files_scanned, "truncated": len(matches) >= limit}
+
+
 def _workspace_read(env: LocalToolEnvironment, args: dict[str, Any]) -> dict[str, Any]:
     path = env.resolve_workspace(args["path"])
     data = _read(path, min(int(args.get("max_bytes", 256_000)), env.max_read_bytes))
@@ -246,12 +286,20 @@ def _atomic_write(path: Path, data: bytes, *, overwrite: bool) -> None:
 
 
 def _workspace_write(env: LocalToolEnvironment, args: dict[str, Any]) -> dict[str, Any]:
-    data = args["content"].encode(args.get("encoding", "utf-8"))
-    if len(data) > min(int(args.get("max_bytes", 5_000_000)), env.max_read_bytes * 5):
+    encoding = args.get("encoding", "utf-8")
+    data = args["content"].encode(encoding)
+    max_allowed = min(int(args.get("max_bytes", 5_000_000)), env.max_read_bytes * 5)
+    if len(data) > max_allowed:
         raise ValueError("content exceeds workspace write budget")
     path = env.resolve_workspace(args["path"])
-    _atomic_write(path, data, overwrite=bool(args.get("overwrite", False)))
-    return {"path": args["path"], "sha256": _digest(data), "size_bytes": len(data)}
+    append = bool(args.get("append", False))
+    if append:
+        existing = path.read_bytes() if path.is_file() else b""
+        data = existing + data
+        if len(data) > max_allowed:
+            raise ValueError("appended content exceeds workspace write budget")
+    _atomic_write(path, data, overwrite=bool(args.get("overwrite", False)) or append)
+    return {"path": args["path"], "sha256": _digest(data), "size_bytes": len(data), "appended": append}
 
 
 def _workspace_edit(env: LocalToolEnvironment, args: dict[str, Any]) -> dict[str, Any]:
@@ -517,6 +565,7 @@ def _solve_problem(env: LocalToolEnvironment, args: dict[str, Any]) -> dict[str,
         run_service = SolveProblemService(
             service.model_agent, service.code_harness, max_iterations=effective_limit,
             research_agent=service.research_agent, file_reader=service.file_reader,
+            archive_writer=service.archive_writer,
         )
         report = run_service.solve(task, context)
     elif hasattr(service, "solve"):
@@ -611,10 +660,12 @@ def register_local_tools(registry: ToolRegistry, env: LocalToolEnvironment) -> T
                      {"required": ["project_id", "logical_name"], "properties": {"project_id": {"type": "string"}, "question_id": {"type": "string"}, "activity_id": {"type": "string"}, "logical_name": {"type": "string"}, "kind": {"type": "string"}, "media_type": {"type": "string"}, "text": {"type": "string"}, "base64": {"type": "string"}, "metadata": {"type": "object"}}}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write")), _artifact_write),
         (_definition("workspace_list", "workspace.read", "List files inside the configured workspace root.",
                      {"properties": {"path": {"type": "string"}, "recursive": {"type": "boolean"}, "limit": {"type": "integer"}}}), _workspace_list),
+        (_definition("workspace_search", "workspace.read", "Search bounded UTF-8 workspace text with literal or regular-expression matching.",
+                     {"required": ["pattern"], "properties": {"pattern": {"type": "string", "minLength": 1, "maxLength": 500}, "path": {"type": "string"}, "regex": {"type": "boolean"}, "case_sensitive": {"type": "boolean"}, "max_matches": {"type": "integer"}, "max_bytes_per_file": {"type": "integer"}, "encoding": {"type": "string"}}}), _workspace_search),
         (_definition("workspace_read", "workspace.read", "Read a bounded UTF-8 text file from the configured workspace.",
                      {"required": ["path"], "properties": {"path": {"type": "string"}, "max_bytes": {"type": "integer"}, "encoding": {"type": "string"}}}), _workspace_read),
         (_definition("workspace_write", "workspace.write", "Atomically write a text file inside the configured workspace.",
-                     {"required": ["path", "content"], "properties": {"path": {"type": "string"}, "content": {"type": "string"}, "encoding": {"type": "string"}, "overwrite": {"type": "boolean"}, "max_bytes": {"type": "integer"}}}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write")), _workspace_write),
+                     {"required": ["path", "content"], "properties": {"path": {"type": "string"}, "content": {"type": "string"}, "encoding": {"type": "string"}, "overwrite": {"type": "boolean"}, "append": {"type": "boolean"}, "max_bytes": {"type": "integer"}}}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write")), _workspace_write),
         (_definition("workspace_edit", "workspace.write", "Apply an exact, bounded, atomic text replacement; ambiguous context is rejected.",
                      {"required": ["path", "old_text", "new_text"], "properties": {"path": {"type": "string"}, "old_text": {"type": "string", "minLength": 1}, "new_text": {"type": "string"}, "encoding": {"type": "string"}, "expected_replacements": {"type": "integer", "minimum": 1, "maximum": 20}, "max_bytes": {"type": "integer"}}}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write")), _workspace_edit),
         (_definition("pdf_inspect", "document.read", "Inspect a PDF header, page estimate, and text preview without mutating it.",

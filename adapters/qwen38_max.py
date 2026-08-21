@@ -397,7 +397,7 @@ def main() -> int:
     _authorize_provider_url(base_url)
     model = os.environ.get("QWEN_MODEL", "qwen3.8-max")
     try:
-        max_tokens = int(os.environ.get("QWEN_MAX_OUTPUT_TOKENS", "12000"))
+        max_tokens = int(os.environ.get("QWEN_MAX_OUTPUT_TOKENS", "64000"))
     except ValueError as exc:
         raise ValueError("QWEN_MAX_OUTPUT_TOKENS must be an integer") from exc
     if not 256 <= max_tokens <= 64_000:

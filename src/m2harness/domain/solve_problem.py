@@ -20,6 +20,11 @@ from m2harness.domain.research import ResearchReport
 from m2harness.domain.media import MultimodalInput
 
 
+# Initial implementation is not counted as a revision.  This hard workflow
+# policy permits at most two review-driven return rounds for one task.
+MAX_REVISION_ROUNDS = 2
+
+
 class ExplorationMode(StrEnum):
     AUTO = "auto"
     SINGLE = "single"
@@ -219,6 +224,7 @@ class SolveProblemReport(StrictModel):
     final_report: ReportPayload | None = None
     revision_instructions: tuple[str, ...] = ()
     artifacts: list[ProducedArtifact] = Field(default_factory=list)
+    archive_files: tuple[ReadOnlyFileReference, ...] = ()
     research_report: ResearchReport | None = None
     error: str | None = None
 
