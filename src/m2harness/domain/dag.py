@@ -32,6 +32,7 @@ class DAGTaskNode(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     kind: DAGTaskKind
     depends_on: tuple[str, ...] = ()
+    dependency_outputs: dict[str, tuple[str, ...]] = Field(default_factory=dict)
     required_capabilities: tuple[str, ...] = ()
     output_contract: str = Field(min_length=1, max_length=200)
     terminal: bool = False
@@ -56,6 +57,9 @@ class DAGTaskTable(BaseModel):
                 raise ValueError(f"task {task.id} depends on unknown task(s): {', '.join(unknown)}")
             if task.id in task.depends_on:
                 raise ValueError(f"task {task.id} cannot depend on itself")
+            undeclared = sorted(set(task.dependency_outputs) - set(task.depends_on))
+            if undeclared:
+                raise ValueError(f"task {task.id} requests outputs from non-dependency task(s): {', '.join(undeclared)}")
         if self.terminal_task_id not in nodes:
             raise ValueError("terminal_task_id must reference a task")
         terminal = nodes[self.terminal_task_id]

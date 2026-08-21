@@ -27,7 +27,7 @@ from m2harness.infrastructure.db.sqlite_artifacts import SQLiteArtifactRegistry
 from m2harness.domain.dag import canonical_single_question_dag
 from m2harness.domain.dag import canonical_main_harness_dag
 from m2harness.domain.media import MultimodalInput
-from m2harness.domain.solve_problem import SolveProblemContext
+from m2harness.domain.solve_problem import ReadOnlyFileReference, ReadOnlyFileRole, SolveProblemContext
 from m2harness.domain.capability import CapabilityRequirement
 from m2harness.domain.tool import ToolCall
 
@@ -263,7 +263,8 @@ def main(argv: list[str] | None = None) -> int:
         client = QwenChatClient(model=args.model or os.environ.get("QWEN_MODEL", "qwen3.8-max"))
         service = build_qwen_solve_problem_service(
             sandbox=runtime.sandbox, workspace_root=runtime.tool_environment.workspace_root,
-            research_agent=runtime.research_service, client=client, max_iterations=args.max_iterations,
+            research_agent=runtime.research_service, skills=runtime.skills,
+            client=client, max_iterations=args.max_iterations,
         )
         runtime = runtime.attach_solve_problem_service(service)
         state = runtime.main_harness.start(args.problem, canonical_main_harness_dag())
@@ -271,6 +272,12 @@ def main(argv: list[str] | None = None) -> int:
             state, "q1",
             context=SolveProblemContext(
                 multimodal_inputs=(multimodal,),
+                readonly_files=(ReadOnlyFileReference(
+                    relative_path=str((Path("inputs") / staged_name).as_posix()),
+                    purpose="Original problem statement or source file selected by the user; read-only input for this solve.",
+                    role=ReadOnlyFileRole.PROBLEM, media_type=media_type,
+                    sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
+                ),),
                 metadata={"staged_input_relative_path": str(Path("inputs") / staged_name)},
             ),
             max_iterations=args.max_iterations,
@@ -278,7 +285,7 @@ def main(argv: list[str] | None = None) -> int:
         if not state.reports or state.reports[-1].status.value != "completed":
             _emit(state)
             return 1
-        state = runtime.main_harness.generate_paper(state, QwenPaperComposer(client))
+        state = runtime.main_harness.generate_paper(state, QwenPaperComposer(client, skills=runtime.skills))
         if state.final_report is None or state.final_latex_paper is None:
             raise RuntimeError("Main Harness paper composer returned no final publication")
         render_definition = runtime.tools.get("report_render")

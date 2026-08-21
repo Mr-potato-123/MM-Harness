@@ -16,15 +16,22 @@ from m2harness.infrastructure.db.sqlite_artifacts import SQLiteArtifactRegistry
 from m2harness.infrastructure.db.main_harness import SQLiteMainHarnessRepository
 from m2harness.workflows.single_question_v1 import SingleQuestionWorkflowV1
 from m2harness.application.runtime_bundle import RuntimeBundle, build_local_runtime, default_skill_root
-from m2harness.application.main_harness import MainHarness, MainHarnessRepository, MainHarnessState, MainHarnessTask, MainTaskStatus, PaperComposerPort
+from m2harness.application.main_harness import MainHarness, MainHarnessDecision, MainHarnessRepository, MainHarnessState, MainHarnessTask, MainTaskStatus, PaperComposerPort
 from m2harness.application.solve_problem import CommandSolveProblemRunner, SolveProblemService, UnconfiguredSolveProblemService
 from m2harness.application.knowledge import EmptyKnowledgeBase, HMMLKnowledgeBase, KnowledgeBasePort
 from m2harness.application.research import DeepResearchService, ResearchAgentPort
+from m2harness.application.compact import ContextCompactor, ContextCompactorPort, compact_text, estimate_tokens
+from m2harness.application.report_store import ReportFileRecord, RunReportStore
 from m2harness.domain.dag import DAGTaskKind, DAGTaskNode, DAGTaskTable, canonical_main_harness_dag, canonical_single_question_dag
 from m2harness.domain.solve_problem import (
     CodingHarnessReport,
     ExplorationMode,
     ModelReviewDecision,
+    RevisionTarget,
+    ReadOnlyFileReference,
+    ReadOnlyFileRole,
+    DisclosedTextFile,
+    DependencySolutionContext,
     PreliminaryModelingReport,
     SolveProblemContext,
     SolveProblemIteration,
@@ -73,6 +80,7 @@ __all__ = [
     "canonical_single_question_dag",
     "canonical_main_harness_dag",
     "MainHarness",
+    "MainHarnessDecision",
     "MainHarnessRepository",
     "MainHarnessState",
     "MainHarnessTask",
@@ -84,6 +92,11 @@ __all__ = [
     "CodingHarnessReport",
     "ExplorationMode",
     "ModelReviewDecision",
+    "RevisionTarget",
+    "ReadOnlyFileReference",
+    "ReadOnlyFileRole",
+    "DisclosedTextFile",
+    "DependencySolutionContext",
     "PreliminaryModelingReport",
     "SolveProblemContext",
     "SolveProblemIteration",
@@ -97,6 +110,12 @@ __all__ = [
     "KnowledgeBasePort",
     "DeepResearchService",
     "ResearchAgentPort",
+    "ContextCompactor",
+    "ContextCompactorPort",
+    "compact_text",
+    "estimate_tokens",
+    "ReportFileRecord",
+    "RunReportStore",
     "KnowledgeEntry",
     "KnowledgeHit",
     "KnowledgeQuery",

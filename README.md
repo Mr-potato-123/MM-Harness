@@ -15,7 +15,12 @@ The repository is currently in a controlled rebuild. The original durable stage 
 ## Implemented kernel
 
 - Main Harness DAG/TODO kernel that dispatches each executable problem node through one `solve_problem` Tool and unlocks dependent nodes only after a completed SolveProblemReport.
+- Explicit `rollback()` and `replan()` operations invalidate downstream state, preserve historical reports/files, and append durable process decisions.
+- MM-Agent-style dependency projection: each downstream solve receives its own subproblem text, a compact accepted-solution projection for direct predecessors, and a purpose-labelled read-only file manifest. DAG nodes can name required upstream keys through `dependency_outputs`.
+- Progressive file disclosure: listing a workspace-relative path does not disclose its content. A Model Agent must return `requested_file_paths`; only allowlisted, digest-verified UTF-8 files are then added to `disclosed_text_files`. Binary problem inputs continue through the explicit multimodal channel.
+- Provider-boundary `compact` middleware preserves system/recent turns and replaces older history with an auditable continuation snapshot containing objectives, decisions, evidence, open issues, file paths, and next actions.
 - Bounded `solve_problem` loop: optional preliminary multi-route modeling → Model Agent synthesis → Code Harness realization → Model Agent approve/revise, with strict report contracts.
+- Review selects the narrowest `revision_target`: code-only revisions reuse the accepted Modeling Report; model/full revisions repeat exploration and synthesis.
 - Strict `SolveProblemTask`, `ModelingReport`, `CodingReport`, `Review`, and final problem report protocols; the default runtime fails closed when real Model Agent/Code Harness ports are not configured.
 - Model Agent context can run a local-first DeepResearch pass before preliminary modeling. The read-only `knowledge_search` Tool returns source-linked HMML findings and gaps; it never grants Harness instructions.
 - SQLite transactions in WAL mode, process-safe leases, bounded attempts, and deterministic activity idempotency keys.
@@ -38,6 +43,9 @@ The repository is currently in a controlled rebuild. The original durable stage 
 - `MainHarness.generate_paper()` is the terminal global-context merge boundary;
   `QwenPaperComposer` can produce the reviewed report plus the single
   `final_latex_paper` artifact after all `solve_problem` nodes are complete.
+- Every solve attempt is materialized under `workspace/reports/runs/<run-id>/tasks/<task-id>/attempt-<n>/` with preliminary/modeling/coding/final reports, generated source/log artifacts, digests, sizes, purposes, and a persisted report-file index in Main Harness state.
+
+Context is intentionally layered for long-horizon work: current problem text and compact direct-dependency conclusions are loaded first; full upstream `solution_report.md`, coding outputs, and generated files remain path-only until requested. Final paper composition receives accepted final reports and artifact metadata rather than complete Model/Code iteration transcripts.
 
 ## Rebuilt runtime smoke check
 

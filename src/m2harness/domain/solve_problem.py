@@ -9,6 +9,7 @@ reports and immutable artifacts.
 from __future__ import annotations
 
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import Any, Literal
 from uuid import UUID
 
@@ -38,6 +39,71 @@ class ModelReviewDecision(StrEnum):
     REJECT = "reject"
 
 
+class RevisionTarget(StrEnum):
+    """Smallest workflow segment that must be repeated after review."""
+
+    CODE = "code"
+    MODEL = "model"
+    FULL = "full"
+
+
+class ReadOnlyFileRole(StrEnum):
+    PROBLEM = "problem"
+    INPUT = "input"
+    DEPENDENCY_SOLUTION = "dependency_solution"
+    DEPENDENCY_OUTPUT = "dependency_output"
+    GENERATED = "generated"
+    REFERENCE = "reference"
+
+
+class ReadOnlyFileReference(StrictModel):
+    """A workspace-relative allowlist entry, not a general filesystem grant."""
+
+    relative_path: str = Field(min_length=1, max_length=1_000)
+    purpose: str = Field(min_length=1, max_length=2_000)
+    role: ReadOnlyFileRole
+    owner_task_id: str | None = Field(default=None, max_length=120)
+    media_type: str = Field(default="application/octet-stream", min_length=1, max_length=200)
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    size_bytes: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def workspace_relative_path_only(self) -> "ReadOnlyFileReference":
+        normalized = self.relative_path.replace("\\", "/")
+        path = PurePosixPath(normalized)
+        if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+            raise ValueError("read-only file path must be a normalized workspace-relative path")
+        if ":" in path.parts[0]:
+            raise ValueError("read-only file path cannot contain a drive prefix")
+        object.__setattr__(self, "relative_path", path.as_posix())
+        return self
+
+
+class DisclosedTextFile(StrictModel):
+    """Verified text disclosed after an agent requests an allowlisted path."""
+
+    relative_path: str
+    purpose: str
+    content: str = Field(max_length=512_000)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    truncated: bool = False
+
+
+class DependencySolutionContext(StrictModel):
+    """Compressed, high-value projection of one accepted upstream solution."""
+
+    task_id: str
+    report_id: UUID
+    title: str
+    summary: str = Field(max_length=30_000)
+    claims: tuple[str, ...] = ()
+    limitations: tuple[str, ...] = ()
+    downstream_outputs: dict[str, Any] = Field(default_factory=dict)
+    solution_report_path: str | None = None
+    solve_files: tuple[ReadOnlyFileReference, ...] = ()
+    estimated_tokens: int = Field(default=0, ge=0)
+
+
 class SolveProblemTask(StrictModel):
     """One node assigned by Main Harness to ``solve_problem``."""
 
@@ -60,8 +126,13 @@ class SolveProblemContext(StrictModel):
     multimodal_inputs: tuple[MultimodalInput, ...] = ()
     dependency_report_ids: tuple[UUID, ...] = ()
     accepted_report_ids: tuple[UUID, ...] = ()
+    dependency_solutions: tuple[DependencySolutionContext, ...] = ()
+    readonly_files: tuple[ReadOnlyFileReference, ...] = ()
+    disclosed_text_files: tuple[DisclosedTextFile, ...] = ()
     instructions: tuple[str, ...] = ()
     research_report: ResearchReport | None = None
+    context_budget_tokens: int = Field(default=32_000, ge=1_000, le=1_000_000)
+    compression: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -75,6 +146,7 @@ class PreliminaryModelingReport(StrictModel):
     expected_outputs: tuple[str, ...] = ()
     risks: tuple[str, ...] = ()
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    requested_file_paths: tuple[str, ...] = ()
 
 
 class UnifiedModelingReport(StrictModel):
@@ -95,14 +167,16 @@ class CodingHarnessReport(StrictModel):
     report: ReportPayload
     execution_succeeded: bool
     validations: dict[str, bool]
+    validation_evidence: dict[str, str] = Field(default_factory=dict)
     metrics: dict[str, float | int | str | bool | None] = Field(default_factory=dict)
     deviations: tuple[str, ...] = ()
     issues: tuple[str, ...] = ()
     artifacts: list[ProducedArtifact] = Field(default_factory=list)
+    generated_files: tuple[ReadOnlyFileReference, ...] = ()
 
     @model_validator(mode="after")
     def successful_execution_requires_evidence(self) -> "CodingHarnessReport":
-        if self.execution_succeeded and not self.artifacts:
+        if self.execution_succeeded and not (self.artifacts or self.generated_files):
             raise ValueError("successful solve_problem execution must include evidence artifacts")
         return self
 
@@ -114,6 +188,8 @@ class SolveProblemReview(StrictModel):
     rationale: str = Field(min_length=1, max_length=30_000)
     revision_instructions: tuple[str, ...] = ()
     accepted_claims: tuple[str, ...] = ()
+    revision_target: RevisionTarget = RevisionTarget.CODE
+    requested_file_paths: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def revision_requires_instructions(self) -> "SolveProblemReview":

@@ -49,6 +49,19 @@ class ContextSnapshot(AgentModel):
     created_at: datetime
 
 
+class ContextCompactionSnapshot(AgentModel):
+    """Auditable continuation summary produced by compact middleware."""
+
+    compaction_id: UUID
+    summary: str = Field(min_length=1, max_length=512_000)
+    source_message_count: int = Field(ge=1)
+    retained_message_count: int = Field(ge=0)
+    estimated_tokens_before: int = Field(ge=1)
+    estimated_tokens_after: int = Field(ge=1)
+    source_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    created_at: datetime
+
+
 class AgentSession(AgentModel):
     session_id: UUID
     activity_id: UUID
@@ -77,6 +90,7 @@ class ModelRequest(AgentModel):
     response_schema: dict[str, Any] | None = None
     enable_thinking: bool = True
     max_output_tokens: int = Field(default=16_384, ge=1)
+    compactions: tuple[ContextCompactionSnapshot, ...] = ()
 
 
 class ModelResponse(AgentModel):

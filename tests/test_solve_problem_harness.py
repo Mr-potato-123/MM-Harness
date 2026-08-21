@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from uuid import uuid4
 
 from m2harness import (
     CodingHarnessReport,
+    DAGTaskKind,
+    DAGTaskNode,
+    DAGTaskTable,
     ExplorationMode,
     ModelReviewDecision,
+    ReadOnlyFileReference,
+    ReadOnlyFileRole,
     PreliminaryModelingReport,
     SolveProblemContext,
     SolveProblemService,
@@ -25,6 +31,7 @@ from m2harness.application.research import DeepResearchService
 from m2harness.domain.knowledge import KnowledgeQuery
 from m2harness.domain.code import CodeProposal
 from m2harness.infrastructure.code_harness import LocalPythonCodeHarness
+from m2harness.application.solve_problem import WorkspaceReadOnlyFileReader
 from adapters.qwen_solve_problem import QwenCodeProposalProvider, QwenModelAgent, QwenPaperComposer, _content_parts
 from m2harness.domain.media import MultimodalInput
 import base64
@@ -116,7 +123,8 @@ class SolveProblemHarnessTest(unittest.TestCase):
         ), SolveProblemContext())
         self.assertEqual(result.status, SolveProblemStatus.COMPLETED)
         self.assertEqual(result.iteration_count, 2)
-        self.assertEqual(model.explorations, [3, 3])
+        # A code-only review revision reuses the accepted modeling contract.
+        self.assertEqual(model.explorations, [3])
         self.assertEqual(len(result.iterations[0].preliminary_reports), 3)
         self.assertEqual(result.iterations[0].review.decision, ModelReviewDecision.REVISE)
 
@@ -146,6 +154,20 @@ class SolveProblemHarnessTest(unittest.TestCase):
             self.assertEqual(state.tasks[0].status.value, "revision_required")
             bundle.main_harness.dispatch(state, "q1", max_iterations=1)
             self.assertIn("add the sanity check", model.instructions_seen[1])
+
+    def test_main_harness_rollback_invalidates_descendants_and_keeps_history(self) -> None:
+        service = SolveProblemService(FakeModelAgent(), FakeCodeHarness(), max_iterations=2)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = build_local_runtime(workspace_root=root / "w", artifact_root=root / "a", database_path=root / "r.db", solve_problem_service=service)
+            state = bundle.main_harness.start("solve", canonical_main_harness_dag())
+            state = bundle.main_harness.dispatch(state, "q1")
+            history_count = len(state.reports)
+            state = bundle.main_harness.rollback(state, "q1", reason="upstream data correction")
+            self.assertEqual(state.tasks[0].status.value, "ready")
+            self.assertEqual(state.tasks[-1].status.value, "blocked")
+            self.assertEqual(len(state.reports), history_count)
+            self.assertEqual(state.decisions[-1].kind, "rollback")
 
     def test_runtime_registers_solve_problem_as_main_tool(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -195,6 +217,7 @@ class SolveProblemHarnessTest(unittest.TestCase):
             )
             published = bundle.main_harness.publish(state, final_report=_report("final"), final_latex_paper=latex)
             self.assertTrue(published.terminal)
+            self.assertEqual(published.tasks[-1].status.value, "completed")
             self.assertEqual(published.final_latex_paper.logical_name, "final-paper.tex")
 
     def test_main_harness_state_survives_runtime_rebuild(self) -> None:
@@ -207,6 +230,76 @@ class SolveProblemHarnessTest(unittest.TestCase):
             self.assertEqual(restored.run_id, state.run_id)
             self.assertEqual(restored.dag.terminal_task_id, "publish-paper")
             self.assertEqual(restored.version, 1)
+
+    def test_reports_are_materialized_and_upstream_context_is_compacted(self) -> None:
+        service = SolveProblemService(FakeModelAgent(), FakeCodeHarness(), max_iterations=2)
+        dag = DAGTaskTable(tasks=(
+            DAGTaskNode(id="q1", title="First", kind=DAGTaskKind.SOLVE_PROBLEM, output_contract="solution", metadata={"problem": "first subproblem"}),
+            DAGTaskNode(id="q2", title="Second", kind=DAGTaskKind.SOLVE_PROBLEM, depends_on=("q1",), dependency_outputs={"q1": ("parameter",)}, output_contract="solution", metadata={"problem": "second subproblem"}),
+            DAGTaskNode(id="publish-paper", title="Paper", kind=DAGTaskKind.PUBLISH_LATEX, depends_on=("q2",), output_contract="paper", terminal=True),
+        ), terminal_task_id="publish-paper")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = build_local_runtime(workspace_root=root / "workspace", artifact_root=root / "artifacts", database_path=root / "runtime.db", solve_problem_service=service)
+            state = bundle.main_harness.start("whole problem", dag)
+            state = bundle.main_harness.dispatch(state, "q1")
+            solution = next(item for item in state.report_files if item.relative_path.endswith("solution_report.md"))
+            self.assertTrue((root / "workspace" / solution.relative_path).is_file())
+            context = bundle.main_harness._context_for_dispatch(state, "q2", ("q1",), None)
+            self.assertEqual(context.dependency_solutions[0].task_id, "q1")
+            self.assertEqual(context.dependency_solutions[0].summary, "final solution")
+            self.assertIn(solution.relative_path, [item.relative_path for item in context.readonly_files])
+            self.assertEqual(context.compression["strategy"], "compact-v1")
+
+    def test_progressive_file_disclosure_is_allowlist_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = "accepted upstream result: alpha=0.25".encode()
+            path = root / "upstream.md"
+            path.write_bytes(data)
+            reference = ReadOnlyFileReference(
+                relative_path="upstream.md", purpose="Accepted upstream solution",
+                role=ReadOnlyFileRole.DEPENDENCY_SOLUTION,
+                sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
+            )
+            reader = WorkspaceReadOnlyFileReader(root)
+            disclosed = reader.disclose(SolveProblemContext(readonly_files=(reference,)), ("upstream.md",))
+            self.assertIn("alpha=0.25", disclosed[0].content)
+            with self.assertRaises(PermissionError):
+                reader.disclose(SolveProblemContext(readonly_files=(reference,)), ("not-allowed.md",))
+
+    def test_solve_loop_discloses_requested_file_then_reexplores(self) -> None:
+        class RequestingModel(FakeModelAgent):
+            def __init__(self):
+                super().__init__()
+                self.explore_calls = 0
+                self.disclosed_seen = False
+
+            def explore(self, task, context, *, branch_count, iteration):
+                self.explore_calls += 1
+                self.disclosed_seen = self.disclosed_seen or bool(context.disclosed_text_files)
+                reports = super().explore(task, context, branch_count=branch_count, iteration=iteration)
+                if self.explore_calls == 1:
+                    reports = (reports[0].model_copy(update={"requested_file_paths": ("dependency.md",)}),)
+                return reports
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            content = b"verified parameter beta=4"
+            (root / "dependency.md").write_bytes(content)
+            context = SolveProblemContext(readonly_files=(ReadOnlyFileReference(
+                relative_path="dependency.md", purpose="Upstream parameter file",
+                role=ReadOnlyFileRole.DEPENDENCY_OUTPUT,
+                sha256=hashlib.sha256(content).hexdigest(), size_bytes=len(content),
+            ),))
+            model = RequestingModel()
+            result = SolveProblemService(
+                model, FakeCodeHarness(), max_iterations=2,
+                file_reader=WorkspaceReadOnlyFileReader(root),
+            ).solve(SolveProblemTask(task_id="q2", title="Q2", problem="Use beta"), context)
+            self.assertEqual(result.status, SolveProblemStatus.COMPLETED)
+            self.assertTrue(model.disclosed_seen)
+            self.assertGreaterEqual(model.explore_calls, 2)
 
     def test_reference_hmml_is_searchable_and_report_first(self) -> None:
         hmml = Path(__file__).parents[1] / "ref_github" / "LLM-MM-Agent" / "MMAgent" / "HMML" / "HMML.json"
@@ -254,7 +347,7 @@ class SolveProblemHarnessTest(unittest.TestCase):
             root = Path(temp)
             bundle = build_local_runtime(workspace_root=root / "w", artifact_root=root / "a", database_path=root / "r.db")
             harness = LocalPythonCodeHarness(
-                FakeCodeProposalProvider("import json; print(json.dumps({'validations': {'sanity': True}, 'metrics': {'score': 1}}))"),
+                FakeCodeProposalProvider("import json; print(json.dumps({'validations': {'sanity': True}, 'validation_evidence': {'sanity': 'score=1, asserted from deterministic fixture'}, 'metrics': {'score': 1}}))"),
                 bundle.sandbox, root / "w",
             )
             modeling = UnifiedModelingReport(
@@ -264,7 +357,14 @@ class SolveProblemHarnessTest(unittest.TestCase):
             coding = harness.execute(SolveProblemTask(task_id="q1", title="Q", problem="P"), SolveProblemContext(), modeling, iteration=1)
             self.assertTrue(coding.execution_succeeded)
             self.assertEqual(coding.validations["sanity"], True)
+            self.assertTrue(coding.validation_evidence["sanity"])
             self.assertEqual(len(coding.artifacts), 2)
+
+            self_reported = LocalPythonCodeHarness(
+                FakeCodeProposalProvider("import json; print(json.dumps({'validations': {'sanity': True}}))"),
+                bundle.sandbox, root / "w",
+            ).execute(SolveProblemTask(task_id="q1", title="Q", problem="P"), SolveProblemContext(), modeling, iteration=2)
+            self.assertFalse(self_reported.execution_succeeded)
 
             blocked = LocalPythonCodeHarness(FakeCodeProposalProvider("import socket; print('bad')"), bundle.sandbox, root / "w")
             failed = blocked.execute(SolveProblemTask(task_id="q1", title="Q", problem="P"), SolveProblemContext(), modeling, iteration=1)
@@ -277,18 +377,23 @@ class SolveProblemHarnessTest(unittest.TestCase):
         context = SolveProblemContext(multimodal_inputs=(media,))
         parts = _content_parts(context, "prompt")
         self.assertEqual(parts[0]["type"], "file")
-        client = FakeQwenClient()
-        agent = QwenModelAgent(client)
-        task = SolveProblemTask(task_id="q1", title="Q", problem="P")
-        preliminary = agent.explore(task, context, branch_count=1, iteration=1)
-        modeling = agent.synthesize(task, context, preliminary, iteration=1)
-        coding = CodingHarnessReport(report=_report("code"), execution_succeeded=True, validations={"sanity": True}, artifacts=[ProducedArtifact(logical_name="evidence.json", text="{}")])
-        review = agent.review(task, context, modeling, coding, iteration=1)
-        final = agent.compose_final_report(task, context, modeling, coding, review, iteration=1)
-        proposal = QwenCodeProposalProvider(client).propose(task, context, modeling, iteration=1)
-        self.assertEqual(final.title, "final")
-        self.assertEqual(proposal.logical_name, "generated_solution.py")
-        self.assertGreaterEqual(len(client.calls), 5)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = build_local_runtime(workspace_root=root / "w", artifact_root=root / "a", database_path=root / "r.db")
+            client = FakeQwenClient()
+            agent = QwenModelAgent(client, skills=bundle.skills)
+            task = SolveProblemTask(task_id="q1", title="Q", problem="P")
+            preliminary = agent.explore(task, context, branch_count=1, iteration=1)
+            modeling = agent.synthesize(task, context, preliminary, iteration=1)
+            coding = CodingHarnessReport(report=_report("code"), execution_succeeded=True, validations={"sanity": True}, artifacts=[ProducedArtifact(logical_name="evidence.json", text="{}")])
+            review = agent.review(task, context, modeling, coding, iteration=1)
+            final = agent.compose_final_report(task, context, modeling, coding, review, iteration=1)
+            proposal = QwenCodeProposalProvider(client, skills=bundle.skills).propose(task, context, modeling, iteration=1)
+            first_prompt = json.loads(client.calls[0][-1]["text"])
+            self.assertIn("Skill: problem-intake", first_prompt["skill_context"])
+            self.assertEqual(final.title, "final")
+            self.assertEqual(proposal.logical_name, "generated_solution.py")
+            self.assertGreaterEqual(len(client.calls), 5)
 
     def test_runtime_can_attach_provider_after_sandbox_composition(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -5,13 +5,18 @@ from .events import DomainEvent, EventEnvelope, EventType
 from .skill import SkillDefinition, SkillManifest, SkillSummary
 from .tool import ToolCall, ToolDefinition, ToolResult
 from .workflow import ActivitySpec, WorkflowDecision, WorkflowState
-from .agent import AgentSession, ContextItem, ContextSnapshot, ModelCapabilities, ModelRequest, ModelResponse
+from .agent import AgentSession, ContextCompactionSnapshot, ContextItem, ContextSnapshot, ModelCapabilities, ModelRequest, ModelResponse
 from .media import MediaObservation, Modality, MultimodalInput
 from .dag import DAGTaskKind, DAGTaskNode, DAGTaskTable, canonical_main_harness_dag, canonical_single_question_dag
 from .solve_problem import (
     CodingHarnessReport,
     ExplorationMode,
     ModelReviewDecision,
+    RevisionTarget,
+    ReadOnlyFileReference,
+    ReadOnlyFileRole,
+    DisclosedTextFile,
+    DependencySolutionContext,
     PreliminaryModelingReport,
     SolveProblemContext,
     SolveProblemIteration,
@@ -43,6 +48,7 @@ __all__ = [
     "WorkflowState",
     "AgentSession",
     "ContextItem",
+    "ContextCompactionSnapshot",
     "ContextSnapshot",
     "ModelCapabilities",
     "ModelRequest",
@@ -58,6 +64,11 @@ __all__ = [
     "CodingHarnessReport",
     "ExplorationMode",
     "ModelReviewDecision",
+    "RevisionTarget",
+    "ReadOnlyFileReference",
+    "ReadOnlyFileRole",
+    "DisclosedTextFile",
+    "DependencySolutionContext",
     "PreliminaryModelingReport",
     "SolveProblemContext",
     "SolveProblemIteration",

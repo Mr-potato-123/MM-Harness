@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from m2harness.application.tools import ToolRuntime, ToolRegistry
+from m2harness.application.compact import ContextCompactor, ContextCompactorPort
 from m2harness.domain.agent import AgentSession, ModelRequest, ModelResponse
 from m2harness.domain.capability import CapabilityResolution
 from m2harness.domain.tool import ToolCall
@@ -12,15 +13,17 @@ from m2harness.ports.provider import ModelProvider
 
 
 class AgentRuntime:
-    def __init__(self, provider: ModelProvider, tool_runtime: ToolRuntime, tool_registry: ToolRegistry) -> None:
+    def __init__(self, provider: ModelProvider, tool_runtime: ToolRuntime, tool_registry: ToolRegistry, *, compactor: ContextCompactorPort | None = None) -> None:
         self.provider = provider
         self.tool_runtime = tool_runtime
         self.tool_registry = tool_registry
+        self.compactor = compactor or ContextCompactor()
 
     async def run(self, request: ModelRequest, resolution: CapabilityResolution) -> ModelResponse:
         session = request.session
         current = request.model_copy(update={"tools": self._project_tools(resolution)})
         for _ in range(session.max_turns):
+            current = await self.compactor.compact(current)
             response = await self.provider.complete(current)
             if not response.tool_calls:
                 return response

@@ -16,6 +16,7 @@ from m2harness.application.local_tools import LocalToolEnvironment, register_loc
 from m2harness.artifacts import ArtifactStore
 from m2harness.application.workflow_engine import WorkflowEngine
 from m2harness.application.main_harness import MainHarness
+from m2harness.application.report_store import RunReportStore
 from m2harness.application.solve_problem import SolveProblemService, UnconfiguredSolveProblemService
 from m2harness.application.knowledge import HMMLKnowledgeBase, EmptyKnowledgeBase, default_hmml_path, KnowledgeBasePort
 from m2harness.application.research import AuthorizedWebResearchPort, DeepResearchService
@@ -124,10 +125,17 @@ def build_local_runtime(*, skill_root: Path | None = None, workspace_root: Path 
     tools = register_local_tools(ToolRegistry(), tool_environment)
     tool_execution_store = SQLiteToolExecutionStore(runtime_database)
     tool_audit_store = SQLiteToolAuditStore(runtime_database)
-    tool_runtime = ToolRuntime(tools, middlewares=(ResultBudgetMiddleware(1_048_576), ResultRedactionMiddleware({"api_key", "access_token", "secret"})), execution_store=tool_execution_store, audit_sink=tool_audit_store)
+    tool_runtime = ToolRuntime(
+        tools, max_result_bytes=32 * 1024 * 1024,
+        middlewares=(ResultBudgetMiddleware(32 * 1024 * 1024), ResultRedactionMiddleware({"api_key", "access_token", "secret"})),
+        execution_store=tool_execution_store, audit_sink=tool_audit_store,
+    )
     definition = SingleQuestionWorkflowV1()
     events = SQLiteEventStore(runtime_database)
     engine = WorkflowEngine(definition, SQLiteWorkflowRepository(runtime_database), capabilities, events=events)
     main_harness_repository = SQLiteMainHarnessRepository(runtime_database)
-    main_harness = MainHarness(tool_runtime, capabilities, repository=main_harness_repository)
+    main_harness = MainHarness(
+        tool_runtime, capabilities, repository=main_harness_repository,
+        report_store=RunReportStore(workspace),
+    )
     return RuntimeBundle(capabilities=capabilities, skills=skills, tools=tools, workflows=engine, media=tool_environment.media or MediaInventory(), network=network, tool_environment=tool_environment, tool_runtime=tool_runtime, tool_execution_store=tool_execution_store, tool_audit_store=tool_audit_store, events=events, sandbox=sandbox, artifact_registry=artifact_registry, main_harness=main_harness, solve_problem_service=configured_solve_service, main_harness_repository=main_harness_repository, knowledge_base=knowledge_base, research_service=research_service)

@@ -396,6 +396,23 @@ class RuntimeV2Test(unittest.TestCase):
         self.assertEqual(response.text, "done")
         self.assertEqual(provider.seen_tools[0]["function"]["name"], "data_profile")
 
+    def test_compact_middleware_replaces_old_turns_with_continuation_snapshot(self) -> None:
+        from asyncio import run
+        from m2harness.application.compact import ContextCompactor
+        session = AgentSession(session_id=uuid4(), activity_id=uuid4(), role="test", provider="fake", model="m")
+        context = ContextEngine().build(session.session_id, [], budget_tokens=1_000, prompt_template="compact-v1")
+        messages = tuple(
+            {"role": "user" if index % 2 == 0 else "assistant", "content": (f"turn {index} decision file outputs/result-{index}.json " * 80)}
+            for index in range(12)
+        )
+        request = ModelRequest(session=session, context=context, messages=messages)
+        compacted = run(ContextCompactor(trigger_ratio=0.5, keep_recent_messages=4).compact(request))
+        self.assertEqual(len(compacted.compactions), 1)
+        self.assertEqual([item["role"] for item in compacted.messages[-4:]], [item["role"] for item in messages[-4:]])
+        self.assertIn("turn 11", compacted.messages[-1]["content"])
+        self.assertIn("COMPACTED CONTINUATION STATE", compacted.messages[0]["content"])
+        self.assertLess(compacted.compactions[0].estimated_tokens_after, compacted.compactions[0].estimated_tokens_before)
+
     def test_media_inventory_sniffs_raw_bytes_and_marks_extraction_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             store = ArtifactStore(Path(temp) / "artifacts")

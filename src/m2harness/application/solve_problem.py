@@ -9,6 +9,7 @@ the model approves or the iteration budget is exhausted.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -28,6 +29,8 @@ from m2harness.domain.solve_problem import (
     SolveProblemTask,
     UnifiedModelingReport,
     ModelReviewDecision,
+    RevisionTarget,
+    DisclosedTextFile,
 )
 from m2harness.errors import ActivityExecutionError, ConfigurationError
 from m2harness.models import ReportPayload
@@ -90,6 +93,59 @@ class CodeHarnessPort(Protocol):
     ) -> CodingHarnessReport: ...
 
 
+class ReadOnlyFileReaderPort(Protocol):
+    """Resolve only paths explicitly allowlisted in SolveProblemContext."""
+
+    def disclose(self, context: SolveProblemContext, paths: Sequence[str]) -> tuple[DisclosedTextFile, ...]: ...
+
+
+class WorkspaceReadOnlyFileReader:
+    """Bounded verified reader used by progressive disclosure."""
+
+    def __init__(self, workspace_root: Path, *, max_file_bytes: int = 256_000, max_total_bytes: int = 1_000_000) -> None:
+        self.workspace_root = workspace_root.resolve()
+        self.max_file_bytes = max_file_bytes
+        self.max_total_bytes = max_total_bytes
+
+    def disclose(self, context: SolveProblemContext, paths: Sequence[str]) -> tuple[DisclosedTextFile, ...]:
+        allowlist = {item.relative_path: item for item in context.readonly_files}
+        existing = {item.relative_path for item in context.disclosed_text_files}
+        result: list[DisclosedTextFile] = []
+        total = 0
+        for requested in dict.fromkeys(path.replace("\\", "/") for path in paths):
+            if requested in existing:
+                continue
+            reference = allowlist.get(requested)
+            if reference is None:
+                raise PermissionError(f"requested file is not disclosed by Main Harness: {requested}")
+            target = (self.workspace_root / requested).resolve()
+            if self.workspace_root != target and self.workspace_root not in target.parents:
+                raise PermissionError(f"requested file escapes workspace: {requested}")
+            if not target.is_file() or target.is_symlink():
+                raise FileNotFoundError(f"disclosed file is unavailable: {requested}")
+            raw = target.read_bytes()
+            digest = hashlib.sha256(raw).hexdigest()
+            if reference.sha256 is not None and digest != reference.sha256:
+                raise ValueError(f"disclosed file digest changed: {requested}")
+            if reference.size_bytes is not None and len(raw) != reference.size_bytes:
+                raise ValueError(f"disclosed file size changed: {requested}")
+            remaining = self.max_total_bytes - total
+            if remaining <= 0:
+                break
+            limit = min(self.max_file_bytes, remaining)
+            sample = raw[:limit]
+            try:
+                content = sample.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"only UTF-8 text can be progressively disclosed: {requested}") from exc
+            result.append(DisclosedTextFile(
+                relative_path=requested, purpose=reference.purpose, content=content,
+                sha256=digest, truncated=len(raw) > limit,
+            ))
+            total += len(sample)
+        return tuple(result)
+
+
 @dataclass(frozen=True)
 class SolveProblemService:
     """Run one bounded report-driven solve loop.
@@ -105,6 +161,7 @@ class SolveProblemService:
     code_harness: CodeHarnessPort
     max_iterations: int = 3
     research_agent: ResearchAgentPort | None = None
+    file_reader: ReadOnlyFileReaderPort | None = None
 
     def __post_init__(self) -> None:
         if self.max_iterations < 1 or self.max_iterations > 20:
@@ -132,15 +189,31 @@ class SolveProblemService:
             current_context = current_context.model_copy(update={"research_report": research})
         iterations: list[SolveProblemIteration] = []
         revision_instructions: tuple[str, ...] = ()
+        revision_target = RevisionTarget.FULL
+        preliminary: tuple[PreliminaryModelingReport, ...] = ()
+        modeling: UnifiedModelingReport | None = None
         branch_count = self.branch_count(task)
         for iteration_number in range(1, self.max_iterations + 1):
             if revision_instructions:
                 current_context = current_context.model_copy(update={
                     "instructions": (*current_context.instructions, *revision_instructions),
                 })
-            preliminary = tuple(self.model_agent.explore(
-                task, current_context, branch_count=branch_count, iteration=iteration_number,
-            ))
+            if modeling is None or revision_target in {RevisionTarget.MODEL, RevisionTarget.FULL}:
+                preliminary = tuple(self.model_agent.explore(
+                    task, current_context, branch_count=branch_count, iteration=iteration_number,
+                ))
+                requested = tuple(dict.fromkeys(
+                    path for report in preliminary for path in report.requested_file_paths
+                ))
+                if requested and self.file_reader is not None:
+                    disclosed = self.file_reader.disclose(current_context, requested)
+                    if disclosed:
+                        current_context = current_context.model_copy(update={
+                            "disclosed_text_files": (*current_context.disclosed_text_files, *disclosed),
+                        })
+                        preliminary = tuple(self.model_agent.explore(
+                            task, current_context, branch_count=branch_count, iteration=iteration_number,
+                        ))
             if not preliminary:
                 return SolveProblemReport(
                     task_id=task.task_id, status=SolveProblemStatus.FAILED,
@@ -156,9 +229,10 @@ class SolveProblemService:
                     research_report=current_context.research_report,
                     error="Model Agent returned duplicate or excess preliminary branch ids",
                 )
-            modeling = self.model_agent.synthesize(
-                task, current_context, preliminary, iteration=iteration_number,
-            )
+            if modeling is None or revision_target in {RevisionTarget.MODEL, RevisionTarget.FULL}:
+                modeling = self.model_agent.synthesize(
+                    task, current_context, preliminary, iteration=iteration_number,
+                )
             if not set(modeling.selected_branch_ids).issubset(set(branch_ids)):
                 return SolveProblemReport(
                     task_id=task.task_id, status=SolveProblemStatus.FAILED,
@@ -194,6 +268,13 @@ class SolveProblemService:
                     research_report=current_context.research_report,
                 )
             revision_instructions = review.revision_instructions
+            revision_target = review.revision_target
+            if review.requested_file_paths and self.file_reader is not None:
+                disclosed = self.file_reader.disclose(current_context, review.requested_file_paths)
+                if disclosed:
+                    current_context = current_context.model_copy(update={
+                        "disclosed_text_files": (*current_context.disclosed_text_files, *disclosed),
+                    })
 
         return SolveProblemReport(
             task_id=task.task_id, status=SolveProblemStatus.REVISION_REQUIRED,

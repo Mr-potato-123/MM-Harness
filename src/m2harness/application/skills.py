@@ -86,8 +86,13 @@ class FilesystemSkillProvider:
         description = declared.get("description", front.get("description", f"Skill: {name}"))
         version = declared.get("version", front.get("version", "0.1.0"))
         api_version = declared.get("apiVersion", "m2harness/v1")
+        declared_model_invocable = declared.get("modelInvocable")
+        if declared_model_invocable is None:
+            model_invocable = front.get("disable-model-invocation", "false").lower() not in {"true", "1"}
+        else:
+            model_invocable = declared_model_invocable.lower() in {"true", "1"}
         invocation = InvocationPolicy(
-            model_invocable=declared.get("modelInvocable", front.get("disable-model-invocation", "false")).lower() not in {"true", "1"},
+            model_invocable=model_invocable,
             user_invocable=declared.get("userInvocable", front.get("user-invocable", "true")).lower() not in {"false", "0"},
         )
         entrypoint = declared.get("entrypoint", "SKILL.md")
