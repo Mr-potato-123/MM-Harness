@@ -278,6 +278,12 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         key = api_key or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("DASHSCOPE_API_KEY")
         if not key:
             raise DeepAgentsUnavailable("DEEPSEEK_API_KEY or DASHSCOPE_API_KEY is required for DeepAgents Code Agent")
+        model_options: dict[str, Any] = {}
+        if "deepseek.com" in endpoint.lower():
+            # DeepSeek currently rejects tool_choice/structured-output calls
+            # while thinking mode is enabled.  The Model Agent keeps its own
+            # reasoning setting; Code Agent tool execution must be callable.
+            model_options["extra_body"] = {"thinking": {"type": "disabled"}}
         return ChatOpenAI(
             model=name,
             base_url=endpoint,
@@ -285,6 +291,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             temperature=0,
             max_retries=2,
             streaming=True,
+            **model_options,
         )
 
     def _permissions(self, context: SolveProblemContext, target_relative: str, permission_type: Any) -> list[Any]:
