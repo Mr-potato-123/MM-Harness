@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import re
 import tempfile
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Mapping
 from uuid import UUID
 
 from pydantic import Field
@@ -41,6 +45,8 @@ class RunReportStore:
     def __init__(self, workspace_root: Path) -> None:
         self.workspace_root = workspace_root.resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
+        self._probe_locks: dict[str, threading.Lock] = {}
+        self._probe_locks_guard = threading.Lock()
 
     def archive_markdown(
         self,
@@ -72,6 +78,73 @@ class RunReportStore:
             attempt=attempt, iteration=iteration, media_type="text/markdown",
         )
         return record.as_readonly()
+
+    def record_probe(
+        self,
+        run_id: UUID,
+        *,
+        task_id: str,
+        attempt: int,
+        iteration: int | None,
+        event: str,
+        actor: str,
+        status: str,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Append one bounded stage probe for live operator inspection.
+
+        ``probe.ndjson`` is machine-readable and append-only for tailing while
+        a run is active.  ``probe.md`` is the same stream rendered as a short
+        Markdown ledger.  Details are deliberately summarized: source code,
+        multimodal bytes, prompts and credentials never belong in a probe.
+        """
+
+        if attempt < 1 or not event.strip() or not actor.strip() or not status.strip():
+            raise ValueError("invalid solve probe identity")
+        run_key = str(run_id)
+        base = Path("reports") / "runs" / run_key
+        ndjson = (base / "probe.ndjson").as_posix()
+        markdown = (base / "probe.md").as_posix()
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "run_id": run_key,
+            "task_id": task_id,
+            "attempt": attempt,
+            "iteration": iteration,
+            "event": event,
+            "actor": actor,
+            "status": status,
+            "details": _probe_value(details or {}),
+        }
+        line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+        md_line = (
+            f"- `{payload['timestamp']}` · `{task_id}` · 迭代 `{iteration or '-'}` · "
+            f"**{actor}** · `{event}` · `{status}` · "
+            f"`{json.dumps(payload['details'], ensure_ascii=False, separators=(',', ':'))}`\n"
+        )
+        with self._probe_lock(run_key):
+            self._append_text(Path(ndjson), line, encoding="utf-8")
+            target = (self.workspace_root / markdown).resolve()
+            if not target.exists():
+                self._write(Path(markdown), "# Solve Problem 探针\n\n" +
+                            "本文件记录 Model、Code、Review 与文件披露边界；完整交接内容见同一 run 下各题目的 `exchanges/`。\n\n",
+                            purpose="Live operator probe index for solve_problem.", role=ReadOnlyFileRole.REFERENCE,
+                            task_id="probe", attempt=1, iteration=None, media_type="text/markdown")
+            self._append_text(Path(markdown), md_line, encoding="utf-8")
+
+    def _probe_lock(self, run_key: str) -> threading.Lock:
+        with self._probe_locks_guard:
+            return self._probe_locks.setdefault(run_key, threading.Lock())
+
+    def _append_text(self, relative: Path, text: str, *, encoding: str) -> None:
+        target = (self.workspace_root / relative).resolve()
+        if self.workspace_root not in target.parents:
+            raise ValueError("probe path escapes workspace")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding=encoding, newline="") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
 
     def persist(self, run_id: UUID, report: SolveProblemReport, *, attempt: int) -> tuple[ReportFileRecord, ...]:
         base = Path("reports") / "runs" / str(run_id) / "tasks" / report.task_id / f"attempt-{attempt}"
@@ -161,6 +234,18 @@ class RunReportStore:
             role=ReadOnlyFileRole.REFERENCE, task_id=report.task_id,
             attempt=attempt, iteration=None, media_type="application/json",
         ))
+        run_base = Path("reports") / "runs" / str(run_id)
+        for relative, media_type in ((run_base / "probe.md", "text/markdown"), (run_base / "probe.ndjson", "application/x-ndjson")):
+            target = (self.workspace_root / relative).resolve()
+            if target.is_file() and not target.is_symlink():
+                data = target.read_bytes()
+                records.append(ReportFileRecord(
+                    relative_path=relative.as_posix(),
+                    purpose="Live solve_problem probe ledger for operator inspection.",
+                    role=ReadOnlyFileRole.REFERENCE, task_id=report.task_id,
+                    attempt=attempt, iteration=None, media_type=media_type,
+                    sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
+                ))
         return tuple(records)
 
     def persist_publication(self, run_id: UUID, final_report: ReportPayload, final_latex: ProducedArtifact) -> tuple[ReportFileRecord, ...]:
@@ -228,3 +313,27 @@ class RunReportStore:
 def _archive_iteration(relative_path: str) -> int | None:
     match = re.search(r"/exchanges/iteration-(\d+)/", "/" + relative_path.replace("\\", "/"))
     return int(match.group(1)) if match else None
+
+
+def _probe_value(value: Any, *, depth: int = 0) -> Any:
+    """Bound probe details and remove fields that could carry secrets/bytes."""
+
+    if depth > 3:
+        return "<depth-limited>"
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key, item in list(value.items())[:32]:
+            name = str(key)
+            lowered = name.lower()
+            if any(token in lowered for token in ("api_key", "access_token", "secret", "password", "base64", "credential")):
+                result[name] = "<redacted>"
+            else:
+                result[name] = _probe_value(item, depth=depth + 1)
+        return result
+    if isinstance(value, (list, tuple, set)):
+        return [_probe_value(item, depth=depth + 1) for item in list(value)[:64]]
+    if isinstance(value, str):
+        return value[:2_000]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(value)[:500]

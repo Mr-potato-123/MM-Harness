@@ -565,7 +565,7 @@ def _solve_problem(env: LocalToolEnvironment, args: dict[str, Any]) -> dict[str,
         run_service = SolveProblemService(
             service.model_agent, service.code_harness, max_iterations=effective_limit,
             research_agent=service.research_agent, file_reader=service.file_reader,
-            archive_writer=service.archive_writer,
+            archive_writer=service.archive_writer, probe_writer=service.probe_writer,
         )
         report = run_service.solve(task, context)
     elif hasattr(service, "solve"):

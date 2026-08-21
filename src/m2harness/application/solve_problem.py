@@ -15,7 +15,7 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 from uuid import UUID
 
 from m2harness.domain.solve_problem import (
@@ -121,6 +121,29 @@ class SolveProblemArchivePort(Protocol):
     ) -> ReadOnlyFileReference: ...
 
 
+class SolveProblemProbePort(Protocol):
+    """Durable, operator-readable probe for every solve stage boundary.
+
+    Handoff Markdown explains *what* is transferred.  The probe explains
+    *when* it happened, which actor was active, and whether the boundary
+    succeeded.  Implementations must not persist secrets or full source
+    payloads; only bounded metadata and verified paths belong here.
+    """
+
+    def record_probe(
+        self,
+        run_id: UUID,
+        *,
+        task_id: str,
+        attempt: int,
+        iteration: int | None,
+        event: str,
+        actor: str,
+        status: str,
+        details: Mapping[str, Any] | None = None,
+    ) -> None: ...
+
+
 class WorkspaceReadOnlyFileReader:
     """Bounded verified reader used by progressive disclosure."""
 
@@ -159,6 +182,13 @@ class WorkspaceReadOnlyFileReader:
             try:
                 content = sample.decode("utf-8")
             except UnicodeDecodeError as exc:
+                # Binary inputs (PDF/images/data files) are already supplied
+                # through ``multimodal_inputs`` or the trusted tool lane.  A
+                # Model Agent may still mention their allowlisted path while
+                # reasoning, but that request must not abort the whole solve
+                # loop merely because the bytes are not UTF-8 text.
+                if reference.media_type != "text/plain" and not reference.media_type.startswith("text/"):
+                    continue
                 raise ValueError(f"only UTF-8 text can be progressively disclosed: {requested}") from exc
             result.append(DisclosedTextFile(
                 relative_path=requested, purpose=reference.purpose, content=content,
@@ -185,6 +215,7 @@ class SolveProblemService:
     research_agent: ResearchAgentPort | None = None
     file_reader: ReadOnlyFileReaderPort | None = None
     archive_writer: SolveProblemArchivePort | None = None
+    probe_writer: SolveProblemProbePort | None = None
 
     def __post_init__(self) -> None:
         if self.max_iterations < 1 or self.max_iterations > 20:
@@ -209,6 +240,12 @@ class SolveProblemService:
 
     def solve(self, task: SolveProblemTask, context: SolveProblemContext | None = None) -> SolveProblemReport:
         current_context = context or SolveProblemContext()
+        self._probe(current_context, task, None, "solve_start", "Main Harness", "started", {
+            "max_iterations": self.max_iterations,
+            "revision_round_limit": self.revision_round_limit,
+            "readonly_file_count": len(current_context.readonly_files),
+            "multimodal_input_count": len(current_context.multimodal_inputs),
+        })
         if self.research_agent is not None and current_context.research_report is None:
             research = self.research_agent.research(
                 task.problem,
@@ -262,9 +299,17 @@ class SolveProblemService:
                     "instructions": (*current_context.instructions, *revision_instructions),
                 })
             if modeling is None or revision_target in {RevisionTarget.MODEL, RevisionTarget.FULL}:
+                self._probe(current_context, task, iteration_number, "model_explore_start", "Model Agent", "started", {
+                    "branch_count": branch_count,
+                    "revision_target": revision_target.value,
+                })
                 preliminary = tuple(self.model_agent.explore(
                     task, current_context, branch_count=branch_count, iteration=iteration_number,
                 ))
+                self._probe(current_context, task, iteration_number, "model_explore_complete", "Model Agent", "completed", {
+                    "branch_ids": [item.branch_id for item in preliminary],
+                    "requested_file_paths": [path for item in preliminary for path in item.requested_file_paths],
+                })
                 for preliminary_report in preliminary:
                     current_context = self._archive(
                         current_context, task, iteration_number, "modeling",
@@ -281,7 +326,33 @@ class SolveProblemService:
                     path for report in preliminary for path in report.requested_file_paths
                 ))
                 if requested and self.file_reader is not None:
-                    disclosed = self.file_reader.disclose(current_context, requested)
+                    self._probe(current_context, task, iteration_number, "file_disclosure_requested", "Model Agent", "started", {
+                        "paths": list(requested),
+                    })
+                    try:
+                        disclosed = self.file_reader.disclose(current_context, requested)
+                    except Exception as exc:
+                        self._probe(current_context, task, iteration_number, "file_disclosure_failed", "Main Harness", "failed", {
+                            "paths": list(requested), "error": str(exc)[:2_000],
+                        })
+                        current_context = self._archive(
+                            current_context, task, iteration_number, "handoff", "disclosure-failure",
+                            _disclosure_failure_markdown(task, iteration_number, requested, exc),
+                            purpose=f"Progressive disclosure failure before the next Model Agent boundary for {task.task_id}.",
+                            role=ReadOnlyFileRole.REFERENCE,
+                        )
+                        return SolveProblemReport(
+                            task_id=task.task_id, status=SolveProblemStatus.FAILED,
+                            iteration_count=max(0, iteration_number - 1), iterations=tuple(iterations),
+                            archive_files=self._archive_files(current_context, task),
+                            research_report=current_context.research_report,
+                            error=f"progressive disclosure failed: {exc}",
+                        )
+                    self._probe(current_context, task, iteration_number, "file_disclosure_complete", "Main Harness", "completed", {
+                        "requested_paths": list(requested),
+                        "disclosed_paths": [item.relative_path for item in disclosed],
+                        "skipped_binary_paths": [path for path in requested if path not in {item.relative_path for item in disclosed}],
+                    })
                     if disclosed:
                         current_context = current_context.model_copy(update={
                             "disclosed_text_files": (*current_context.disclosed_text_files, *disclosed),
@@ -315,9 +386,15 @@ class SolveProblemService:
                     error="Model Agent returned duplicate or excess preliminary branch ids",
                 )
             if modeling is None or revision_target in {RevisionTarget.MODEL, RevisionTarget.FULL}:
+                self._probe(current_context, task, iteration_number, "model_synthesize_start", "Model Agent", "started", {})
                 modeling = self.model_agent.synthesize(
                     task, current_context, preliminary, iteration=iteration_number,
                 )
+                self._probe(current_context, task, iteration_number, "model_synthesize_complete", "Model Agent", "completed", {
+                    "selected_branch_ids": list(modeling.selected_branch_ids),
+                    "required_validations": list(modeling.required_validations),
+                    "expected_outputs": list(modeling.expected_outputs),
+                })
                 current_context = self._archive(
                     current_context, task, iteration_number, "modeling", "modeling_report",
                     _modeling_markdown(modeling),
@@ -341,6 +418,11 @@ class SolveProblemService:
                 purpose=f"Explicit Model Agent to Code Agent handoff for {task.task_id}, iteration {iteration_number}.",
                 role=ReadOnlyFileRole.REFERENCE,
             )
+            self._probe(current_context, task, iteration_number, "model_to_code_handoff", "Model Agent", "completed", {
+                "handoff": "model-to-code.md",
+                "required_validations": list(modeling.required_validations),
+                "expected_outputs": list(modeling.expected_outputs),
+            })
             if not set(modeling.selected_branch_ids).issubset(set(branch_ids)):
                 return SolveProblemReport(
                     task_id=task.task_id, status=SolveProblemStatus.FAILED,
@@ -349,9 +431,22 @@ class SolveProblemService:
                     research_report=current_context.research_report,
                     error="Unified Modeling Report selected an unknown preliminary branch",
                 )
-            coding = self.code_harness.execute(
+            self._probe(current_context, task, iteration_number, "code_execute_start", "Code Agent", "started", {
+                "revision_target": revision_target.value,
+            })
+            try:
+                coding = self.code_harness.execute(
                 task, current_context, modeling, iteration=iteration_number,
-            )
+                )
+            except Exception as exc:
+                self._probe(current_context, task, iteration_number, "code_execute_failed", "Code Agent", "failed", {"error": str(exc)[:2_000]})
+                raise
+            self._probe(current_context, task, iteration_number, "code_execute_complete", "Code Agent", "completed", {
+                "execution_succeeded": coding.execution_succeeded,
+                "validations": coding.validations,
+                "generated_files": [item.relative_path for item in coding.generated_files],
+                "artifact_names": [item.logical_name for item in coding.artifacts],
+            })
             # Generated source/output files become reviewable evidence only
             # after the Code Harness has materialized and hashed them.  Merge
             # those references into the read-only manifest before asking the
@@ -381,15 +476,33 @@ class SolveProblemService:
                 purpose=f"Explicit Code Harness to Review Agent handoff for {task.task_id}, iteration {iteration_number}.",
                 role=ReadOnlyFileRole.DEPENDENCY_OUTPUT,
             )
+            self._probe(current_context, task, iteration_number, "code_to_review_handoff", "Code Agent", "completed", {
+                "handoff": "code-to-review.md",
+                "execution_succeeded": coding.execution_succeeded,
+                "generated_files": [item.relative_path for item in coding.generated_files],
+            })
+            self._probe(current_context, task, iteration_number, "review_start", "Review Agent", "started", {})
             review = self.model_agent.review(
                 task, current_context, modeling, coding, iteration=iteration_number,
             )
+            self._probe(current_context, task, iteration_number, "review_complete", "Review Agent", "completed", {
+                "decision": review.decision.value,
+                "revision_target": review.revision_target.value,
+                "revision_instruction_count": len(review.revision_instructions),
+                "requested_file_paths": list(review.requested_file_paths),
+            })
             current_context = self._archive(
                 current_context, task, iteration_number, "review", "review_report",
                 _review_markdown(review),
                 purpose=f"Review Agent decision for {task.task_id}, iteration {iteration_number}.",
                 role=ReadOnlyFileRole.REFERENCE,
             )
+            self._probe(current_context, task, iteration_number, "review_to_next_stage_handoff", "Review Agent", "completed", {
+                "handoff": "review-to-next-stage.md",
+                "decision": review.decision.value,
+                "revision_target": review.revision_target.value,
+                "revision_instructions": list(review.revision_instructions),
+            })
             current_context = self._record_conversation(
                 current_context, task, iteration_number, "Review Agent",
                 f"审查决定：{review.decision.value}；返修目标：{review.revision_target.value}；指令：{'；'.join(review.revision_instructions[:8])}。",
@@ -418,6 +531,10 @@ class SolveProblemService:
                     task, current_context, modeling, coding, review,
                     iteration=iteration_number,
                 )
+                self._probe(current_context, task, iteration_number, "final_report_composed", "Model Agent", "completed", {
+                    "title": final_report.title,
+                    "markdown_chars": len(final_report.markdown),
+                })
                 return SolveProblemReport(
                     task_id=task.task_id, status=SolveProblemStatus.COMPLETED,
                     iteration_count=iteration_number, iterations=tuple(iterations),
@@ -449,6 +566,27 @@ class SolveProblemService:
             archive_files=self._archive_files(current_context, task),
             research_report=current_context.research_report,
             error="solve_problem iteration budget exhausted",
+        )
+
+    def _probe(
+        self,
+        context: SolveProblemContext,
+        task: SolveProblemTask,
+        iteration: int | None,
+        event: str,
+        actor: str,
+        status: str,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        if self.probe_writer is None:
+            return
+        raw_run_id = context.metadata.get("run_id")
+        if not raw_run_id:
+            return
+        self.probe_writer.record_probe(
+            UUID(str(raw_run_id)), task_id=task.task_id,
+            attempt=task.revision + 1, iteration=iteration, event=event,
+            actor=actor, status=status, details=details or {},
         )
 
     def _archive(
@@ -559,6 +697,39 @@ def _review_markdown(review: SolveProblemReview) -> str:
         "", "## 请求读取的只读文件", "", *(f"- `{item}`" for item in review.requested_file_paths),
     ]
     return "\n".join(lines).strip() + "\n"
+
+
+def _disclosure_failure_markdown(
+    task: SolveProblemTask,
+    iteration: int,
+    requested_paths: Sequence[str],
+    error: Exception,
+) -> str:
+    """Keep a visible report even when a boundary fails before Code runs."""
+
+    return "\n".join([
+        "# 交接前失败报告：Model Agent → 文件披露",
+        "",
+        f"- 题目：`{task.task_id}` — {task.title}",
+        f"- 迭代：`{iteration}`",
+        "- 结果：`failed`",
+        "",
+        "## 转接理由",
+        "",
+        "Model Agent 请求了只读路径，但文件披露阶段未能完成；因此没有把不完整上下文转给 Code Agent。",
+        "",
+        "## 请求路径",
+        "",
+        *(f"- `{path}`" for path in requested_paths),
+        "",
+        "## 失败原因",
+        "",
+        f"`{str(error)[:2_000]}`",
+        "",
+        "## 下一步",
+        "",
+        "若路径是 PDF、图片或其他二进制输入，应通过 multimodal_inputs 或受限工具读取；只有 UTF-8 文本才进入渐进式文本披露。",
+    ]).strip() + "\n"
 
 
 def _handoff_paths(context: SolveProblemContext, *, task_id: str | None = None) -> list[str]:

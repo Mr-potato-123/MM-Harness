@@ -281,6 +281,44 @@ class SolveProblemHarnessTest(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 reader.disclose(SolveProblemContext(readonly_files=(reference,)), ("not-allowed.md",))
 
+    def test_binary_progressive_disclosure_is_skipped_not_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = b"%PDF-1.7\x00\xffbinary"
+            (root / "problem.pdf").write_bytes(data)
+            reference = ReadOnlyFileReference(
+                relative_path="problem.pdf", purpose="Original PDF problem statement",
+                role=ReadOnlyFileRole.PROBLEM, media_type="application/pdf",
+                sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
+            )
+            disclosed = WorkspaceReadOnlyFileReader(root).disclose(
+                SolveProblemContext(readonly_files=(reference,)), ("problem.pdf",)
+            )
+            self.assertEqual(disclosed, ())
+
+    def test_probe_ledger_is_written_for_each_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_id = uuid4()
+            store = RunReportStore(root)
+            result = SolveProblemService(
+                FakeModelAgent(), FakeCodeHarness(), max_iterations=2,
+                archive_writer=store, probe_writer=store,
+            ).solve(
+                SolveProblemTask(task_id="q1", title="Q", problem="P"),
+                SolveProblemContext(metadata={"run_id": str(run_id)}),
+            )
+            self.assertEqual(result.status, SolveProblemStatus.COMPLETED)
+            probe = root / "reports" / "runs" / str(run_id) / "probe.ndjson"
+            probe_md = root / "reports" / "runs" / str(run_id) / "probe.md"
+            self.assertTrue(probe.is_file())
+            self.assertTrue(probe_md.is_file())
+            events = [json.loads(line) for line in probe.read_text(encoding="utf-8").splitlines()]
+            names = {item["event"] for item in events}
+            self.assertIn("model_to_code_handoff", names)
+            self.assertIn("code_to_review_handoff", names)
+            self.assertIn("review_to_next_stage_handoff", names)
+
     def test_solve_loop_discloses_requested_file_then_reexplores(self) -> None:
         class RequestingModel(FakeModelAgent):
             def __init__(self):

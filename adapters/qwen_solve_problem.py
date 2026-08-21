@@ -814,6 +814,7 @@ def build_qwen_solve_problem_service(*, sandbox, workspace_root, research_agent=
         research_agent=research_agent,
         file_reader=WorkspaceReadOnlyFileReader(workspace_root),
         archive_writer=archive_writer,
+        probe_writer=archive_writer if hasattr(archive_writer, "record_probe") else None,
     )
 
 
@@ -841,6 +842,7 @@ def build_dsh_solve_problem_service(*, sandbox, workspace_root, research_agent=N
         research_agent=research_agent,
         file_reader=WorkspaceReadOnlyFileReader(Path(workspace_root)),
         archive_writer=archive_writer,
+        probe_writer=archive_writer if hasattr(archive_writer, "record_probe") else None,
     )
 
 
