@@ -80,5 +80,12 @@ class M2AgentAuditMiddleware(AgentMiddleware):
         except Exception as exc:
             self._emit("tool_error", runtime, getattr(request, "state", None), tool_name=name, error=str(exc)[:2_000])
             raise
-        self._emit("after_tool", runtime, getattr(request, "state", None), tool_name=name)
+        result_content = getattr(result, "content", None)
+        self._emit(
+            "after_tool",
+            runtime,
+            getattr(request, "state", None),
+            tool_name=name,
+            result_preview=str(result_content)[:1_000] if result_content is not None else None,
+        )
         return result

@@ -144,7 +144,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             "必须先用 write_todos 建立实现清单；每次只允许一个 in_progress，完成一项就更新为 completed。\n"
             "只能通过文件工具访问已授权路径；授权路径是逐项清单，不等于整个工作区。禁止网络、密钥、主 Harness 数据库和后续题目。\n"
             "源代码必须写入交接中指定的 target_source_path，验证输出只能写入同一 iteration 目录的 outputs 子目录。\n"
-            "交接信息已经包含建模契约和必要路径，不要循环读取报告清单。第一步直接调用 write_code_source 写入完整源代码；写入成功后再调用 python_execute 验证，必要时用 read_file 读取一次源文件。不要在写源代码前连续调用 ls/read_file。"
+            "交接信息已经包含建模契约和必要路径，不要循环读取报告清单。第一步直接调用 write_code_source 写入完整源代码（尽量不超过 350 行）；若工具返回 complete=false，必须用 append=true 继续写后续源码块，直到 complete=true，再调用 python_execute 验证。必要时用 read_file 读取一次源文件，不要在写源代码前连续调用 ls/read_file。"
             "完成后必须使用结构化输出字段 source_path、logical_name、timeout_seconds、expected_validations；不要把源代码放进最终回答。"
         )
         model_identifier = getattr(self.model, "model_name", None) or getattr(self.model, "model", None)
@@ -188,27 +188,50 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         workspace_root = self.workspace_root
 
         @tool("write_code_source")
-        def write_code_source(source: str) -> str:
-            """将完整 Python 源码原子写入本轮交接指定的固定路径。"""
+        def write_code_source(source: str, append: bool = False) -> str:
+            """将 Python 源码首块或后续块写入本轮交接指定的固定路径。"""
             if not isinstance(source, str) or not source.strip():
                 return json.dumps({"ok": False, "error": "source must be non-empty"}, ensure_ascii=False)
             if len(source.encode("utf-8")) > 2_000_000:
                 return json.dumps({"ok": False, "error": "source exceeds 2MB"}, ensure_ascii=False)
             try:
-                _validate_python_policy(source)
                 target.parent.mkdir(parents=True, exist_ok=True)
-                descriptor, temporary_name = tempfile.mkstemp(prefix=".m2h-source-", suffix=".py", dir=target.parent)
-                temporary = Path(temporary_name)
-                try:
-                    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                if append:
+                    if not target.is_file() or target.is_symlink():
+                        return json.dumps({"ok": False, "error": "append requires an existing first source chunk"}, ensure_ascii=False)
+                    with target.open("a", encoding="utf-8") as stream:
                         stream.write(source)
                         stream.flush()
                         os.fsync(stream.fileno())
-                    os.replace(temporary, target)
-                finally:
-                    temporary.unlink(missing_ok=True)
+                    if target.stat().st_size > 2_000_000:
+                        return json.dumps({"ok": False, "error": "assembled source exceeds 2MB"}, ensure_ascii=False)
+                else:
+                    descriptor, temporary_name = tempfile.mkstemp(prefix=".m2h-source-", suffix=".py", dir=target.parent)
+                    temporary = Path(temporary_name)
+                    try:
+                        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                            stream.write(source)
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                        os.replace(temporary, target)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                complete = True
+                syntax_error = ""
+                try:
+                    _validate_python_policy(target.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    complete = False
+                    syntax_error = str(exc)[:1_000]
                 return json.dumps(
-                    {"ok": True, "path": str(target.relative_to(workspace_root).as_posix()), "bytes": target.stat().st_size},
+                    {
+                        "ok": True,
+                        "complete": complete,
+                        "path": str(target.relative_to(workspace_root).as_posix()),
+                        "bytes": target.stat().st_size,
+                        "syntax_error": syntax_error,
+                        "next_action": "continue with write_code_source(append=true)" if not complete else "run python_execute",
+                    },
                     ensure_ascii=False,
                 )
             except Exception as exc:
