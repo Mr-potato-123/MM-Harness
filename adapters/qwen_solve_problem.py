@@ -804,7 +804,7 @@ def build_qwen_solve_problem_service(*, sandbox, workspace_root, research_agent=
     )
 
 
-def build_dsh_solve_problem_service(*, sandbox, workspace_root, research_agent=None, skills=None, client: QwenChatClient | None = None, max_iterations: int = 3, archive_writer: SolveProblemArchivePort | None = None, dsh_config=None) -> SolveProblemService:
+def build_dsh_solve_problem_service(*, sandbox, workspace_root, research_agent=None, skills=None, client: QwenChatClient | None = None, max_iterations: int = 3, archive_writer: SolveProblemArchivePort | None = None, dsh_config=None, tool_runtime: ToolRuntime | None = None, capabilities: CapabilityRegistry | None = None) -> SolveProblemService:
     """Compose the production LangGraph/DeepAgents Code Harness.
 
     ``dsh`` remains the stable CLI selector for compatibility with existing
