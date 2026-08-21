@@ -16,6 +16,7 @@ from pydantic import Field, model_validator
 
 from m2harness.models import ProducedArtifact, ReportPayload, StrictModel
 from m2harness.domain.research import ResearchReport
+from m2harness.domain.media import MultimodalInput
 
 
 class ExplorationMode(StrEnum):
@@ -56,6 +57,7 @@ class SolveProblemContext(StrictModel):
     """Progressively disclosed context passed from Main Harness."""
 
     source_artifact_ids: tuple[UUID, ...] = ()
+    multimodal_inputs: tuple[MultimodalInput, ...] = ()
     dependency_report_ids: tuple[UUID, ...] = ()
     accepted_report_ids: tuple[UUID, ...] = ()
     instructions: tuple[str, ...] = ()

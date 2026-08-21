@@ -25,6 +25,10 @@ from m2harness.application.research import DeepResearchService
 from m2harness.domain.knowledge import KnowledgeQuery
 from m2harness.domain.code import CodeProposal
 from m2harness.infrastructure.code_harness import LocalPythonCodeHarness
+from adapters.qwen_solve_problem import QwenCodeProposalProvider, QwenModelAgent, QwenPaperComposer, _content_parts
+from m2harness.domain.media import MultimodalInput
+import base64
+import hashlib
 
 
 def _report(title: str, claims: list[str] | None = None) -> ReportPayload:
@@ -36,9 +40,11 @@ class FakeModelAgent:
         self.explorations: list[int] = []
         self.reviews = 0
         self.research_seen = []
+        self.instructions_seen = []
 
     def explore(self, task, context, *, branch_count, iteration):
         self.research_seen.append(context.research_report)
+        self.instructions_seen.append(context.instructions)
         self.explorations.append(branch_count)
         return tuple(
             PreliminaryModelingReport(
@@ -82,6 +88,24 @@ class FakeCodeProposalProvider:
         return CodeProposal(source=self.source, expected_validations=modeling.required_validations)
 
 
+class FakeQwenClient:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def json(self, *, system, content, schema):
+        self.calls.append(content)
+        properties = schema.get("properties", {})
+        if "branch_id" in properties:
+            return {"branch_id": "route-1", "report": _report("route").model_dump(mode="json"), "candidate_scheme": "scheme", "expected_outputs": ["result"]}
+        if "selected_branch_ids" in properties:
+            return {"report": _report("model").model_dump(mode="json"), "selected_branch_ids": ["route-1"], "main_scheme": "scheme", "required_validations": ["sanity"], "expected_outputs": ["result"]}
+        if "decision" in properties:
+            return {"decision": "approve", "rationale": "evidence", "accepted_claims": ["result"]}
+        if "python_source" in properties or "source" in properties and "logical_name" in properties:
+            return {"source": "import json; print(json.dumps({'validations': {'sanity': True}}))", "logical_name": "generated_solution.py"}
+        return _report("final").model_dump(mode="json")
+
+
 class SolveProblemHarnessTest(unittest.TestCase):
     def test_solve_problem_is_a_bounded_report_loop(self) -> None:
         model = FakeModelAgent()
@@ -110,6 +134,18 @@ class SolveProblemHarnessTest(unittest.TestCase):
             self.assertEqual(next_state.tasks[0].status.value, "completed")
             self.assertEqual(bundle.main_harness.ready_tasks(next_state), ("publish-paper",))
             self.assertEqual(next_state.reports[0].status, SolveProblemStatus.COMPLETED)
+
+    def test_main_harness_reuses_revision_instructions_on_next_dispatch(self) -> None:
+        model = FakeModelAgent()
+        service = SolveProblemService(model, FakeCodeHarness(), max_iterations=1)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = build_local_runtime(workspace_root=root / "workspace", artifact_root=root / "artifacts", database_path=root / "runtime.db", solve_problem_service=service)
+            state = bundle.main_harness.start("solve", canonical_main_harness_dag())
+            state = bundle.main_harness.dispatch(state, "q1", max_iterations=1)
+            self.assertEqual(state.tasks[0].status.value, "revision_required")
+            bundle.main_harness.dispatch(state, "q1", max_iterations=1)
+            self.assertIn("add the sanity check", model.instructions_seen[1])
 
     def test_runtime_registers_solve_problem_as_main_tool(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -234,6 +270,61 @@ class SolveProblemHarnessTest(unittest.TestCase):
             failed = blocked.execute(SolveProblemTask(task_id="q1", title="Q", problem="P"), SolveProblemContext(), modeling, iteration=1)
             self.assertFalse(failed.execution_succeeded)
             self.assertTrue(failed.issues)
+
+    def test_qwen_solve_adapter_preserves_report_protocol_and_multimodal_parts(self) -> None:
+        raw = b"%PDF-1.7\n"
+        media = MultimodalInput(logical_name="problem.pdf", media_type="application/pdf", data_base64=base64.b64encode(raw).decode(), sha256=hashlib.sha256(raw).hexdigest(), size_bytes=len(raw))
+        context = SolveProblemContext(multimodal_inputs=(media,))
+        parts = _content_parts(context, "prompt")
+        self.assertEqual(parts[0]["type"], "file")
+        client = FakeQwenClient()
+        agent = QwenModelAgent(client)
+        task = SolveProblemTask(task_id="q1", title="Q", problem="P")
+        preliminary = agent.explore(task, context, branch_count=1, iteration=1)
+        modeling = agent.synthesize(task, context, preliminary, iteration=1)
+        coding = CodingHarnessReport(report=_report("code"), execution_succeeded=True, validations={"sanity": True}, artifacts=[ProducedArtifact(logical_name="evidence.json", text="{}")])
+        review = agent.review(task, context, modeling, coding, iteration=1)
+        final = agent.compose_final_report(task, context, modeling, coding, review, iteration=1)
+        proposal = QwenCodeProposalProvider(client).propose(task, context, modeling, iteration=1)
+        self.assertEqual(final.title, "final")
+        self.assertEqual(proposal.logical_name, "generated_solution.py")
+        self.assertGreaterEqual(len(client.calls), 5)
+
+    def test_runtime_can_attach_provider_after_sandbox_composition(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runtime = build_local_runtime(workspace_root=root / "w", artifact_root=root / "a", database_path=root / "r.db")
+            service = SolveProblemService(FakeModelAgent(), FakeCodeHarness(), max_iterations=1)
+            attached = runtime.attach_solve_problem_service(service)
+            self.assertIs(attached.solve_problem_service, service)
+            self.assertIs(runtime.tool_environment.solve_problem_service, service)
+
+    def test_main_harness_terminal_composer_owns_global_paper_merge(self) -> None:
+        class Composer:
+            def compose(self, problem, reports):
+                return _report("global final"), ProducedArtifact(
+                    logical_name="global.tex", kind=ArtifactKind.FINAL_LATEX_PAPER, media_type="text/x-tex",
+                    text="\\documentclass{article}\n\\title{Global}\n\\begin{document}\\begin{abstract}Evidence.\\end{abstract}\\section*{Result}Evidence.\\end{document}",
+                )
+
+        service = SolveProblemService(FakeModelAgent(), FakeCodeHarness(), max_iterations=2)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = build_local_runtime(workspace_root=root / "w", artifact_root=root / "a", database_path=root / "r.db", solve_problem_service=service)
+            state = bundle.main_harness.start("P", canonical_main_harness_dag())
+            state = bundle.main_harness.dispatch(state, "q1")
+            state = bundle.main_harness.generate_paper(state, Composer())
+            self.assertTrue(state.terminal)
+            self.assertEqual(state.final_report.title, "global final")
+
+    def test_qwen_paper_composer_returns_typed_single_latex_artifact(self) -> None:
+        class PaperClient:
+            def json(self, *, system, content, schema):
+                return {"final_report": _report("paper").model_dump(mode="json"), "latex": "\\documentclass{article}\n\\title{Paper}\n\\begin{document}\\begin{abstract}Evidence.\\end{abstract}\\section*{Result}Evidence.\\end{document}"}
+
+        report, artifact = QwenPaperComposer(PaperClient()).compose("P", ())
+        self.assertEqual(report.title, "paper")
+        self.assertEqual(artifact.kind, ArtifactKind.FINAL_LATEX_PAPER)
 
 
 if __name__ == "__main__":

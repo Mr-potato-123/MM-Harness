@@ -35,6 +35,9 @@ The repository is currently in a controlled rebuild. The original durable stage 
 - The local runtime discovers MM-Agent's HMML export from `M2HARNESS_HMML_PATH`,
   `knowledge/HMML.json`, or the checked-in reference path; set the environment
   variable for a production-managed index.
+- `MainHarness.generate_paper()` is the terminal global-context merge boundary;
+  `QwenPaperComposer` can produce the reviewed report plus the single
+  `final_latex_paper` artifact after all `solve_problem` nodes are complete.
 
 ## Rebuilt runtime smoke check
 
@@ -83,6 +86,16 @@ python -m pip install -e ".[media,analytics]"
 m2harness init
 m2harness create-project "validation-run"
 ```
+
+The target Main Harness path can be run after injecting the provider secret
+(`DASHSCOPE_API_KEY`) without putting it in source:
+
+```powershell
+m2harness run-main-qwen .\2026B.pdf --problem "Solve the attached problem" --max-iterations 3
+```
+
+This executes `Main Harness → solve_problem → Model/Code/Review → global paper
+composer`; the local sandbox and HMML index remain on the machine.
 
 The wheel carries the complete 19-skill bundled library (including referenced
 checklists/evals) under `share/m2harness/skills`; an installed CLI does not

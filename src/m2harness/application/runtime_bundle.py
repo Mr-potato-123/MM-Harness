@@ -52,6 +52,16 @@ class RuntimeBundle:
     knowledge_base: KnowledgeBasePort
     research_service: DeepResearchService
 
+    def attach_solve_problem_service(self, service: SolveProblemService) -> "RuntimeBundle":
+        """Attach a real Model/Code service after sandbox/runtime creation.
+
+        A Qwen Code Harness needs the already-composed local sandbox.  This
+        explicit second step keeps provider construction out of the local
+        runtime and avoids hidden global configuration.
+        """
+        self.tool_environment.solve_problem_service = service
+        return replace(self, solve_problem_service=service)
+
 
 def default_skill_root() -> Path:
     """Locate bundled Skills in source, editable, and wheel installations."""

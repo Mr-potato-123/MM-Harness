@@ -29,6 +29,8 @@ class DeepResearchService:
     knowledge_base: KnowledgeBasePort
     web_search: AuthorizedWebResearchPort | Callable[[str, int], Sequence[ResearchSource]] | None = None
     allow_web: bool = False
+    max_sources: int = 64
+    max_excerpt_chars: int = 1_500
 
     @staticmethod
     def plan_facets(query: str, *, max_facets: int) -> tuple[str, ...]:
@@ -58,7 +60,7 @@ class DeepResearchService:
                 sources.append(ResearchSource(
                     source_id=source_id, title=hit.entry.method, uri=hit.entry.source,
                     kind=ResearchSourceKind.LOCAL_KNOWLEDGE, trust="trusted-local-index",
-                    excerpt=hit.snippet, digest=hit.entry.source_digest,
+                    excerpt=hit.snippet[:self.max_excerpt_chars], digest=hit.entry.source_digest,
                     metadata={"score": hit.score, "matched_terms": list(hit.matched_terms), "facet_index": index, "hierarchy": list(hit.entry.hierarchy)},
                 ))
             if not result.hits:
@@ -73,7 +75,8 @@ class DeepResearchService:
         findings: list[ResearchFinding] = []
         # One finding per source keeps provenance explicit and avoids inventing
         # cross-source claims before a real Model Agent performs synthesis.
-        for index, source in enumerate(sources[:100]):
+        bounded_sources = sources[:max(1, min(self.max_sources, 100))]
+        for index, source in enumerate(bounded_sources):
             findings.append(ResearchFinding(
                 finding_id=f"finding-{index + 1}",
                 claim=f"Candidate method/evidence: {source.title}.",
@@ -82,7 +85,7 @@ class DeepResearchService:
                 confidence=0.65 if source.kind == ResearchSourceKind.LOCAL_KNOWLEDGE else 0.45,
             ))
         return ResearchReport(
-            query=query, plan=facets, sources=tuple(sources[:100]), findings=tuple(findings),
+            query=query, plan=facets, sources=tuple(bounded_sources), findings=tuple(findings),
             gaps=tuple(gaps[:20]), local_only=not (self.allow_web and self.web_search is not None),
             completed=True, index_digest=next((source.digest for source in sources if source.digest), None),
         )

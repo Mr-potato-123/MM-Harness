@@ -72,6 +72,12 @@ class MainHarnessRepository(Protocol):
     def save(self, state: MainHarnessState, expected_version: int) -> MainHarnessState: ...
 
 
+class PaperComposerPort(Protocol):
+    """Main-Harness-owned final report/LaTeX composition boundary."""
+
+    def compose(self, problem: str, reports: tuple[SolveProblemReport, ...]) -> tuple[ReportPayload, ProducedArtifact]: ...
+
+
 class MainHarness:
     """Enforce DAG/TODO semantics around one ``solve_problem`` Tool."""
 
@@ -151,7 +157,7 @@ class MainHarness:
             max_branches=int(node.metadata.get("max_branches", 3)) if isinstance(node.metadata.get("max_branches", 3), int) else 3,
             revision=attempt - 1, metadata=node.metadata,
         )
-        solve_context = context or SolveProblemContext()
+        solve_context = self._context_for_dispatch(state, node.id, node.depends_on, context)
         call = ToolCall(
             call_id=uuid4(), tool_name=definition.name, tool_version=definition.version,
             activity_id=uuid4(), session_id=uuid4(),
@@ -223,6 +229,22 @@ class MainHarness:
             "updated_at": utc_now(),
         }), state.version)
 
+    def generate_paper(self, state: MainHarnessState, composer: PaperComposerPort) -> MainHarnessState:
+        """Generate and publish the terminal paper after all solve nodes finish.
+
+        The terminal DAG node is deliberately not dispatched through
+        ``solve_problem``.  It is a Main Harness operation with global report
+        context, so a paper composer cannot accidentally see only one task or
+        close the run before the dependency graph is complete.
+        """
+        terminal = next(item for item in state.dag.tasks if item.id == state.dag.terminal_task_id)
+        if terminal.kind != DAGTaskKind.PUBLISH_LATEX:
+            raise ValueError("DAG terminal is not publish_latex")
+        if any(item.status != MainTaskStatus.COMPLETED for item in state.tasks if item.task_id != terminal.id):
+            raise ValueError("cannot compose paper before every solve_problem task is completed")
+        final_report, final_latex = composer.compose(state.problem, state.reports)
+        return self.publish(state, final_report=final_report, final_latex_paper=final_latex)
+
     def _commit(self, state: MainHarnessState, expected_version: int) -> MainHarnessState:
         committed = state.model_copy(update={"version": expected_version + 1, "updated_at": utc_now()})
         if self.repository is not None:
@@ -247,3 +269,37 @@ class MainHarness:
     def _replace_task(state: MainHarnessState, task: MainHarnessTask) -> MainHarnessState:
         tasks = tuple(task if item.task_id == task.task_id else item for item in state.tasks)
         return state.model_copy(update={"tasks": tasks, "updated_at": utc_now()})
+
+    @staticmethod
+    def _context_for_dispatch(
+        state: MainHarnessState,
+        task_id: str,
+        dependencies: tuple[str, ...],
+        supplied: SolveProblemContext | None,
+    ) -> SolveProblemContext:
+        """Build progressive-disclosure context from durable report snapshots."""
+        context = supplied or SolveProblemContext()
+        report_pairs = tuple(zip(state.report_ids, state.reports))
+        dependency_ids: list[UUID] = list(context.dependency_report_ids)
+        accepted_ids: list[UUID] = list(context.accepted_report_ids)
+        for report_id, report in report_pairs:
+            if report.task_id in dependencies and report_id not in dependency_ids:
+                dependency_ids.append(report_id)
+                if report.status == SolveProblemStatus.COMPLETED and report_id not in accepted_ids:
+                    accepted_ids.append(report_id)
+        instructions = list(context.instructions)
+        research_report = context.research_report
+        for _, report in reversed(report_pairs):
+            if report.task_id != task_id:
+                continue
+            if report.status == SolveProblemStatus.REVISION_REQUIRED:
+                instructions.extend(item for item in report.revision_instructions if item not in instructions)
+            if research_report is None and report.research_report is not None:
+                research_report = report.research_report
+            break
+        return context.model_copy(update={
+            "dependency_report_ids": tuple(dependency_ids),
+            "accepted_report_ids": tuple(accepted_ids),
+            "instructions": tuple(instructions),
+            "research_report": research_report,
+        })

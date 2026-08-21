@@ -57,7 +57,7 @@ class LocalPythonCodeHarness:
         try:
             proposal = self.provider.propose(task, context, modeling, iteration=iteration)
             _validate_python_policy(proposal.source)
-            script_path = self._write_script(proposal)
+            script_path = self._write_script(task, proposal, iteration=iteration)
             output = self.sandbox.run(
                 (sys.executable, "-I", str(script_path)), timeout_seconds=proposal.timeout_seconds,
                 env={"PYTHONIOENCODING": "utf-8", "M2HARNESS_NETWORK": "deny"},
@@ -83,7 +83,7 @@ class LocalPythonCodeHarness:
                 report=ReportPayload(title="Local Code Harness execution", summary="Execution evidence captured locally.", markdown="# Code Harness\n\nExecution evidence was captured locally.", claims=["Source was parsed and executed by the configured local sandbox."], limitations=issues),
                 execution_succeeded=succeeded, validations=validations, metrics={key: value for key, value in metrics.items() if isinstance(value, (str, int, float, bool))},
                 issues=tuple(issues), artifacts=[
-                    ProducedArtifact(logical_name=proposal.logical_name, kind=ArtifactKind.OUTPUT, media_type="text/x-python", text=proposal.source),
+                    ProducedArtifact(logical_name=proposal.logical_name, kind=ArtifactKind.OUTPUT, media_type="text/x-python", text=proposal.source, metadata={"workspace_script": str(script_path.relative_to(self.workspace_root).as_posix()), "task_id": task.task_id, "iteration": iteration}),
                     ProducedArtifact(logical_name=proposal.logical_name.removesuffix(".py") + ".execution.json", kind=ArtifactKind.LOG, media_type="application/json", text=log),
                 ],
             )
@@ -93,10 +93,14 @@ class LocalPythonCodeHarness:
                 execution_succeeded=False, validations={}, issues=(str(exc)[:2_000],), artifacts=[],
             )
 
-    def _write_script(self, proposal: CodeProposal) -> Path:
-        target = (self.workspace_root / proposal.logical_name).resolve()
+    def _write_script(self, task: SolveProblemTask, proposal: CodeProposal, *, iteration: int) -> Path:
+        # Separate task/iteration lanes prevent parallel root DAG nodes from
+        # overwriting one another while preserving the shared workspace for
+        # staged input data and generated output files.
+        target = (self.workspace_root / ".m2harness-code" / task.task_id / f"iteration-{iteration}" / proposal.logical_name).resolve()
         if self.workspace_root not in target.parents:
             raise ValueError("generated script escapes workspace")
+        target.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary = tempfile.mkstemp(prefix=".m2h-code-", suffix=".py", dir=target.parent)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import importlib.util
 import json
 import mimetypes
@@ -12,17 +14,22 @@ import sys
 import tempfile
 from urllib.parse import urlsplit
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from m2harness.artifacts import ArtifactStore
 from m2harness.executor import CommandActivityExecutor, SandboxedActivityExecutor
-from m2harness.models import ArtifactKind, HarnessSettings
+from m2harness.models import ArtifactKind, HarnessSettings, utc_now
 from m2harness.store import HarnessStore
 from m2harness.workflow import SingleQuestionWorkflow
 from m2harness.application.runtime_bundle import build_local_runtime, default_skill_root
 from m2harness.infrastructure.db.tool_runs import SQLiteToolAuditStore
 from m2harness.infrastructure.db.sqlite_artifacts import SQLiteArtifactRegistry
 from m2harness.domain.dag import canonical_single_question_dag
+from m2harness.domain.dag import canonical_main_harness_dag
+from m2harness.domain.media import MultimodalInput
+from m2harness.domain.solve_problem import SolveProblemContext
+from m2harness.domain.capability import CapabilityRequirement
+from m2harness.domain.tool import ToolCall
 
 MAX_INPUT_FILE_BYTES = 200 * 1024 * 1024
 
@@ -120,6 +127,11 @@ def build_parser() -> argparse.ArgumentParser:
     qwen.add_argument("--adapter", type=Path, default=Path("adapters/qwen38_max.py"))
     qwen.add_argument("--model", default=None)
     qwen.add_argument("--allow-remote-code-interpreter", action="store_true", help="preliminary provider-only run; remote execution can never satisfy the production evidence gate")
+    main_qwen = commands.add_parser("run-main-qwen", help="run the target Main Harness -> solve_problem -> paper path")
+    main_qwen.add_argument("input", type=Path, help="PDF/image/video input selected for the problem")
+    main_qwen.add_argument("--problem", default="Solve the attached single mathematical-modeling problem and produce an auditable report.")
+    main_qwen.add_argument("--model", default=None)
+    main_qwen.add_argument("--max-iterations", type=int, default=3)
     commands.add_parser("catalog")
     preflight = commands.add_parser("preflight")
     preflight.add_argument("--input", type=Path, default=None)
@@ -224,6 +236,68 @@ def main(argv: list[str] | None = None) -> int:
             )
         workflow = SingleQuestionWorkflow(settings, executor, artifact_registry=runtime.artifact_registry)
         _emit(workflow.run_until_terminal(args.question_id, args.worker_id))
+        return 0
+    if args.command == "run-main-qwen":
+        from adapters.qwen_solve_problem import QwenChatClient, QwenPaperComposer, build_qwen_solve_problem_service
+
+        data = _read_input_file(args.input)
+        if not os.environ.get("DASHSCOPE_API_KEY"):
+            raise RuntimeError("DASHSCOPE_API_KEY is required for run-main-qwen; inject it through the process environment or a secret provider")
+        if args.max_iterations < 1 or args.max_iterations > 20:
+            raise ValueError("--max-iterations must be between 1 and 20")
+        media_type = mimetypes.guess_type(args.input.name)[0] or "application/octet-stream"
+        if media_type == "application/pdf" and len(data) > 150 * 1024 * 1024:
+            raise ValueError("Qwen PDF input exceeds the 150MB provider limit")
+        multimodal = MultimodalInput(
+            logical_name=args.input.name, media_type=media_type,
+            data_base64=base64.b64encode(data).decode("ascii"),
+            sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
+        )
+        runtime = build_local_runtime(database_path=settings.database_path, artifact_root=settings.artifact_root, allow_host_sandbox=True)
+        if not runtime.sandbox.available:
+            raise RuntimeError("local_execution_disabled: run-main-qwen requires the trusted host or Docker/VM sandbox")
+        staged_name = Path(args.input.name).name
+        staged_path = runtime.tool_environment.resolve_workspace(Path("inputs") / staged_name)
+        staged_path.parent.mkdir(parents=True, exist_ok=True)
+        staged_path.write_bytes(data)
+        client = QwenChatClient(model=args.model or os.environ.get("QWEN_MODEL", "qwen3.8-max"))
+        service = build_qwen_solve_problem_service(
+            sandbox=runtime.sandbox, workspace_root=runtime.tool_environment.workspace_root,
+            research_agent=runtime.research_service, client=client, max_iterations=args.max_iterations,
+        )
+        runtime = runtime.attach_solve_problem_service(service)
+        state = runtime.main_harness.start(args.problem, canonical_main_harness_dag())
+        state = runtime.main_harness.dispatch(
+            state, "q1",
+            context=SolveProblemContext(
+                multimodal_inputs=(multimodal,),
+                metadata={"staged_input_relative_path": str(Path("inputs") / staged_name)},
+            ),
+            max_iterations=args.max_iterations,
+        )
+        if not state.reports or state.reports[-1].status.value != "completed":
+            _emit(state)
+            return 1
+        state = runtime.main_harness.generate_paper(state, QwenPaperComposer(client))
+        if state.final_report is None or state.final_latex_paper is None:
+            raise RuntimeError("Main Harness paper composer returned no final publication")
+        render_definition = runtime.tools.get("report_render")
+        if render_definition is None:
+            raise RuntimeError("report_render tool is not registered")
+        render_resolution = runtime.capabilities.resolve([
+            CapabilityRequirement(capability=render_definition.required_capability, reason="Main Harness final publication"),
+        ])
+        render_call = ToolCall(
+            call_id=uuid4(), tool_name=render_definition.name, tool_version=render_definition.version,
+            activity_id=uuid4(), session_id=state.run_id,
+            idempotency_key=f"main-harness:{state.run_id}:publish-paper",
+            arguments={"markdown": state.final_report.markdown, "title": state.final_report.title, "path": "reports/final-question-report.md", "latex": state.final_latex_paper.text, "latex_path": "reports/final-question-paper.tex", "overwrite": True},
+            requested_at=utc_now(),
+        )
+        rendered = runtime.tool_runtime.execute(render_call, render_resolution)
+        if not rendered.ok:
+            raise RuntimeError(f"final report rendering failed: {rendered.error_message}")
+        _emit({"state": state, "published_files": rendered.output})
         return 0
     if args.command == "catalog":
         runtime = build_local_runtime(database_path=settings.database_path, artifact_root=settings.artifact_root)

@@ -148,9 +148,24 @@ class SolveProblemService:
                     research_report=current_context.research_report,
                     error="Model Agent returned no preliminary modeling report",
                 )
+            branch_ids = [item.branch_id for item in preliminary]
+            if len(branch_ids) != len(set(branch_ids)) or len(preliminary) > branch_count:
+                return SolveProblemReport(
+                    task_id=task.task_id, status=SolveProblemStatus.FAILED,
+                    iteration_count=iteration_number - 1, iterations=tuple(iterations),
+                    research_report=current_context.research_report,
+                    error="Model Agent returned duplicate or excess preliminary branch ids",
+                )
             modeling = self.model_agent.synthesize(
                 task, current_context, preliminary, iteration=iteration_number,
             )
+            if not set(modeling.selected_branch_ids).issubset(set(branch_ids)):
+                return SolveProblemReport(
+                    task_id=task.task_id, status=SolveProblemStatus.FAILED,
+                    iteration_count=iteration_number - 1, iterations=tuple(iterations),
+                    research_report=current_context.research_report,
+                    error="Unified Modeling Report selected an unknown preliminary branch",
+                )
             coding = self.code_harness.execute(
                 task, current_context, modeling, iteration=iteration_number,
             )
@@ -163,6 +178,11 @@ class SolveProblemService:
             )
             iterations.append(snapshot)
             if review.decision == ModelReviewDecision.APPROVE:
+                if not coding.execution_succeeded:
+                    revision_instructions = (
+                        "Code Harness execution must succeed and provide validation evidence before approval.",
+                    )
+                    continue
                 final_report = self.model_agent.compose_final_report(
                     task, current_context, modeling, coding, review,
                     iteration=iteration_number,

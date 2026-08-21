@@ -6,7 +6,7 @@ from .skill import SkillDefinition, SkillManifest, SkillSummary
 from .tool import ToolCall, ToolDefinition, ToolResult
 from .workflow import ActivitySpec, WorkflowDecision, WorkflowState
 from .agent import AgentSession, ContextItem, ContextSnapshot, ModelCapabilities, ModelRequest, ModelResponse
-from .media import MediaObservation, Modality
+from .media import MediaObservation, Modality, MultimodalInput
 from .dag import DAGTaskKind, DAGTaskNode, DAGTaskTable, canonical_main_harness_dag, canonical_single_question_dag
 from .solve_problem import (
     CodingHarnessReport,
@@ -49,6 +49,7 @@ __all__ = [
     "ModelResponse",
     "MediaObservation",
     "Modality",
+    "MultimodalInput",
     "DAGTaskKind",
     "DAGTaskNode",
     "DAGTaskTable",

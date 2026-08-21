@@ -16,7 +16,7 @@ from m2harness.infrastructure.db.sqlite_artifacts import SQLiteArtifactRegistry
 from m2harness.infrastructure.db.main_harness import SQLiteMainHarnessRepository
 from m2harness.workflows.single_question_v1 import SingleQuestionWorkflowV1
 from m2harness.application.runtime_bundle import RuntimeBundle, build_local_runtime, default_skill_root
-from m2harness.application.main_harness import MainHarness, MainHarnessRepository, MainHarnessState, MainHarnessTask, MainTaskStatus
+from m2harness.application.main_harness import MainHarness, MainHarnessRepository, MainHarnessState, MainHarnessTask, MainTaskStatus, PaperComposerPort
 from m2harness.application.solve_problem import CommandSolveProblemRunner, SolveProblemService, UnconfiguredSolveProblemService
 from m2harness.application.knowledge import EmptyKnowledgeBase, HMMLKnowledgeBase, KnowledgeBasePort
 from m2harness.application.research import DeepResearchService, ResearchAgentPort
@@ -37,6 +37,7 @@ from m2harness.domain.solve_problem import (
 from m2harness.domain.knowledge import KnowledgeEntry, KnowledgeHit, KnowledgeQuery, KnowledgeSearchResult, KnowledgeSourceKind
 from m2harness.domain.research import ResearchFinding, ResearchReport, ResearchSource, ResearchSourceKind
 from m2harness.domain.code import CodeProposal
+from m2harness.domain.media import MultimodalInput
 from m2harness.infrastructure.code_harness import CodeProposalProvider, LocalPythonCodeHarness
 
 __all__ = [
@@ -76,6 +77,7 @@ __all__ = [
     "MainHarnessState",
     "MainHarnessTask",
     "MainTaskStatus",
+    "PaperComposerPort",
     "SolveProblemService",
     "CommandSolveProblemRunner",
     "UnconfiguredSolveProblemService",
@@ -105,6 +107,7 @@ __all__ = [
     "ResearchSource",
     "ResearchSourceKind",
     "CodeProposal",
+    "MultimodalInput",
     "CodeProposalProvider",
     "LocalPythonCodeHarness",
 ]
