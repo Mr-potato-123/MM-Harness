@@ -21,6 +21,8 @@ The repository is currently in a controlled rebuild. The original durable stage 
 - Provider-boundary `compact` middleware preserves system/recent turns and replaces older history with an auditable continuation snapshot containing objectives, decisions, evidence, open issues, file paths, and next actions.
 - Bounded `solve_problem` loop: optional preliminary multi-route modeling → Model Agent synthesis → Code Harness realization → Model Agent approve/revise, with strict report contracts.
 - Review selects the narrowest `revision_target`: code-only revisions reuse the accepted Modeling Report; model/full revisions repeat exploration and synthesis.
+- The distilled local Skill library now contains 43 packages (42 model-invocable). Model, Code, Review, and Paper Agents receive the same complete Skill-body catalog; role-specific names are FOCUS markers that add selected references rather than hiding the rest of the catalog.
+- Provider-backed roles share one detailed system-prompt contract for Harness authority, evidence precedence, progressive file disclosure, prompt-injection resistance, typed outputs, uncertainty, and reproducibility. Role prompts refine that common contract instead of redefining policy independently.
 - Strict `SolveProblemTask`, `ModelingReport`, `CodingReport`, `Review`, and final problem report protocols; the default runtime fails closed when real Model Agent/Code Harness ports are not configured.
 - Model Agent context can run a local-first DeepResearch pass before preliminary modeling. The read-only `knowledge_search` Tool returns source-linked HMML findings and gaps; it never grants Harness instructions.
 - SQLite transactions in WAL mode, process-safe leases, bounded attempts, and deterministic activity idempotency keys.

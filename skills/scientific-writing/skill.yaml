@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: scientific-writing
+version: 1.0.0
+description: Write a coherent mathematical-modeling report whose structure, equations, tables, figures, and conclusions preserve reviewed evidence.
+entrypoint: SKILL.md
+contextTokens: 1500
+requiresCapabilities: artifact.read, report.finalize
+

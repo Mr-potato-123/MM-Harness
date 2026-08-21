@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: time-series-modeling
+version: 1.0.0
+description: Model and forecast ordered data while preserving temporal causality, seasonality, uncertainty, and honest backtesting.
+entrypoint: SKILL.md
+contextTokens: 1500
+requiresCapabilities: python.execute, validation.numerical, artifact.write
+

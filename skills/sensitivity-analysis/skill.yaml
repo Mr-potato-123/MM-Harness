@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: sensitivity-analysis
+version: 1.0.0
+description: Test how outputs and decisions change under defensible parameter, data, scenario, and structural perturbations.
+entrypoint: SKILL.md
+contextTokens: 1300
+requiresCapabilities: python.execute, validation.numerical, artifact.write
+

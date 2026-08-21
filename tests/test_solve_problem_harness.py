@@ -98,9 +98,11 @@ class FakeCodeProposalProvider:
 class FakeQwenClient:
     def __init__(self) -> None:
         self.calls = []
+        self.systems = []
 
     def json(self, *, system, content, schema):
         self.calls.append(content)
+        self.systems.append(system)
         properties = schema.get("properties", {})
         if "branch_id" in properties:
             return {"branch_id": "route-1", "report": _report("route").model_dump(mode="json"), "candidate_scheme": "scheme", "expected_outputs": ["result"]}
@@ -391,6 +393,13 @@ class SolveProblemHarnessTest(unittest.TestCase):
             proposal = QwenCodeProposalProvider(client, skills=bundle.skills).propose(task, context, modeling, iteration=1)
             first_prompt = json.loads(client.calls[0][-1]["text"])
             self.assertIn("Skill: problem-intake", first_prompt["skill_context"])
+            self.assertIn("Skill: coding-contract", first_prompt["skill_context"])
+            code_prompt = json.loads(client.calls[4][-1]["text"])
+            self.assertIn("Skill: modeling-core", code_prompt["skill_context"])
+            self.assertNotIn("## Explicit omissions", code_prompt["skill_context"])
+            self.assertIn("The Main Harness owns", client.systems[0])
+            self.assertIn("independent Review Agent", client.systems[2])
+            self.assertIn("Code Agent", client.systems[4])
             self.assertEqual(final.title, "final")
             self.assertEqual(proposal.logical_name, "generated_solution.py")
             self.assertGreaterEqual(len(client.calls), 5)

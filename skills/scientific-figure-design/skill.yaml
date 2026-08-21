@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: scientific-figure-design
+version: 1.0.0
+description: Plan and verify publication-quality scientific figures whose visual encodings, source data, captions, and exports remain auditable.
+entrypoint: SKILL.md
+contextTokens: 1400
+requiresCapabilities: python.execute, artifact.read, artifact.write
+

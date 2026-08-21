@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: simulation-modeling
+version: 1.0.0
+description: Design reproducible Monte Carlo, discrete-event, or dynamical simulations with verified mechanics and quantified stochastic error.
+entrypoint: SKILL.md
+contextTokens: 1500
+requiresCapabilities: python.execute, validation.numerical, artifact.write
+

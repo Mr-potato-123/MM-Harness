@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: research-planning
+version: 1.0.0
+description: Plan adaptive, multi-angle evidence retrieval for a modeling problem and stop when decision-relevant gaps are bounded.
+entrypoint: SKILL.md
+contextTokens: 1200
+requiresCapabilities: knowledge.search
+

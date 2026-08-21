@@ -19,6 +19,7 @@ from typing import Any
 import httpx
 from pydantic import TypeAdapter, ValidationError
 
+from m2harness.application.agent_prompts import AgentRole, build_agent_system_prompt
 from m2harness.models import (
     ActivityRequest,
     ActivityResponse,
@@ -44,21 +45,22 @@ STAGE_SKILLS = {
     # Skill never requires editing the workflow state machine; only the stage
     # profile changes, and the snapshot is recorded with the response.
     StageKind.MODELING: (
-        "problem-intake", "problem-decomposition", "modeling-core",
+        "problem-intake", "modeling-project-orchestration", "problem-decomposition", "research-planning", "modeling-core",
         "pdf-inspection", "tabular-analysis", "model-selection",
-        "deep-research", "modeling-knowledge",
+        "deep-research", "modeling-knowledge", "dimensional-analysis",
+        "uncertainty-quantification", "sensitivity-analysis",
     ),
     StageKind.CODING: (
-        "coding-contract", "data-analysis", "sandbox-execution",
-        "numerical-validation", "visualization",
+        "coding-contract", "code-debugging", "data-analysis", "sandbox-execution",
+        "numerical-validation", "visualization", "scientific-figure-design",
     ),
     StageKind.REVIEW: (
-        "claim-evidence", "numerical-validation", "report-review",
-        "coding-contract",
+        "claim-evidence", "numerical-validation", "model-diagnostics",
+        "report-review", "coding-contract",
     ),
     StageKind.FINALIZE: (
-        "claim-evidence", "report-review", "report-rendering",
-        "latex-publication", "visualization",
+        "claim-evidence", "report-review", "scientific-writing", "report-rendering",
+        "latex-publication", "visualization", "scientific-figure-design", "publication-verification",
     ),
 }
 
@@ -180,7 +182,7 @@ def _prompt(request: ActivityRequest) -> str:
         f"{MAINLINE_DAG_CONTRACT}\n"
         f"{role}\nQuestion: {request.question.title}\nRevision: {request.revision}\n"
         f"Harness instructions: {json.dumps(request.instructions, ensure_ascii=False)}\n"
-        f"Local Skill snapshot (read-only, stage-scoped):\n{skills}\n"
+        f"Local Skill snapshot (read-only, complete catalog with stage focus markers):\n{skills}\n"
         "Return ONLY one JSON object matching this JSON Schema. Do not use Markdown fences around the JSON. "
         "The stage field must match exactly. The report.markdown field may contain Markdown. "
         "Every report.claims item must be traceable to an input, modeling report, execution artifact, or review decision. "
@@ -199,7 +201,9 @@ def _skill_context(stage: StageKind) -> str:
         return "Local Skill root unavailable; do not infer missing Skill content."
     sections: list[str] = []
     total_budget = 0
-    for name in STAGE_SKILLS.get(stage, ()):
+    focus_names = STAGE_SKILLS.get(stage, ())
+    discovered = _model_invocable_skill_names(root)
+    for name in dict.fromkeys((*focus_names, *discovered)):
         path = (root / name / "SKILL.md").resolve()
         if root not in path.parents or path.is_symlink() or not path.is_file():
             sections.append(f"[{name}] unavailable")
@@ -209,8 +213,9 @@ def _skill_context(stage: StageKind) -> str:
             continue
         raw = path.read_bytes()
         digest = _skill_snapshot_digest(path.parent)
-        content = raw[:8_000].decode("utf-8", errors="replace")
-        section = f"[{name}; sha256={digest}]\n{content}"
+        content = raw[:16_000].decode("utf-8", errors="replace")
+        focus_marker = "FOCUS" if name in focus_names else "AVAILABLE"
+        section = f"[{name}; {focus_marker}; sha256={digest}]\n{content}"
         # Progressive disclosure: expose explicitly declared local resources
         # alongside the entrypoint, but keep a hard prompt budget.  This makes
         # the DeerFlow/DSH-style references actionable without recursively
@@ -219,7 +224,7 @@ def _skill_context(stage: StageKind) -> str:
         if manifest.is_file() and not manifest.is_symlink():
             declared = manifest.read_text(encoding="utf-8", errors="replace")
             match = re.search(r"^resources:\s*(.+)$", declared, flags=re.MULTILINE)
-            if match:
+            if match and name in focus_names:
                 resource_names = [item.strip().strip("'\"") for item in match.group(1).split(",") if item.strip()]
                 for resource_name in resource_names[:4]:
                     resource = (path.parent / resource_name).resolve()
@@ -227,8 +232,8 @@ def _skill_context(stage: StageKind) -> str:
                         resource_text = resource.read_text(encoding="utf-8", errors="replace")[:3_000]
                         section += f"\n[resource: {resource_name}]\n{resource_text}"
         total_budget += len(section.encode("utf-8"))
-        if total_budget > 96_000:
-            sections.append(f"[{name}; sha256={digest}] entrypoint omitted after the 96KB stage Skill budget")
+        if total_budget > 384_000:
+            sections.append(f"[{name}; sha256={digest}] entrypoint omitted after the 384KB all-role Skill budget")
             break
         sections.append(section)
     return "\n\n".join(sections) or "No stage Skill selected."
@@ -240,11 +245,31 @@ def _skill_snapshot_metadata(stage: StageKind) -> list[dict[str, str]]:
         return []
     root = Path(root_value).resolve()
     result: list[dict[str, str]] = []
-    for name in STAGE_SKILLS.get(stage, ()):
+    focus_names = STAGE_SKILLS.get(stage, ())
+    discovered = _model_invocable_skill_names(root)
+    for name in dict.fromkeys((*focus_names, *discovered)):
         path = (root / name / "SKILL.md").resolve()
         if root in path.parents and path.is_file() and not path.is_symlink():
-            result.append({"name": name, "sha256": _skill_snapshot_digest(path.parent)})
+            result.append({"name": name, "sha256": _skill_snapshot_digest(path.parent), "focus": str(name in focus_names).lower()})
     return result
+
+
+def _model_invocable_skill_names(root: Path) -> tuple[str, ...]:
+    """Discover full local catalog while respecting explicit invocation policy."""
+
+    names: list[str] = []
+    for path in root.rglob("SKILL.md"):
+        if not path.is_file() or path.is_symlink() or root not in path.resolve().parents:
+            continue
+        manifest = path.parent / "skill.yaml"
+        declared = manifest.read_text(encoding="utf-8", errors="strict") if manifest.is_file() and not manifest.is_symlink() else ""
+        if re.search(r"^modelInvocable:\s*(?:false|0)\s*$", declared, flags=re.MULTILINE | re.IGNORECASE):
+            continue
+        front = path.read_text(encoding="utf-8", errors="strict")[:4_096]
+        if re.search(r"^disable-model-invocation:\s*true\s*$", front, flags=re.MULTILINE | re.IGNORECASE):
+            continue
+        names.append(path.parent.name)
+    return tuple(sorted(set(names)))
 
 
 def _skill_snapshot_digest(skill_dir: Path) -> str:
@@ -346,6 +371,19 @@ def _extract_json(text: str) -> dict[str, Any]:
     return value
 
 
+def _system_prompt(stage: StageKind) -> str:
+    role = {
+        StageKind.MODELING: AgentRole.MODEL,
+        StageKind.CODING: AgentRole.CODE,
+        StageKind.REVIEW: AgentRole.REVIEW,
+        StageKind.FINALIZE: AgentRole.PAPER,
+    }[stage]
+    return build_agent_system_prompt(
+        role,
+        output_contract=f"Return one JSON object matching the {OUTPUT_TYPES[stage].__name__} schema for stage={stage.value}.",
+    )
+
+
 def main() -> int:
     request = ActivityRequest.model_validate_json(sys.stdin.buffer.read())
     key = os.environ.get("DASHSCOPE_API_KEY")
@@ -367,7 +405,10 @@ def main() -> int:
     prompt = _prompt(request)
     payload: dict[str, Any] = {
         "model": model,
-        "messages": [{"role": "user", "content": _multimodal_content(request, root, prompt)}],
+        "messages": [
+            {"role": "system", "content": _system_prompt(request.stage)},
+            {"role": "user", "content": _multimodal_content(request, root, prompt)},
+        ],
         "stream": True,
         "stream_options": {"include_usage": True},
         "enable_thinking": True,

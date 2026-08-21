@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: multi-criteria-decision
+version: 1.0.0
+description: Structure multi-criteria decisions with transparent scales, weights, uncertainty, dominance, and rank-robustness checks.
+entrypoint: SKILL.md
+contextTokens: 1300
+requiresCapabilities: python.execute, validation.numerical, artifact.write
+

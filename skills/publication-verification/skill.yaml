@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: publication-verification
+version: 1.0.0
+description: Gate a final modeling paper by checking structure, claim parity, figures, references, compilation, visual layout, reproducibility, and submission completeness.
+entrypoint: SKILL.md
+contextTokens: 1500
+requiresCapabilities: artifact.read, report.review, report.publish
+

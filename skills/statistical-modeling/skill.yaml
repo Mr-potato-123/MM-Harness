@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: statistical-modeling
+version: 1.0.0
+description: Build interpretable statistical models with explicit estimands, data-generating assumptions, diagnostics, uncertainty, and out-of-sample checks.
+entrypoint: SKILL.md
+contextTokens: 1500
+requiresCapabilities: python.execute, validation.numerical, artifact.write
+

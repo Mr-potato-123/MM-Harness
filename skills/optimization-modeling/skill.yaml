@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: optimization-modeling
+version: 1.0.0
+description: Formulate and verify linear, integer, nonlinear, or multi-objective optimization models with explicit feasibility and optimality evidence.
+entrypoint: SKILL.md
+contextTokens: 1500
+requiresCapabilities: python.execute, validation.numerical, artifact.write
+

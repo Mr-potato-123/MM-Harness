@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: machine-learning-modeling
+version: 1.0.0
+description: Build predictive models with leakage-safe evaluation, appropriate baselines, calibration, robustness, and reproducible model selection.
+entrypoint: SKILL.md
+contextTokens: 1500
+requiresCapabilities: python.execute, validation.numerical, artifact.write
+

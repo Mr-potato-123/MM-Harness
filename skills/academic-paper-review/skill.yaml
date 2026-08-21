@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: academic-paper-review
+version: 1.0.0
+description: Review one technical paper for claim support, methodological validity, reproducibility, significance, and actionable defects.
+entrypoint: SKILL.md
+contextTokens: 1400
+requiresCapabilities: artifact.read, report.review
+

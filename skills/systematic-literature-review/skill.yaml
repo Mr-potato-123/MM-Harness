@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: systematic-literature-review
+version: 1.0.0
+description: Conduct a bounded, reproducible multi-paper review with explicit inclusion criteria, extraction fields, synthesis, and citation provenance.
+entrypoint: SKILL.md
+contextTokens: 1500
+requiresCapabilities: knowledge.search, artifact.read
+

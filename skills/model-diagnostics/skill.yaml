@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: model-diagnostics
+version: 1.0.0
+description: Diagnose model failure through invariants, residuals, calibration, convergence, stability, and comparison with simple baselines.
+entrypoint: SKILL.md
+contextTokens: 1300
+requiresCapabilities: validation.numerical, artifact.read, report.review
+

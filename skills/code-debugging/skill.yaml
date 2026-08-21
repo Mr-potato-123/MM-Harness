@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: code-debugging
+version: 1.0.0
+description: Debug generated modeling code from reproducible failures while preserving the accepted model and evidence contract.
+entrypoint: SKILL.md
+contextTokens: 1300
+requiresCapabilities: python.execute, artifact.read, artifact.write
+

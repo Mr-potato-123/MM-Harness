@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: geospatial-modeling
+version: 1.0.0
+description: Analyze spatial data with explicit coordinate systems, scale, topology, spatial dependence, and map evidence controls.
+entrypoint: SKILL.md
+contextTokens: 1300
+requiresCapabilities: python.execute, artifact.read, artifact.write
+

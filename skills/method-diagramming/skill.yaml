@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: method-diagramming
+version: 1.0.0
+description: Design non-data diagrams for modeling pipelines, variable relationships, algorithm decisions, and cross-question dependencies without fabricating results.
+entrypoint: SKILL.md
+contextTokens: 1200
+requiresCapabilities: artifact.read, artifact.write
+

@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: dimensional-analysis
+version: 1.0.0
+description: Enforce unit consistency, scaling, nondimensionalization, and physically meaningful bounds throughout a model and its code.
+entrypoint: SKILL.md
+contextTokens: 1100
+requiresCapabilities: validation.numerical
+

@@ -29,7 +29,7 @@ from m2harness.infrastructure.local_sandbox import LocalSandboxClient
 from m2harness.ports.sandbox import SandboxSpec
 from m2harness.runtime.skill_loader import SkillLoader
 from m2harness.workflows.single_question_v1 import SingleQuestionWorkflowV1
-from adapters.qwen38_max import _authorize_provider_url, _multimodal_content, _prompt, _skill_context
+from adapters.qwen38_max import _authorize_provider_url, _multimodal_content, _prompt, _skill_context, _system_prompt
 from m2harness.models import ActivityRequest, ArtifactKind, ArtifactRecord, ProjectRecord, QuestionRecord, QuestionState, StageKind
 
 
@@ -294,13 +294,25 @@ class RuntimeV2Test(unittest.TestCase):
         with self.assertRaises(PermissionError):
             _authorize_provider_url("https://evil.example/compatible-mode/v1")
 
-    def test_qwen_prompt_receives_stage_scoped_skill_snapshot(self) -> None:
+    def test_qwen_prompt_receives_complete_skill_snapshot_with_stage_focus(self) -> None:
         from unittest.mock import patch
         with patch.dict(os.environ, {"M2HARNESS_SKILL_ROOT": str(Path("skills").resolve())}, clear=False):
-            context = _skill_context(StageKind.MODELING)
-        self.assertIn("modeling-core", context)
-        self.assertIn("model-contract.md", context)
-        self.assertIn("sha256=", context)
+            modeling = _skill_context(StageKind.MODELING)
+            coding = _skill_context(StageKind.CODING)
+        self.assertIn("[modeling-core; FOCUS", modeling)
+        self.assertIn("[coding-contract; AVAILABLE", modeling)
+        self.assertIn("[coding-contract; FOCUS", coding)
+        self.assertIn("[modeling-core; AVAILABLE", coding)
+        self.assertIn("model-contract.md", modeling)
+        self.assertNotIn("[skill-review;", modeling)
+        self.assertIn("sha256=", coding)
+
+    def test_legacy_qwen_roles_share_one_harness_authority_contract(self) -> None:
+        for stage in StageKind:
+            system = _system_prompt(stage)
+            self.assertIn("The Main Harness owns", system)
+            self.assertIn("A listed read-only path is a manifest entry", system)
+            self.assertIn("Skills improve method selection", system)
 
     def test_qwen_prompt_carries_harness_owned_dag_and_paper_terminal(self) -> None:
         project = ProjectRecord(id=uuid4(), name="prompt", created_at=datetime.now(UTC), updated_at=datetime.now(UTC), version=1)
@@ -315,10 +327,15 @@ class RuntimeV2Test(unittest.TestCase):
         state, activities = bundle.workflows.start(uuid4(), {"problem": "runtime composition"})
         self.assertEqual(len(activities), 1)
         self.assertEqual(activities[0].activity_type, "media.inventory")
-        # Two reference-derived local skills cover the new DeepResearch and
-        # HMML knowledge phases inside Model Agent; the legacy catalog remains
-        # unchanged and therefore now totals nineteen bundles.
-        self.assertEqual(len(bundle.skills.list()), 19)
+        # The local catalog is a distilled cross-role modeling library rather
+        # than a direct mount of third-party Skill packages.
+        names = {item.name for item in bundle.skills.list()}
+        self.assertEqual(len(names), 43)
+        self.assertTrue({
+            "modeling-project-orchestration", "statistical-modeling",
+            "optimization-modeling", "publication-verification",
+            "scientific-figure-design", "systematic-literature-review",
+        }.issubset(names))
         with self.assertRaises(PermissionError):
             bundle.network.authorize_model("https://dashscope.aliyuncs.com/compatible-mode/v1")
 

@@ -17,4 +17,9 @@ Before proposing equations:
 6. Produce machine-readable validation contracts with stable IDs.
 7. List expected tables, figures, intermediate files, and downstream outputs.
 
+Every calibrated constant, threshold, weight, or bound needs a provenance class:
+observed data, literature/source, physical or policy constraint, or an explicit
+scenario assumption. Physical and geometric decision variables need feasible
+bounds even when the unconstrained mathematical optimum looks better.
+
 Every important claim must name the input or future execution evidence required to support it. If evidence is not available, write `unverified` rather than filling the gap with plausible prose.

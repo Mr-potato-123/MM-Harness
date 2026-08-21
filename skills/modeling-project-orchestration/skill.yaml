@@ -1,0 +1,7 @@
+apiVersion: m2harness/v1
+name: modeling-project-orchestration
+version: 1.0.0
+description: Coordinate a multi-question modeling project through explicit stage interfaces, durable artifacts, acceptance gates, and dependency-aware progress.
+entrypoint: SKILL.md
+contextTokens: 1400
+

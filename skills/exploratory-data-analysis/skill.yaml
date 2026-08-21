@@ -1,0 +1,8 @@
+apiVersion: m2harness/v1
+name: exploratory-data-analysis
+version: 1.0.0
+description: Explore registered data to expose structure, quality problems, plausible relationships, and modeling risks without converting exploration into conclusions.
+entrypoint: SKILL.md
+contextTokens: 1400
+requiresCapabilities: data.profile, python.execute, artifact.read, artifact.write
+

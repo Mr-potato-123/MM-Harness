@@ -1,0 +1,7 @@
+apiVersion: m2harness/v1
+name: environment-preflight
+version: 1.0.0
+description: Inspect the local modeling runtime for required interpreters, libraries, compilers, renderers, and output paths without silently installing software.
+entrypoint: SKILL.md
+contextTokens: 1200
+
