@@ -325,7 +325,12 @@ def main(argv: list[str] | None = None) -> int:
             max_iterations=args.max_iterations,
         )
         if state.final_report is None or state.final_latex_paper is None:
-            raise RuntimeError("Main Harness paper composer returned no final publication")
+            run_report_root = runtime.tool_environment.workspace_root / "reports" / "runs" / str(state.run_id)
+            raise RuntimeError(
+                "Main Harness paper composer returned no final publication; "
+                f"run_id={state.run_id}; probe={run_report_root / 'probe.md'}; "
+                f"probe_ndjson={run_report_root / 'probe.ndjson'}; exchanges={run_report_root / 'tasks'}"
+            )
         render_definition = runtime.tools.get("report_render")
         if render_definition is None:
             raise RuntimeError("report_render tool is not registered")
@@ -461,7 +466,12 @@ def main(argv: list[str] | None = None) -> int:
             max_iterations=args.max_iterations,
         )
         if state.final_report is None or state.final_latex_paper is None:
-            raise RuntimeError("Main Harness paper composer returned no final publication")
+            run_report_root = runtime.tool_environment.workspace_root / "reports" / "runs" / str(state.run_id)
+            raise RuntimeError(
+                "Main Harness paper composer returned no final publication; "
+                f"run_id={state.run_id}; probe={run_report_root / 'probe.md'}; "
+                f"probe_ndjson={run_report_root / 'probe.ndjson'}; exchanges={run_report_root / 'tasks'}"
+            )
         render_definition = runtime.tools.get("report_render")
         if render_definition is None:
             raise RuntimeError("report_render tool is not registered")
