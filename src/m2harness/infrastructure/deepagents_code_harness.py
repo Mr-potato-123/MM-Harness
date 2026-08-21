@@ -80,8 +80,8 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         self._checkpointer: Any | None = None
 
     def propose(self, task: SolveProblemTask, context: SolveProblemContext, modeling: UnifiedModelingReport, *, iteration: int) -> CodeProposal:
-        target_relative = self._target_path(task, iteration)
-        prompt_path = self.workspace_root / ".m2harness-code" / task.task_id / f"iteration-{iteration}" / "deepagents-prompt.md"
+        target_relative = self._target_path(task, context, iteration)
+        prompt_path = self.workspace_root / Path(target_relative).parent / "deepagents-prompt.md"
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
         prompt = self._build_prompt(task, context, modeling, iteration=iteration, target_relative=target_relative)
         prompt_path.write_text(prompt, encoding="utf-8")
@@ -409,7 +409,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         return python_execute
 
     def _run_agent(self, task: SolveProblemTask, context: SolveProblemContext, modeling: UnifiedModelingReport, *, iteration: int, prompt: str, event_path: Path) -> dict[str, Any]:
-        target_relative = self._target_path(task, iteration)
+        target_relative = self._target_path(task, context, iteration)
         agent = self._ensure_agent(context, target_relative)
         config = {
             "configurable": {"thread_id": self._session_id(task, context)},
@@ -572,10 +572,13 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             raise DeepAgentsUnavailable("DeepAgents source_path escapes workspace")
         return target
 
-    @staticmethod
-    def _target_path(task: SolveProblemTask, iteration: int) -> str:
+    def _target_path(self, task: SolveProblemTask, context: SolveProblemContext, iteration: int) -> str:
         logical = "solve_" + re.sub(r"[^A-Za-z0-9_-]+", "_", task.task_id) + ".py"
-        return str(Path(".m2harness-code") / task.task_id / f"iteration-{iteration}" / logical).replace("\\", "/")
+        run_id = "unscoped"
+        if isinstance(context.metadata, dict):
+            run_id = str(context.metadata.get("run_id", run_id))
+        safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
+        return str(Path(".m2harness-code") / "runs" / safe_run_id / task.task_id / f"iteration-{iteration}" / logical).replace("\\", "/")
 
     @staticmethod
     def _session_id(task: SolveProblemTask, context: SolveProblemContext | None = None) -> str:
