@@ -303,9 +303,15 @@ class SolveProblemService:
                     "branch_count": branch_count,
                     "revision_target": revision_target.value,
                 })
-                preliminary = tuple(self.model_agent.explore(
-                    task, current_context, branch_count=branch_count, iteration=iteration_number,
-                ))
+                try:
+                    preliminary = tuple(self.model_agent.explore(
+                        task, current_context, branch_count=branch_count, iteration=iteration_number,
+                    ))
+                except Exception as exc:
+                    self._probe(current_context, task, iteration_number, "model_explore_failed", "Model Agent", "failed", {
+                        "error": str(exc)[:2_000],
+                    })
+                    raise
                 self._probe(current_context, task, iteration_number, "model_explore_complete", "Model Agent", "completed", {
                     "branch_ids": [item.branch_id for item in preliminary],
                     "requested_file_paths": [path for item in preliminary for path in item.requested_file_paths],
@@ -357,9 +363,15 @@ class SolveProblemService:
                         current_context = current_context.model_copy(update={
                             "disclosed_text_files": (*current_context.disclosed_text_files, *disclosed),
                         })
-                        preliminary = tuple(self.model_agent.explore(
-                            task, current_context, branch_count=branch_count, iteration=iteration_number,
-                        ))
+                        try:
+                            preliminary = tuple(self.model_agent.explore(
+                                task, current_context, branch_count=branch_count, iteration=iteration_number,
+                            ))
+                        except Exception as exc:
+                            self._probe(current_context, task, iteration_number, "model_explore_failed", "Model Agent", "failed", {
+                                "error": str(exc)[:2_000], "after_disclosure": True,
+                            })
+                            raise
                         for preliminary_report in preliminary:
                             current_context = self._archive(
                                 current_context, task, iteration_number, "modeling",
@@ -387,9 +399,15 @@ class SolveProblemService:
                 )
             if modeling is None or revision_target in {RevisionTarget.MODEL, RevisionTarget.FULL}:
                 self._probe(current_context, task, iteration_number, "model_synthesize_start", "Model Agent", "started", {})
-                modeling = self.model_agent.synthesize(
-                    task, current_context, preliminary, iteration=iteration_number,
-                )
+                try:
+                    modeling = self.model_agent.synthesize(
+                        task, current_context, preliminary, iteration=iteration_number,
+                    )
+                except Exception as exc:
+                    self._probe(current_context, task, iteration_number, "model_synthesize_failed", "Model Agent", "failed", {
+                        "error": str(exc)[:2_000],
+                    })
+                    raise
                 self._probe(current_context, task, iteration_number, "model_synthesize_complete", "Model Agent", "completed", {
                     "selected_branch_ids": list(modeling.selected_branch_ids),
                     "required_validations": list(modeling.required_validations),
@@ -482,9 +500,15 @@ class SolveProblemService:
                 "generated_files": [item.relative_path for item in coding.generated_files],
             })
             self._probe(current_context, task, iteration_number, "review_start", "Review Agent", "started", {})
-            review = self.model_agent.review(
-                task, current_context, modeling, coding, iteration=iteration_number,
-            )
+            try:
+                review = self.model_agent.review(
+                    task, current_context, modeling, coding, iteration=iteration_number,
+                )
+            except Exception as exc:
+                self._probe(current_context, task, iteration_number, "review_failed", "Review Agent", "failed", {
+                    "error": str(exc)[:2_000],
+                })
+                raise
             self._probe(current_context, task, iteration_number, "review_complete", "Review Agent", "completed", {
                 "decision": review.decision.value,
                 "revision_target": review.revision_target.value,
@@ -527,10 +551,16 @@ class SolveProblemService:
                         "Code Harness execution must succeed and provide validation evidence before approval.",
                     )
                     continue
-                final_report = self.model_agent.compose_final_report(
-                    task, current_context, modeling, coding, review,
-                    iteration=iteration_number,
-                )
+                try:
+                    final_report = self.model_agent.compose_final_report(
+                        task, current_context, modeling, coding, review,
+                        iteration=iteration_number,
+                    )
+                except Exception as exc:
+                    self._probe(current_context, task, iteration_number, "final_report_failed", "Model Agent", "failed", {
+                        "error": str(exc)[:2_000],
+                    })
+                    raise
                 self._probe(current_context, task, iteration_number, "final_report_composed", "Model Agent", "completed", {
                     "title": final_report.title,
                     "markdown_chars": len(final_report.markdown),
