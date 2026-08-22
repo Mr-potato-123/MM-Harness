@@ -167,6 +167,8 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             "python_execute 已经负责外部超时；Windows 没有 signal.SIGALRM，验证代码禁止自行安装 SIGALRM 或假设 solve_dp 等不存在的函数。验证源码时只运行 import runpy; runpy.run_path('solve_q1.py', run_name='__main__')，并读取其 stdout JSON。"
             "资源补给不得对三种资源做无界三重数量枚举；必须使用候选边界、需求驱动枚举或支配剪枝，并在超时后改变算法复杂度。"
             "建立 MILP 后必须先做小规模可行性烟雾检查；到达终点后的活动标志约束不得与 a_0=1、a_T=0 和终点位置约束互相矛盾，禁止使用会令到达终点后 a_t<0 的不等式。"
+            "路线实现硬性自检：候选路线的节点序列必须显式包含需要停留的补给平台（不能只把补给需求按总量加到初始资源上）；允许重复访问作业点，或给出可检查的上界/支配证明说明为何不会漏掉重复访问。若 bfs_path(a,b) 返回含起点和终点的节点列表，移动日必须遍历 path[1:]（第1天到达第一个相邻节点），不得用 path[0:distance] 导致终点和补给平台被跳过。到达终点当天立即结算并停止，不得用 END 填充后续消耗日。"
+            "在正式求解前必须运行最小路径烟雾测试：验证 START→END 的首个移动位置是其相邻节点、最后一个移动位置是 END；验证一条经过 SUPPLY 的候选路线确实产生补给记录且补给前后 O/H/F、M 和 O+H+F<=CAP 均满足。禁止使用名为 solve_simplified 的总量估算作为主求解器，也不得在未逐日模拟时声称 V1-V3 已通过。"
             "最终脚本必须在 stdout 返回一份可审查的中文 Markdown 执行报告，内容包括完整路径、每日行动与 O/H/F/M/Z、目标值、算法偏差、验证过程和限制；可以附带 JSON，但 JSON 中的 false 只是待审查提示，不是 Harness 失败信号。"
             "必须把同一份可审查结果保存到当前 iteration 的 outputs/result.md（必要时另存 outputs/result.json）；不要只返回 all_valid 或孤立的 true/false。"
         )
