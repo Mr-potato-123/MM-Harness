@@ -2,7 +2,8 @@
 
 Main Harness owns the process and calls this module as a Tool.  The module is
 not a top-level subagent dispatcher.  It is a bounded internal protocol which
-lets a Model Agent explore/synthesize a modeling plan, lets a Code Harness
+lets a Model Agent explore, summarize and formulate a preliminary modeling
+plan, lets a Code Harness
 realize that plan, and sends the Coding Report back to the same Model Agent
 through a Code→Model handoff. The Model Agent then gives Code-only repair
 instructions; it does not start a second modeling pass during revisions.
@@ -22,6 +23,7 @@ from uuid import UUID
 from m2harness.domain.solve_problem import (
     CodingHarnessReport,
     ExplorationMode,
+    ExplorationMaterial,
     PreliminaryModelingReport,
     SolveProblemContext,
     SolveProblemIteration,
@@ -43,6 +45,9 @@ from m2harness.models import ReportPayload
 from m2harness.application.research import ResearchAgentPort
 
 
+ModelingContract = PreliminaryModelingReport | UnifiedModelingReport
+
+
 class ModelAgentPort(Protocol):
     """Model Agent boundary used inside one solve_problem invocation."""
 
@@ -53,7 +58,37 @@ class ModelAgentPort(Protocol):
         *,
         branch_count: int,
         iteration: int,
-    ) -> tuple[PreliminaryModelingReport, ...]: ...
+    ) -> tuple[ExplorationMaterial, ...]: ...
+
+    def summarize_exploration(
+        self,
+        task: SolveProblemTask,
+        context: SolveProblemContext,
+        exploration: tuple[ExplorationMaterial, ...],
+        *,
+        iteration: int,
+    ) -> ReportPayload: ...
+
+    def formulate_preliminary(
+        self,
+        task: SolveProblemTask,
+        context: SolveProblemContext,
+        exploration: tuple[ExplorationMaterial, ...],
+        summary: ReportPayload,
+        *,
+        iteration: int,
+    ) -> PreliminaryModelingReport: ...
+
+    def unify(
+        self,
+        task: SolveProblemTask,
+        context: SolveProblemContext,
+        preliminary: tuple[PreliminaryModelingReport, ...],
+        coding: CodingHarnessReport,
+        review: SolveProblemReview,
+        *,
+        iteration: int,
+    ) -> UnifiedModelingReport: ...
 
     def synthesize(
         self,
@@ -68,7 +103,7 @@ class ModelAgentPort(Protocol):
         self,
         task: SolveProblemTask,
         context: SolveProblemContext,
-        modeling: UnifiedModelingReport,
+        modeling: ModelingContract,
         coding: CodingHarnessReport,
         *,
         iteration: int,
@@ -93,7 +128,7 @@ class CodeHarnessPort(Protocol):
         self,
         task: SolveProblemTask,
         context: SolveProblemContext,
-        modeling: UnifiedModelingReport,
+        modeling: ModelingContract,
         *,
         iteration: int,
     ) -> CodingHarnessReport: ...
@@ -181,25 +216,10 @@ class WorkspaceReadOnlyFileReader:
                 break
             limit = min(self.max_file_bytes, remaining)
             if reference.media_type.lower() == "application/pdf" or requested.lower().endswith(".pdf"):
-                # The original PDF remains a binary, read-only allowlisted
-                # input and is also sent through the multimodal lane.  For a
-                # textual handoff, disclose a local extraction of the same
-                # original bytes instead of silently dropping the request.
-                # If PyMuPDF is unavailable or the fixture is not a valid PDF,
-                # return an explicit path/digest marker rather than pretending
-                # that the original was inaccessible.
-                extracted = self._extract_pdf_text(raw, limit)
-                content = extracted or (
-                    f"[原始 PDF 二进制题面未做文本抽取；请通过只读路径打开原文件。]\\n"
-                    f"path={requested}\\nmedia_type={reference.media_type}\\n"
-                    f"sha256={digest}\\nsize_bytes={len(raw)}"
+                raise PermissionError(
+                    "complete PDF sources are Main Harness ingestion inputs and cannot be disclosed to solve agents; "
+                    "delegate a scoped Markdown context instead"
                 )
-                result.append(DisclosedTextFile(
-                    relative_path=requested, purpose=reference.purpose + "；原始 PDF 只读输入及其本地文本披露。",
-                    content=content[:limit], sha256=digest, truncated=len(content.encode("utf-8")) > limit,
-                ))
-                total += min(len(content.encode("utf-8")), limit)
-                continue
             sample = raw[:limit]
             try:
                 content = sample.decode("utf-8")
@@ -328,43 +348,33 @@ class SolveProblemService:
                 top_k=min(12, max(4, task.max_branches * 2)),
             )
             current_context = current_context.model_copy(update={"research_report": research})
-        # The original problem PDF is always part of the boundary contract,
-        # not an optional binary that disappears when an Agent asks for
-        # progressive disclosure.  Keep the original allowlisted path and
-        # proactively add a bounded local text extraction to the same context
-        # so every detailed report/handoff can show both forms of the source.
-        pdf_paths = tuple(dict.fromkeys(
+        # A solve invocation is allowed to receive only a delegated text slice.
+        # The complete PDF and the complete ingestion Markdown belong to the
+        # Main Harness ingestion boundary and must never enter this context.
+        full_problem_inputs = tuple(dict.fromkeys(
             item.relative_path for item in current_context.readonly_files
             if item.role == ReadOnlyFileRole.PROBLEM
             and (item.media_type.lower() == "application/pdf" or item.relative_path.lower().endswith(".pdf"))
         ))
-        if pdf_paths and self.file_reader is not None:
-            self._probe(current_context, task, None, "problem_pdf_disclosure_start", "Main Harness", "started", {
-                "paths": list(pdf_paths),
-            })
-            try:
-                disclosed_pdf = self.file_reader.disclose(current_context, pdf_paths)
-            except Exception as exc:
-                self._probe(current_context, task, None, "problem_pdf_disclosure_failed", "Main Harness", "failed", {
-                    "paths": list(pdf_paths), "error": str(exc)[:2_000],
-                })
-                raise
-            if disclosed_pdf:
-                current_context = current_context.model_copy(update={
-                    "disclosed_text_files": (*current_context.disclosed_text_files, *disclosed_pdf),
-                })
-            self._probe(current_context, task, None, "problem_pdf_disclosure_complete", "Main Harness", "completed", {
-                "requested_paths": list(pdf_paths),
-                "disclosed_paths": [item.relative_path for item in disclosed_pdf],
-            })
+        if current_context.multimodal_inputs or full_problem_inputs:
+            raise ValueError(
+                "solve_problem received a complete binary problem source; pass only a delegated scoped Markdown context"
+            )
         iterations: list[SolveProblemIteration] = []
         revision_instructions: tuple[str, ...] = ()
-        # The modeling contract is created once per solve invocation. A
-        # Code→Model repair round never reopens explore/synthesize.
+        # The preliminary modeling contract is created once per solve
+        # invocation. A Code→Model repair round never reopens exploration or
+        # preliminary formulation.
         revision_target = RevisionTarget.CODE
+        exploration: tuple[ExplorationMaterial, ...] = ()
+        exploration_summary: ReportPayload | None = None
         preliminary: tuple[PreliminaryModelingReport, ...] = ()
-        modeling: UnifiedModelingReport | None = None
-        branch_count = self.branch_count(task)
+        modeling: ModelingContract | None = None
+        # The first boundary is deliberately singular: one preliminary report
+        # and one handoff.  Route comparison, if ever needed, belongs to a
+        # later explicit modeling stage rather than multiplying first-round
+        # reports before Code has produced evidence.
+        branch_count = 1
         resume_iteration_value = current_context.metadata.get("resume_iteration")
         resume_modeling_value = current_context.metadata.get("resume_modeling")
         resume_mode = resume_iteration_value is not None or resume_modeling_value is not None
@@ -416,7 +426,7 @@ class SolveProblemService:
                     "revision_target": revision_target.value,
                 })
                 try:
-                    preliminary = tuple(self.model_agent.explore(
+                    exploration = tuple(self.model_agent.explore(
                         task, current_context, branch_count=branch_count, iteration=iteration_number,
                     ))
                 except Exception as exc:
@@ -425,15 +435,15 @@ class SolveProblemService:
                     })
                     raise
                 self._probe(current_context, task, iteration_number, "model_explore_complete", "Model Agent", "completed", {
-                    "branch_ids": [item.branch_id for item in preliminary],
-                    "requested_file_paths": [path for item in preliminary for path in item.requested_file_paths],
+                    "branch_ids": [item.branch_id for item in exploration],
+                    "requested_file_paths": [path for item in exploration for path in item.requested_file_paths],
                 })
                 current_context = self._record_context_marker(
                     current_context, task, iteration_number, "Model Agent",
-                    "已完成内部初步路线比较；不对外另存路线报告，等待统一建模。",
+                    "探索阶段已完成；探索材料不直接交给 Code，先由 Model Agent 总结并形成初步建模报告。",
                 )
                 requested = tuple(dict.fromkeys(
-                    path for report in preliminary for path in report.requested_file_paths
+                    path for report in exploration for path in report.requested_file_paths
                 ))
                 if requested and self.file_reader is not None:
                     self._probe(current_context, task, iteration_number, "file_disclosure_requested", "Model Agent", "started", {
@@ -468,7 +478,7 @@ class SolveProblemService:
                             "disclosed_text_files": (*current_context.disclosed_text_files, *disclosed),
                         })
                         try:
-                            preliminary = tuple(self.model_agent.explore(
+                            exploration = tuple(self.model_agent.explore(
                                 task, current_context, branch_count=branch_count, iteration=iteration_number,
                             ))
                         except Exception as exc:
@@ -476,48 +486,79 @@ class SolveProblemService:
                                 "error": str(exc)[:2_000], "after_disclosure": True,
                             })
                             raise
-            if not preliminary:
-                return SolveProblemReport(
-                    task_id=task.task_id, status=SolveProblemStatus.FAILED,
-                    iteration_count=max(0, iteration_number - 1), iterations=tuple(iterations),
-                    archive_files=self._archive_files(current_context, task),
-                    research_report=current_context.research_report,
-                    error="Model Agent returned no preliminary modeling report",
-                )
-            branch_ids = [item.branch_id for item in preliminary]
-            if len(branch_ids) != len(set(branch_ids)) or len(preliminary) > branch_count:
-                return SolveProblemReport(
-                    task_id=task.task_id, status=SolveProblemStatus.FAILED,
-                    iteration_count=max(0, iteration_number - 1), iterations=tuple(iterations),
-                    archive_files=self._archive_files(current_context, task),
-                    research_report=current_context.research_report,
-                    error="Model Agent returned duplicate or excess preliminary branch ids",
-                )
             if modeling is None:
-                self._probe(current_context, task, iteration_number, "model_synthesize_start", "Model Agent", "started", {})
-                try:
-                    modeling = self.model_agent.synthesize(
-                        task, current_context, preliminary, iteration=iteration_number,
+                if not exploration:
+                    return SolveProblemReport(
+                        task_id=task.task_id, status=SolveProblemStatus.FAILED,
+                        iteration_count=max(0, iteration_number - 1), iterations=tuple(iterations),
+                        archive_files=self._archive_files(current_context, task),
+                        research_report=current_context.research_report,
+                        error="Model Agent returned no exploration material",
                     )
+                branch_ids = [item.branch_id for item in exploration]
+                if len(exploration) != 1 or len(branch_ids) != len(set(branch_ids)):
+                    return SolveProblemReport(
+                        task_id=task.task_id, status=SolveProblemStatus.FAILED,
+                        iteration_count=max(0, iteration_number - 1), iterations=tuple(iterations),
+                        archive_files=self._archive_files(current_context, task),
+                        research_report=current_context.research_report,
+                        error="Model Agent must return exactly one exploration route",
+                    )
+                self._probe(current_context, task, iteration_number, "model_exploration_summary_start", "Model Agent", "started", {})
+                try:
+                    summarize = getattr(self.model_agent, "summarize_exploration", None)
+                    if callable(summarize):
+                        exploration_summary = summarize(
+                            task, current_context, exploration, iteration=iteration_number,
+                        )
+                    else:
+                        exploration_summary = exploration[0].report
                 except Exception as exc:
-                    self._probe(current_context, task, iteration_number, "model_synthesize_failed", "Model Agent", "failed", {
+                    self._probe(current_context, task, iteration_number, "model_exploration_summary_failed", "Model Agent", "failed", {
                         "error": str(exc)[:2_000],
                     })
                     raise
-                self._probe(current_context, task, iteration_number, "model_synthesize_complete", "Model Agent", "completed", {
-                    "selected_branch_ids": list(modeling.selected_branch_ids),
-                    "required_validations": list(modeling.required_validations),
-                    "expected_outputs": list(modeling.expected_outputs),
+                self._probe(current_context, task, iteration_number, "model_exploration_summary_complete", "Model Agent", "completed", {
+                    "markdown_chars": len(exploration_summary.markdown),
                 })
+                self._probe(current_context, task, iteration_number, "model_preliminary_start", "Model Agent", "started", {})
+                try:
+                    formulate = getattr(self.model_agent, "formulate_preliminary", None)
+                    if callable(formulate):
+                        preliminary_report = formulate(
+                            task, current_context, exploration, exploration_summary,
+                            iteration=iteration_number,
+                        )
+                    else:
+                        route = exploration[0]
+                        if isinstance(route, PreliminaryModelingReport):
+                            preliminary_report = route.model_copy(update={"exploration_summary": exploration_summary})
+                        else:
+                            preliminary_report = PreliminaryModelingReport(
+                                **route.model_dump(),
+                                exploration_summary=exploration_summary,
+                            )
+                except Exception as exc:
+                    self._probe(current_context, task, iteration_number, "model_preliminary_failed", "Model Agent", "failed", {
+                        "error": str(exc)[:2_000],
+                    })
+                    raise
+                preliminary = (preliminary_report,)
+                self._probe(current_context, task, iteration_number, "model_preliminary_complete", "Model Agent", "completed", {
+                    "branch_id": preliminary_report.branch_id,
+                    "required_validations": list(preliminary_report.required_validations),
+                    "expected_outputs": list(preliminary_report.expected_outputs),
+                })
+                modeling = preliminary[0]
                 current_context = self._archive(
-                    current_context, task, iteration_number, "modeling", "modeling_report",
-                    _modeling_markdown(modeling),
-                    purpose=f"题目 {task.task_id} 第 {iteration_number} 轮 Model Agent 统一建模方案。",
+                    current_context, task, iteration_number, "modeling", "preliminary_modeling_report",
+                    _preliminary_markdown(modeling),
+                    purpose=f"题目 {task.task_id} 第 {iteration_number} 轮初步建模报告；统一建模尚未生成。",
                     role=ReadOnlyFileRole.REFERENCE,
                 )
                 current_context = self._record_context_marker(
                     current_context, task, iteration_number, "Model Agent",
-                    f"统一建模已完成。主方案：{modeling.main_scheme[:1800]}；验证项：{', '.join(modeling.required_validations[:12])}。",
+                    f"初步建模已完成，已交给 Code；统一建模将在 review 后生成。候选方案：{modeling.candidate_scheme[:1800]}。",
                 )
             # The full Model→Code contract is written exactly once.  On a
             # repair iteration the previous iteration's delta handoff is
@@ -529,7 +570,7 @@ class SolveProblemService:
                 current_context = self._archive(
                     current_context, task, iteration_number, "handoff", "model-to-code",
                     _compact_model_to_code_handoff(
-                        task, current_context, preliminary, modeling, iteration_number,
+                        task, current_context, preliminary, iteration_number,
                         max_revision_rounds=self.revision_round_limit,
                     ),
                     purpose=f"题目 {task.task_id} 的初始 Model Agent→Code Agent 建模契约。",
@@ -540,14 +581,6 @@ class SolveProblemService:
                     "required_validations": list(modeling.required_validations),
                     "expected_outputs": list(modeling.expected_outputs),
                 })
-            if not set(modeling.selected_branch_ids).issubset(set(branch_ids)):
-                return SolveProblemReport(
-                    task_id=task.task_id, status=SolveProblemStatus.FAILED,
-                    iteration_count=iteration_number - 1, iterations=tuple(iterations),
-                    archive_files=self._archive_files(current_context, task),
-                    research_report=current_context.research_report,
-                    error="Unified Modeling Report selected an unknown preliminary branch",
-                )
             self._probe(current_context, task, iteration_number, "code_execute_start", "Code Agent", "started", {
                 "revision_target": revision_target.value,
             })
@@ -674,26 +707,59 @@ class SolveProblemService:
                     purpose=f"题目 {task.task_id} 第 {iteration_number} 轮 Code 返修指令正文索引。",
                     role=ReadOnlyFileRole.REFERENCE,
                 )
-            snapshot = SolveProblemIteration(
-                iteration=iteration_number,
-                # A revision snapshot keeps only a compact pointer to the
-                # already accepted model.  The first snapshot is the single
-                # full modeling record; later snapshots must not serialize it
-                # again into every report/handoff.
-                preliminary_reports=(preliminary if iteration_number == start_iteration else ()),
-                modeling_report=_modeling_snapshot(modeling, iteration_number, first_iteration=start_iteration),
-                coding_report=coding, review=review,
-            )
-            iterations.append(snapshot)
             # A successful review, or the final allowed iteration, closes this
             # one-shot solve call.  At the cap the Model Agent still writes a
             # total question report with explicit limitations; Main Harness
             # must not call solve again to manufacture another review loop.
+            unified_modeling: UnifiedModelingReport | None = None
             if review.decision == ModelReviewDecision.APPROVE or iteration_number == iteration_limit:
+                self._probe(current_context, task, iteration_number, "model_unify_start", "Model Agent", "started", {})
+                try:
+                    unify = getattr(self.model_agent, "unify", None)
+                    if callable(unify):
+                        unified_modeling = unify(
+                            task, current_context, preliminary, coding, review,
+                            iteration=iteration_number,
+                        )
+                    else:
+                        # Compatibility fallback for older injected test/host
+                        # adapters. Production Qwen uses ``unify`` explicitly.
+                        unified_modeling = self.model_agent.synthesize(
+                            task, current_context, preliminary, iteration=iteration_number,
+                        )
+                except Exception as exc:
+                    self._probe(current_context, task, iteration_number, "model_unify_failed", "Model Agent", "failed", {
+                        "error": str(exc)[:2_000],
+                    })
+                    raise
+                self._probe(current_context, task, iteration_number, "model_unify_complete", "Model Agent", "completed", {
+                    "selected_branch_ids": list(unified_modeling.selected_branch_ids),
+                    "required_validations": list(unified_modeling.required_validations),
+                    "expected_outputs": list(unified_modeling.expected_outputs),
+                })
+                current_context = self._archive(
+                    current_context, task, iteration_number, "modeling", "modeling_report",
+                    _modeling_markdown(unified_modeling),
+                    purpose=f"题目 {task.task_id} 第 {iteration_number} 轮 review 后的最终统一建模报告。",
+                    role=ReadOnlyFileRole.REFERENCE,
+                )
+                current_context = self._record_context_marker(
+                    current_context, task, iteration_number, "Model Agent",
+                    f"review 后统一建模已生成。主方案：{unified_modeling.main_scheme[:1800]}。",
+                )
+
+            snapshot = SolveProblemIteration(
+                iteration=iteration_number,
+                preliminary_reports=(preliminary if iteration_number == start_iteration else ()),
+                modeling_report=unified_modeling,
+                coding_report=coding, review=review,
+            )
+            iterations.append(snapshot)
+            if unified_modeling is not None:
                 current_context = self._control_checkpoint(current_context, task, iteration_number, "final_report_start")
                 try:
                     final_report = self.model_agent.compose_final_report(
-                        task, current_context, modeling, coding, review,
+                        task, current_context, unified_modeling, coding, review,
                         iteration=iteration_number,
                     )
                 except Exception as exc:
@@ -910,8 +976,13 @@ def _preliminary_markdown(report: PreliminaryModelingReport) -> str:
         f"# 初步建模路线：{report.branch_id}",
         "", "## 候选方案", "", report.candidate_scheme,
         "", "## 假设", "", *(f"- {item}" for item in report.assumptions),
+        "", "## 必须验证", "", *(f"- {item}" for item in report.required_validations),
         "", "## 预期输出", "", *(f"- {item}" for item in report.expected_outputs),
+        "", "## 预期图", "", *(f"- {item}" for item in report.expected_figures),
+        "", "## 编码提示", "", *(f"- {item}" for item in report.coding_instructions),
         "", "## 风险", "", *(f"- {item}" for item in report.risks),
+        "", "## 探索总结", "",
+        report.exploration_summary.markdown if report.exploration_summary is not None else "（兼容旧适配器：未单独返回探索总结。）",
         "", "## Model Agent 报告", "", report.report.markdown,
     ]
     if report.requested_file_paths:
@@ -1063,7 +1134,6 @@ def _model_to_code_handoff(
     task: SolveProblemTask,
     context: SolveProblemContext,
     preliminary: tuple[PreliminaryModelingReport, ...],
-    modeling: UnifiedModelingReport,
     iteration: int,
 ) -> str:
     lines = [
@@ -1154,41 +1224,40 @@ def _compact_model_to_code_handoff(
     task: SolveProblemTask,
     context: SolveProblemContext,
     preliminary: tuple[PreliminaryModelingReport, ...],
-    modeling: UnifiedModelingReport,
     iteration: int,
     *,
     max_revision_rounds: int = MAX_REVISION_ROUNDS,
 ) -> str:
-    """Write a reference-only first Model→Code handoff.
+    """Write the one initial preliminary Model→Code handoff.
 
-    The accepted model is a single canonical ``modeling_report.md``.  This
-    boundary must not copy its body (or a preliminary route) into a second
-    report; it only tells Code Agent which allowlisted files to read.
+    The handoff is an index, not a second modeling report. The complete PDF
+    ingestion Markdown is intentionally absent; only the delegated scoped
+    context and preliminary report are visible at this boundary.
     """
 
-    del preliminary, iteration, max_revision_rounds
+    del iteration, max_revision_rounds
     available = [item for item in context.readonly_files if "/exchanges/" in item.relative_path.replace("\\", "/")]
-    modeling_paths = [item.relative_path for item in available if item.relative_path.endswith("/modeling/modeling_report.md")]
+    preliminary_paths = [item.relative_path for item in available if item.relative_path.endswith("/modeling/preliminary_modeling_report.md")]
     problem_paths = [
         item.relative_path for item in context.readonly_files
         if getattr(getattr(item, "role", None), "value", getattr(item, "role", "")) == "problem"
-        or item.relative_path.lower().endswith(".pdf")
+        and not item.relative_path.lower().endswith(".pdf")
     ]
     lines = [
         "# Model → Code", "",
         f"题目：{task.title}（{task.task_id}）", "",
-        "建模报告（唯一建模来源）：",
-        *(f"- `{path}`" for path in dict.fromkeys(modeling_paths)),
-        "" if modeling_paths else "- 建模报告未在白名单中找到；不得自行补写模型。",
+        "当前初步建模报告（唯一初步建模来源）：",
+        *(f"- `{path}`" for path in dict.fromkeys(preliminary_paths)),
+        "" if preliminary_paths else "- No preliminary modeling report is present in the allowlist.",
         "",
-        "原始题面（只读来源）：",
+        "Main Harness 委派的题面上下文（只读来源）：",
         *(f"- `{path}`" for path in dict.fromkeys(problem_paths)),
         "" if problem_paths else "- 原始题面未在白名单中找到。",
         "",
         "交接要求：",
-        "- Code Agent 先按白名单读取上述建模报告和题面；本文件不重复建模正文。",
-        "- 只处理当前题目，按建模报告实现、执行和验证。",
-        "- 生成文件、图片和执行结果由 Code→Model 交接直接汇报；不在本文件重复。",
+        "- Code Agent 先读取初步建模报告和 scoped Markdown；本文件不复制建模正文。",
+        "- 只处理当前题目，不读取或猜测完整题面 Markdown。",
+        "- 生成文件、图片和执行结果由 Code→Model 交接直接汇报。",
     ]
     return "\n".join(lines).strip() + "\n"
 

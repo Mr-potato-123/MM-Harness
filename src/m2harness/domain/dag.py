@@ -11,7 +11,7 @@ terminal node.
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -158,6 +158,7 @@ def canonical_main_harness_dag(
     *,
     scope: str = "question-1",
     task_problem: str | None = None,
+    task_problems: Mapping[str, str] | None = None,
     question_count: int = 1,
 ) -> DAGTaskTable:
     """Return a TODO graph whose solve nodes are independently scoped.
@@ -197,10 +198,11 @@ def canonical_main_harness_dag(
         node_metadata["scope"] = node_scope
         node_metadata["question_number"] = index
         node_metadata["todo"] = f"Solve only {node_scope} and return its reviewed solve_problem_report."
-        if task_problem is not None:
+        scoped_problem = (task_problems or {}).get(node_id, task_problem)
+        if scoped_problem is not None:
             node_metadata["problem"] = (
-                task_problem if question_count == 1 else
-                task_problem + f"\n\nSCOPE LOCK: analyze only {node_scope}; do not solve or summarize any other numbered question."
+                scoped_problem if question_count == 1 else
+                scoped_problem + f"\n\nSCOPE LOCK: analyze only {node_scope}; do not solve or summarize any other numbered question."
             )
         solve_nodes.append(DAGTaskNode(
             id=node_id,

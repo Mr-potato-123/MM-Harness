@@ -141,17 +141,37 @@ class SolveProblemContext(StrictModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class PreliminaryModelingReport(StrictModel):
-    """One independent modeling route produced inside the solve tool."""
+class ExplorationMaterial(StrictModel):
+    """Internal route material produced by the exploration pass."""
 
     branch_id: str = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9-]*[a-z0-9])?$", min_length=1, max_length=120)
     report: ReportPayload
     candidate_scheme: str = Field(min_length=1, max_length=20_000)
     assumptions: tuple[str, ...] = ()
+    required_validations: tuple[str, ...] = ()
     expected_outputs: tuple[str, ...] = ()
+    expected_figures: tuple[str, ...] = ()
+    coding_instructions: tuple[str, ...] = ()
     risks: tuple[str, ...] = ()
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     requested_file_paths: tuple[str, ...] = ()
+
+
+class PreliminaryModelingReport(StrictModel):
+    """The one report formed after exploration has been summarized."""
+
+    branch_id: str = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9-]*[a-z0-9])?$", min_length=1, max_length=120)
+    report: ReportPayload
+    candidate_scheme: str = Field(min_length=1, max_length=20_000)
+    assumptions: tuple[str, ...] = ()
+    required_validations: tuple[str, ...] = ()
+    expected_outputs: tuple[str, ...] = ()
+    expected_figures: tuple[str, ...] = ()
+    coding_instructions: tuple[str, ...] = ()
+    risks: tuple[str, ...] = ()
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    requested_file_paths: tuple[str, ...] = ()
+    exploration_summary: ReportPayload | None = None
 
 
 class UnifiedModelingReport(StrictModel):
@@ -209,7 +229,11 @@ class SolveProblemIteration(StrictModel):
 
     iteration: int = Field(ge=1)
     preliminary_reports: tuple[PreliminaryModelingReport, ...] = ()
-    modeling_report: UnifiedModelingReport
+    # Only the terminal iteration contains the final unified modeling report.
+    # Earlier review/revision iterations carry the preliminary contract only;
+    # this prevents a premature ``modeling_report.md`` from becoming the
+    # source of truth before Code has produced evidence.
+    modeling_report: UnifiedModelingReport | None = None
     coding_report: CodingHarnessReport
     review: SolveProblemReview
 

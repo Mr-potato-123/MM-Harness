@@ -26,7 +26,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from m2harness.domain.code import CodeProposal
 from m2harness.application.code_agent_prompts import CODE_AGENT_SYSTEM_PROMPT, build_code_agent_task_prompt
-from m2harness.domain.solve_problem import SolveProblemContext, SolveProblemTask, UnifiedModelingReport
+from m2harness.domain.solve_problem import SolveProblemContext, SolveProblemTask
+from m2harness.application.solve_problem import ModelingContract
 from m2harness.errors import ActivityExecutionError
 from m2harness.human_control import HumanControlStore, HumanInterruptRequested
 from m2harness.infrastructure.code_harness import CodeProposalProvider, _validate_python_policy
@@ -88,7 +89,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         self._forced_handoff_targets: set[str] = set()
         self._python_environments: dict[Path, Any] = {}
 
-    def propose(self, task: SolveProblemTask, context: SolveProblemContext, modeling: UnifiedModelingReport, *, iteration: int) -> CodeProposal:
+    def propose(self, task: SolveProblemTask, context: SolveProblemContext, modeling: ModelingContract, *, iteration: int) -> CodeProposal:
         target_relative = self._target_path(task, context, iteration)
         prompt_path = self.workspace_root / Path(target_relative).parent / "deepagents-prompt.md"
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -507,7 +508,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
 
         return python_cancel
 
-    def _run_agent(self, task: SolveProblemTask, context: SolveProblemContext, modeling: UnifiedModelingReport, *, iteration: int, prompt: str, event_path: Path) -> dict[str, Any]:
+    def _run_agent(self, task: SolveProblemTask, context: SolveProblemContext, modeling: ModelingContract, *, iteration: int, prompt: str, event_path: Path) -> dict[str, Any]:
         target_relative = self._target_path(task, context, iteration)
         run_id = str(context.metadata.get("run_id", "unscoped")) if isinstance(context.metadata, dict) else "unscoped"
         agent = self._ensure_agent(context, target_relative, run_id)
@@ -712,7 +713,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
         return f"m2h-deepagents-code-{safe_run_id}-{task.task_id}-attempt-{attempt}"
 
-    def _build_prompt(self, task: SolveProblemTask, context: SolveProblemContext, modeling: UnifiedModelingReport, *, iteration: int, target_relative: str) -> str:
+    def _build_prompt(self, task: SolveProblemTask, context: SolveProblemContext, modeling: ModelingContract, *, iteration: int, target_relative: str) -> str:
         return build_code_agent_task_prompt(
             task,
             context,

@@ -37,8 +37,8 @@ from m2harness.application.code_agent_prompts import CODE_AGENT_SYSTEM_PROMPT, b
 from m2harness.domain.solve_problem import (
     SolveProblemContext,
     SolveProblemTask,
-    UnifiedModelingReport,
 )
+from m2harness.application.solve_problem import ModelingContract
 from m2harness.errors import ActivityExecutionError
 from m2harness.infrastructure.code_harness import CodeProposalProvider
 
@@ -321,7 +321,7 @@ class DshCodeProposalProvider(CodeProposalProvider):
         self._event_sequence: dict[str, int] = {}
         self._lock = threading.Lock()
 
-    def propose(self, task: SolveProblemTask, context: SolveProblemContext, modeling: UnifiedModelingReport, *, iteration: int) -> CodeProposal:
+    def propose(self, task: SolveProblemTask, context: SolveProblemContext, modeling: ModelingContract, *, iteration: int) -> CodeProposal:
         raw_run_id = str(context.metadata.get("run_id", "unscoped")) if isinstance(context.metadata, dict) else "unscoped"
         raw_run_name = str(context.metadata.get("run_name", raw_run_id)) if isinstance(context.metadata, dict) else raw_run_id
         run_path_key = str(context.metadata.get("run_path_key", raw_run_id)) if isinstance(context.metadata, dict) else raw_run_id
@@ -487,7 +487,7 @@ class DshCodeProposalProvider(CodeProposalProvider):
             stream.write(json.dumps(prompt_record, ensure_ascii=False, separators=(",", ":")) + "\n")
         return manifest_path, prompt_index_path
 
-    def _prompt(self, task: SolveProblemTask, context: SolveProblemContext, modeling: UnifiedModelingReport, *, iteration: int, logical_name: str, source_path: str) -> str:
+    def _prompt(self, task: SolveProblemTask, context: SolveProblemContext, modeling: ModelingContract, *, iteration: int, logical_name: str, source_path: str) -> str:
         return CODE_AGENT_SYSTEM_PROMPT + "\n\n" + build_code_agent_task_prompt(
             task,
             context,

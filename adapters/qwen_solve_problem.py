@@ -28,13 +28,14 @@ from uuid import UUID, uuid4
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
-from m2harness.application.solve_problem import ModelAgentPort
+from m2harness.application.solve_problem import ModelAgentPort, ModelingContract
 from m2harness.application.code_agent_prompts import CODE_AGENT_SYSTEM_PROMPT, build_code_agent_task_prompt
 from m2harness.application.solve_problem import SolveProblemArchivePort, SolveProblemService, WorkspaceReadOnlyFileReader
 from m2harness.domain.code import CodeProposal
 from m2harness.domain.media import MultimodalInput
 from m2harness.domain.solve_problem import (
     CodingHarnessReport,
+    ExplorationMaterial,
     PreliminaryModelingReport,
     SolveProblemContext,
     SolveProblemReview,
@@ -152,7 +153,7 @@ class MainHarnessToolBridge:
                 "type": "function",
                 "function": {
                     "name": "todo_write",
-                    "description": "Update the Harness-preloaded Code Agent implementation todo list; preserve task content and change statuses only.",
+                    "description": "Create or update the Code Agent's own implementation todo list; this does not modify the Main Harness workflow.",
                     "parameters": {
                         "type": "object", "additionalProperties": False, "required": ["todos"],
                         "properties": {"todos": {"type": "array", "maxItems": 100, "items": {
@@ -174,22 +175,11 @@ class MainHarnessToolBridge:
                 if self.workspace_root is not None:
                     todo_root = self.workspace_root / ".m2harness-code" / "runs" / self.run_id / f"task-{task_id}" / f"attempt-{self.task_attempt}" / "todo.json"
                 ledger = TodoLedger(task_id, todo_root)
-                ledger.write(self._canonical_todos(iteration), iteration=iteration)
                 self._todo_ledgers[todo_key] = ledger
             if name == "todo_read":
                 return {"ok": True, "tool_name": name, "output": {"todos": ledger.render()}}
             try:
                 raw_todos = arguments.get("todos")
-                expected = [item.content for item in ledger.read()]
-                submitted = [item.get("content") for item in raw_todos] if isinstance(raw_todos, list) and all(isinstance(item, dict) for item in raw_todos) else []
-                if submitted != expected:
-                    return {
-                        "ok": False,
-                        "tool_name": name,
-                        "error_code": "todo_plan_locked",
-                        "error_message": "Code Agent TODO 由 Harness 预置；只能更新既有任务的 status，不得改写、删除或增加任务。",
-                        "required_todos": ledger.render(),
-                    }
                 snapshot = ledger.write(raw_todos, iteration=iteration)
             except (TypeError, ValueError) as exc:
                 return {"ok": False, "tool_name": name, "error_code": "invalid_todo", "error_message": str(exc)}
@@ -260,27 +250,6 @@ class MainHarnessToolBridge:
                 self._source_written.add(source_key)
             return {"ok": True, "tool_name": name, "output": output}
         return {"ok": False, "tool_name": name, "error_code": result.error_code, "error_message": result.error_message}
-
-    @staticmethod
-    def _canonical_todos(iteration: int) -> list[dict[str, str]]:
-        """Return the bounded implementation lifecycle for this iteration."""
-
-        if iteration == 1:
-            return [
-                {"content": "读取 Model→Code 交接、统一建模报告和原始题面", "status": "in_progress"},
-                {"content": "写入完整目标 Python 源文件", "status": "pending"},
-                {"content": "执行脚本并完成建模报告要求的验证", "status": "pending"},
-                {"content": "整理 outputs 中的结果文件和图片", "status": "pending"},
-                {"content": "返回 CodeProposal 交接对象", "status": "pending"},
-            ]
-        return [
-            {"content": "读取最新返修交接、代码报告和已有源文件", "status": "in_progress"},
-            {"content": "按返修点修改目标 Python 源文件", "status": "pending"},
-            {"content": "重新执行脚本并完成相关验证", "status": "pending"},
-            {"content": "整理 outputs 中的最新结果文件和图片", "status": "pending"},
-            {"content": "返回 CodeProposal 交接对象", "status": "pending"},
-        ]
-
 
 def _content_parts(context: SolveProblemContext, prompt: str, *, deepseek: bool = False) -> list[dict[str, Any]]:
     parts: list[dict[str, Any]] = []
@@ -398,9 +367,15 @@ def _compact_evidence(value: Any) -> Any:
     return result
 
 
-def _modeling_payload(modeling: UnifiedModelingReport, context: SolveProblemContext, iteration: int) -> dict[str, Any]:
+def _modeling_payload(modeling: ModelingContract, context: SolveProblemContext, iteration: int) -> dict[str, Any]:
     """Pass the full model once, then a compact continuation reference."""
 
+    if isinstance(modeling, PreliminaryModelingReport):
+        return {
+            "stage": "preliminary",
+            "contract": modeling.model_dump(mode="json"),
+            "instruction": "这是初步建模契约。请按它审查实现证据，不要在 review 阶段生成统一建模报告。",
+        }
     if iteration == 1:
         return modeling.model_dump(mode="json")
     paths = sorted(
@@ -787,16 +762,59 @@ class QwenModelAgent(ModelAgentPort):
         return self.client.json(system=system, content=_content_parts(context, prompt, deepseek=deepseek), schema=schema)
 
     def explore(self, task, context, *, branch_count, iteration):
-        schema = PreliminaryModelingReport.model_json_schema()
-        reports: list[PreliminaryModelingReport] = []
+        schema = ExplorationMaterial.model_json_schema()
+        reports: list[ExplorationMaterial] = []
         for index in range(branch_count):
-            value = self._request(task, context, f"仅用中文产生第 {index + 1}/{branch_count} 条独立初步建模路线（迭代 {iteration}），只覆盖范围锁定的问题。列出假设、风险和该问题的预期输出，不得讨论其他问题。若需要白名单 UTF-8 文件，请在 requested_file_paths 中返回路径。", schema, skill_names=("problem-intake", "modeling-project-orchestration", "problem-decomposition", "research-planning", "deep-research", "modeling-knowledge", "modeling-core", "exploratory-data-analysis"))
+            value = self._request(task, context, f"仅用中文产生第 {index + 1}/{branch_count} 条探索路线材料（迭代 {iteration}），只覆盖范围锁定的问题。这里先记录候选思路、假设、风险和预期输出，不要生成统一建模报告，也不要把本材料当作 Code 交接。若需要白名单 UTF-8 文件，请在 requested_file_paths 中返回路径。", schema, skill_names=("problem-intake", "modeling-project-orchestration", "problem-decomposition", "research-planning", "deep-research", "modeling-knowledge", "modeling-core", "exploratory-data-analysis"))
             value.setdefault("branch_id", f"route-{index + 1}")
-            reports.append(PreliminaryModelingReport.model_validate(value, strict=False))
+            reports.append(ExplorationMaterial.model_validate(value, strict=False))
         return tuple(reports)
+
+    def summarize_exploration(self, task, context, exploration, *, iteration):
+        value = self._request(
+            task,
+            context,
+            f"用中文总结第 {iteration} 轮探索材料，只提炼当前范围的问题结构、关键约束、可行路线差异、主要风险和后续初步建模必须明确的事项。此处只输出探索总结，不生成统一建模报告，不处理其他编号问题。",
+            ReportPayload.model_json_schema(),
+            evidence={"exploration_materials": [item.model_dump(mode="json") for item in exploration]},
+            skill_names=("model-selection", "problem-decomposition", "modeling-core", "model-diagnostics"),
+        )
+        return ReportPayload.model_validate(value, strict=False)
+
+    def formulate_preliminary(self, task, context, exploration, summary, *, iteration):
+        value = self._request(
+            task,
+            context,
+            f"基于第 {iteration} 轮探索总结，形成一份当前题目的初步建模报告，供 Code Agent 实现。报告必须明确候选主方案、假设、必需验证、预期输出、预期图和编码提示；不要生成最终统一建模报告，不要扩展到其他编号问题。",
+            PreliminaryModelingReport.model_json_schema(),
+            evidence={
+                "exploration_summary": summary.model_dump(mode="json"),
+                "exploration_materials": [item.model_dump(mode="json") for item in exploration],
+            },
+            skill_names=("modeling-core", "dimensional-analysis", "numerical-validation", "model-diagnostics"),
+        )
+        value.setdefault("branch_id", exploration[0].branch_id)
+        value.setdefault("exploration_summary", summary.model_dump(mode="json"))
+        return PreliminaryModelingReport.model_validate(value, strict=False)
 
     def synthesize(self, task, context, preliminary, *, iteration):
         value = self._request(task, context, f"用中文选择并统一第 {iteration} 轮的最佳路线，只针对当前范围。给出一个可执行主方案、必需验证、预期输出和需要绘制的图；没有必要的图就返回空列表。不得扩展到其他问题。", UnifiedModelingReport.model_json_schema(), evidence={"preliminary_reports": [item.model_dump(mode="json") for item in preliminary]}, skill_names=("model-selection", "modeling-core", "dimensional-analysis", "uncertainty-quantification", "sensitivity-analysis", "numerical-validation"))
+        return UnifiedModelingReport.model_validate(value, strict=False)
+
+    def unify(self, task, context, preliminary, coding, review, *, iteration):
+        value = self._request(
+            task,
+            context,
+            f"现在才生成第 {iteration} 轮 review 后的最终统一建模报告。只在已有初步建模、Code→Model Markdown 报告、可复现证据和 review 决定之间做一致性归纳；不得扩展当前题目范围，不得重新引入其他题目，也不得把未验证内容写成已验证结论。给出 Code 下一步可依赖的主方案、必需验证、预期输出、预期图和编码提示。",
+            UnifiedModelingReport.model_json_schema(),
+            evidence={
+                "preliminary_report": [item.model_dump(mode="json") for item in preliminary],
+                "code_report_markdown": coding.report.markdown,
+                "validation_evidence": coding.validation_evidence,
+                "review": review.model_dump(mode="json"),
+            },
+            skill_names=("model-selection", "modeling-core", "dimensional-analysis", "uncertainty-quantification", "sensitivity-analysis", "numerical-validation"),
+        )
         return UnifiedModelingReport.model_validate(value, strict=False)
 
     def review(self, task, context, modeling, coding, *, iteration):
@@ -806,13 +824,13 @@ class QwenModelAgent(ModelAgentPort):
         )
         value = self._request(
             task, context,
-            f"用中文读取第 {iteration} 轮 Code→Model 交接，作为同一个 Model Agent 的代码返修阶段。 "
-            "不要重新 explore、synthesize 或重建模型；统一建模契约已经锁定。只根据 Code Agent 的完整 Markdown 报告、stdout、源代码路径、输出路径和探针记录，逐条核验本轮实现并给 Code Agent 可执行的返修意见。"
+            f"用中文读取第 {iteration} 轮 Code→Model 交接，作为同一个 Model Agent 的代码审查阶段。 "
+            "当前只有初步建模契约；此处只检查实现是否忠实覆盖它，不要重新 explore、synthesize 或生成统一建模报告。只根据 Code Agent 的完整 Markdown 报告、stdout、源代码路径、输出路径和探针记录，逐条核验本轮实现并给 Code Agent 可执行的返修意见。"
             "交接中的结构化字段只能用于定位文件，不能把 timeout、execution_failed 或单个 false 索引当作裁决；报告本身和可复现证据才是依据。"
             "若需要源码或输出，使用 requested_file_paths 请求白名单路径。无论发现何种问题，decision 为 revise/reject 时 revision_target 必须为 code，指令必须说明要改哪段代码、如何重新执行和需要补充什么报告证据。",
             SolveProblemReview.model_json_schema(),
             evidence={
-                "modeling_report": _modeling_payload(modeling, context, iteration),
+                "modeling_contract": _modeling_payload(modeling, context, iteration),
                 # Code→Model is report-first. Keep structural fields only as
                 # path/evidence indexes; do not route timeout/failed booleans
                 # into the Model Agent's repair decision.

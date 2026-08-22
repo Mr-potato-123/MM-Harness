@@ -13,6 +13,7 @@ from m2harness import (
     DAGTaskNode,
     DAGTaskTable,
     ExplorationMode,
+    ExplorationMaterial,
     ModelReviewDecision,
     ReadOnlyFileReference,
     ReadOnlyFileRole,
@@ -35,6 +36,7 @@ from m2harness.domain.code import CodeProposal
 from m2harness.infrastructure.code_harness import LocalPythonCodeHarness
 from m2harness.application.solve_problem import WorkspaceReadOnlyFileReader
 from m2harness.application.report_store import RunReportStore
+from m2harness.cli import _question_contexts
 from adapters.qwen_solve_problem import MainHarnessToolBridge, QwenChatClient, QwenCodeProposalProvider, QwenModelAgent, QwenPaperComposer, _content_parts
 from m2harness.domain.media import MultimodalInput
 import base64
@@ -119,6 +121,63 @@ class FakeQwenClient:
 
 
 class SolveProblemHarnessTest(unittest.TestCase):
+    def test_explore_summary_preliminary_and_unification_are_separate_stages(self) -> None:
+        class StagedModel(FakeModelAgent):
+            def __init__(self):
+                super().__init__()
+                self.events = []
+
+            def explore(self, task, context, *, branch_count, iteration):
+                self.events.append("explore")
+                return (ExplorationMaterial(
+                    branch_id="route-1", report=_report("exploration"),
+                    candidate_scheme="candidate", expected_outputs=("result",),
+                ),)
+
+            def summarize_exploration(self, task, context, exploration, *, iteration):
+                self.events.append("summarize")
+                return _report("exploration summary")
+
+            def formulate_preliminary(self, task, context, exploration, summary, *, iteration):
+                self.events.append("preliminary")
+                return PreliminaryModelingReport(
+                    branch_id="route-1", report=_report("preliminary"),
+                    candidate_scheme="candidate", required_validations=("sanity",),
+                    expected_outputs=("result",), exploration_summary=summary,
+                )
+
+            def review(self, task, context, modeling, coding, *, iteration):
+                self.events.append("review")
+                return SolveProblemReview(decision=ModelReviewDecision.APPROVE, rationale="evidence is sufficient")
+
+            def unify(self, task, context, preliminary, coding, review, *, iteration):
+                self.events.append("unify")
+                return self.synthesize(task, context, preliminary, iteration=iteration)
+
+        model = StagedModel()
+        result = SolveProblemService(model, FakeCodeHarness(), max_iterations=1).solve(
+            SolveProblemTask(task_id="q1", title="Q", problem="P"),
+        )
+        self.assertEqual(result.status, SolveProblemStatus.COMPLETED)
+        self.assertEqual(model.events, ["explore", "summarize", "preliminary", "review", "unify"])
+        self.assertIsNotNone(result.iterations[0].modeling_report)
+
+    def test_pdf_context_is_hierarchically_sliced_before_solve(self) -> None:
+        full_markdown = "\n".join((
+            "# 2026B",
+            "公共背景：所有任务共享参数。",
+            "任务1：建立基础模型。",
+            "任务2：在任务1基础上扩展。",
+            "任务3：分析随机情形。",
+        ))
+        contexts = _question_contexts(full_markdown, question_count=3)
+        self.assertIn("任务1：建立基础模型", contexts["q1"])
+        self.assertNotIn("任务2：在任务1基础上扩展", contexts["q1"])
+        self.assertIn("任务1：建立基础模型", contexts["q2"])
+        self.assertIn("任务2：在任务1基础上扩展", contexts["q2"])
+        self.assertNotIn("任务3：分析随机情形", contexts["q2"])
+        self.assertIn("SCOPE LOCK", contexts["q3"])
+
     def test_main_harness_can_build_serial_question_todos_with_scopes(self) -> None:
         dag = canonical_main_harness_dag(question_count=4, task_problem="BASE")
         self.assertEqual(dag.topological_order(), ("q1", "q2", "q3", "q4", "publish-paper"))
@@ -138,8 +197,8 @@ class SolveProblemHarnessTest(unittest.TestCase):
         self.assertEqual(result.status, SolveProblemStatus.COMPLETED)
         self.assertEqual(result.iteration_count, 2)
         # A code-only review revision reuses the accepted modeling contract.
-        self.assertEqual(model.explorations, [3])
-        self.assertEqual(len(result.iterations[0].preliminary_reports), 3)
+        self.assertEqual(model.explorations, [1])
+        self.assertEqual(len(result.iterations[0].preliminary_reports), 1)
         self.assertEqual(result.iterations[0].review.decision, ModelReviewDecision.REVISE)
 
     def test_main_context_is_a_projection_not_a_transcript_ledger(self) -> None:
@@ -176,7 +235,7 @@ class SolveProblemHarnessTest(unittest.TestCase):
             SolveProblemTask(task_id="q1", title="Q", problem="P", difficulty=4),
         )
         self.assertEqual(result.status, SolveProblemStatus.COMPLETED)
-        self.assertEqual(model.explorations, [2])
+        self.assertEqual(model.explorations, [1])
         self.assertEqual(result.iterations[0].review.revision_target.value, "code")
 
     def test_main_harness_dispatches_only_solve_problem_nodes_and_unlocks_terminal(self) -> None:
@@ -351,7 +410,7 @@ class SolveProblemHarnessTest(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 reader.disclose(SolveProblemContext(readonly_files=(reference,)), ("not-allowed.md",))
 
-    def test_pdf_progressive_disclosure_keeps_original_path_and_text_marker(self) -> None:
+    def test_pdf_progressive_disclosure_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             data = b"%PDF-1.7\x00\xffbinary"
@@ -361,14 +420,12 @@ class SolveProblemHarnessTest(unittest.TestCase):
                 role=ReadOnlyFileRole.PROBLEM, media_type="application/pdf",
                 sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
             )
-            disclosed = WorkspaceReadOnlyFileReader(root).disclose(
-                SolveProblemContext(readonly_files=(reference,)), ("problem.pdf",)
-            )
-            self.assertEqual(len(disclosed), 1)
-            self.assertEqual(disclosed[0].relative_path, "problem.pdf")
-            self.assertIn("原始 PDF", disclosed[0].content)
+            with self.assertRaises(PermissionError):
+                WorkspaceReadOnlyFileReader(root).disclose(
+                    SolveProblemContext(readonly_files=(reference,)), ("problem.pdf",)
+                )
 
-    def test_pdf_is_auto_disclosed_while_agent_handoffs_stay_small(self) -> None:
+    def test_complete_pdf_is_rejected_at_solve_boundary(self) -> None:
         class PdfAwareModel(FakeModelAgent):
             def __init__(self):
                 super().__init__()
@@ -390,31 +447,16 @@ class SolveProblemHarnessTest(unittest.TestCase):
             )
             model = PdfAwareModel()
             run_id = uuid4()
-            result = SolveProblemService(
+            service = SolveProblemService(
                 model, FakeCodeHarness(), max_iterations=2,
                 file_reader=WorkspaceReadOnlyFileReader(root),
                 archive_writer=RunReportStore(root),
-            ).solve(
-                SolveProblemTask(task_id="q1", title="Q", problem="P"),
-                SolveProblemContext(readonly_files=(reference,), metadata={"run_id": str(run_id)}),
             )
-            self.assertEqual(result.status, SolveProblemStatus.COMPLETED)
-            assert model.first_context is not None
-            self.assertTrue(any(item.relative_path == "problem.pdf" for item in model.first_context.disclosed_text_files))
-            exchange_root = root / "reports" / "runs" / str(run_id) / "tasks" / "q1" / "attempt-1" / "exchanges"
-            model_to_code = next(exchange_root.rglob("model-to-code.md")).read_text(encoding="utf-8")
-            code_to_model = next(exchange_root.rglob("code-to-model.md")).read_text(encoding="utf-8")
-            model_to_code_revision = next(exchange_root.rglob("model-to-code-revision.md")).read_text(encoding="utf-8")
-            self.assertIn("题目", model_to_code)
-            self.assertIn("建模", model_to_code)
-            self.assertIn("modeling_report.md", model_to_code)
-            self.assertIn("problem.pdf", model_to_code)
-            self.assertNotIn("route 0", model_to_code)
-            self.assertIn("产生的文件/图片", code_to_model)
-            self.assertIn("结果", code_to_model)
-            self.assertIn("请修改", model_to_code_revision)
-            self.assertNotIn("原始题面 PDF", code_to_model)
-            self.assertNotIn("原始题面 PDF", model_to_code_revision)
+            with self.assertRaises(ValueError):
+                service.solve(
+                    SolveProblemTask(task_id="q1", title="Q", problem="P"),
+                    SolveProblemContext(readonly_files=(reference,), metadata={"run_id": str(run_id)}),
+                )
 
     def test_probe_ledger_is_written_for_each_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -583,14 +625,18 @@ class SolveProblemHarnessTest(unittest.TestCase):
                 SolveProblemContext(metadata={"run_id": str(run_id)}),
             )
             self.assertEqual(result.status, SolveProblemStatus.COMPLETED)
+            self.assertIsNone(result.iterations[0].modeling_report)
+            self.assertIsNotNone(result.iterations[1].modeling_report)
             self.assertGreaterEqual(len(result.archive_files), 7)
             exchange_root = root / "reports" / "runs" / str(run_id) / "tasks" / "q1" / "attempt-1" / "exchanges"
             expected = {
-                "modeling_report.md", "coding_report.md",
+                "preliminary_modeling_report.md", "modeling_report.md", "coding_report.md",
                 "review_report.md", "revision_instructions.md",
             }
             names = {path.name for path in exchange_root.rglob("*.md")}
             self.assertTrue(expected.issubset(names), names)
+            self.assertFalse((exchange_root / "iteration-1" / "modeling" / "modeling_report.md").exists())
+            self.assertTrue((exchange_root / "iteration-2" / "modeling" / "modeling_report.md").exists())
             self.assertGreaterEqual(len(list(exchange_root.rglob("*.md"))), 7)
             model_to_code = next(exchange_root.rglob("model-to-code.md"))
             code_to_model = next(exchange_root.rglob("code-to-model.md"))
@@ -601,7 +647,7 @@ class SolveProblemHarnessTest(unittest.TestCase):
             self.assertIn("结果", code_to_model.read_text(encoding="utf-8"))
             model_to_code_text = model_to_code.read_text(encoding="utf-8")
             code_to_model_text = code_to_model.read_text(encoding="utf-8")
-            self.assertNotIn("preliminary", model_to_code_text.lower())
+            self.assertIn("preliminary_modeling_report.md", model_to_code_text)
             model_to_code_revision = next(exchange_root.rglob("model-to-code-revision.md")).read_text(encoding="utf-8")
             self.assertIn("建模", model_to_code_text)
             self.assertIn("产生的文件/图片", code_to_model_text)
@@ -826,24 +872,25 @@ class SolveProblemHarnessTest(unittest.TestCase):
                 metadata={"run_id": "run-a", "run_name": "traceable-run", "task_attempt": 1},
                 readonly_files=(
                     ReadOnlyFileReference(
-                        relative_path="reports/runs/run-a/tasks/q1/attempt-1/exchanges/iteration-1/modeling/modeling_report.md",
-                        purpose="model", role=ReadOnlyFileRole.REFERENCE, media_type="text/markdown",
+                        relative_path="reports/runs/run-a/tasks/q1/attempt-1/exchanges/iteration-1/modeling/preliminary_modeling_report.md",
+                        purpose="preliminary model", role=ReadOnlyFileRole.REFERENCE, media_type="text/markdown",
                     ),
                     ReadOnlyFileReference(
-                        relative_path="inputs/problem.pdf",
-                        purpose="problem", role=ReadOnlyFileRole.PROBLEM, media_type="application/pdf",
+                        relative_path="inputs/scoped-context/q1.md",
+                        purpose="delegated scoped problem context", role=ReadOnlyFileRole.PROBLEM, media_type="text/markdown",
                     ),
                 ),
             )
-            modeling = UnifiedModelingReport(
-                report=_report("model"), selected_branch_ids=("route-0",), main_scheme="scheme",
+            modeling = PreliminaryModelingReport(
+                branch_id="route-0", report=_report("model"), candidate_scheme="scheme",
                 required_validations=("sanity",), expected_outputs=("result",),
             )
             proposal = provider.propose(task, context, modeling, iteration=1)
             prompt = client.tool_prompt
             self.assertIn("Code Agent 任务信封", prompt)
             self.assertIn("modeling_report.md", prompt)
-            self.assertIn("inputs/problem.pdf", prompt)
+            self.assertIn("inputs/scoped-context/q1.md", prompt)
+            self.assertNotIn(".pdf", prompt)
             self.assertIn("timeout_seconds", prompt)
             self.assertNotIn('"task_contract"', prompt)
             self.assertNotIn("Skill: modeling-core", prompt)
@@ -947,13 +994,13 @@ class SolveProblemHarnessTest(unittest.TestCase):
             self.assertEqual(result["output"]["matches"][0]["path"], "sample.py")
             todo = bridge.execute("todo_read", {}, task_id="q1", iteration=1, turn=1)
             self.assertTrue(todo["ok"])
-            self.assertEqual(len(todo["output"]["todos"]), 5)
-            wrong_todo = bridge.execute(
-                "todo_write", {"todos": [{"content": "反复穷举 DP 状态", "status": "in_progress"}]},
+            self.assertEqual(todo["output"]["todos"], [])
+            written_todo = bridge.execute(
+                "todo_write", {"todos": [{"content": "先确定可行的 DP 状态", "status": "in_progress"}]},
                 task_id="q1", iteration=1, turn=1,
             )
-            self.assertFalse(wrong_todo["ok"])
-            self.assertEqual(wrong_todo["error_code"], "todo_plan_locked")
+            self.assertTrue(written_todo["ok"])
+            self.assertEqual(written_todo["output"]["items"][0]["content"], "先确定可行的 DP 状态")
             execution_before_source = bridge.execute(
                 "python_execute", {"code": "print(1)", "timeout_seconds": 10}, task_id="q1", iteration=1, turn=1,
             )

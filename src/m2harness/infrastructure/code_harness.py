@@ -23,15 +23,16 @@ from typing import Protocol
 from m2harness.domain.code import CodeProposal
 from m2harness.domain.solve_problem import (
     CodingHarnessReport, ReadOnlyFileReference, ReadOnlyFileRole,
-    SolveProblemContext, SolveProblemTask, UnifiedModelingReport,
+    SolveProblemContext, SolveProblemTask,
 )
+from m2harness.application.solve_problem import ModelingContract
 from m2harness.human_control import HumanControlStore, HumanInterruptRequested
 from m2harness.infrastructure.local_sandbox import LocalSandboxClient
 from m2harness.models import ArtifactKind, ProducedArtifact, ReportPayload
 
 
 class CodeProposalProvider(Protocol):
-    def propose(self, task: SolveProblemTask, context: SolveProblemContext, modeling: UnifiedModelingReport, *, iteration: int) -> CodeProposal: ...
+    def propose(self, task: SolveProblemTask, context: SolveProblemContext, modeling: ModelingContract, *, iteration: int) -> CodeProposal: ...
 
 
 def _validate_python_policy(source: str) -> None:
@@ -66,7 +67,7 @@ class LocalPythonCodeHarness:
         self.max_output_bytes = max_output_bytes
         self.human_control = human_control
 
-    def execute(self, task: SolveProblemTask, context: SolveProblemContext, modeling: UnifiedModelingReport, *, iteration: int) -> CodingHarnessReport:
+    def execute(self, task: SolveProblemTask, context: SolveProblemContext, modeling: ModelingContract, *, iteration: int) -> CodingHarnessReport:
         try:
             proposal = self.provider.propose(task, context, modeling, iteration=iteration)
             _validate_python_policy(proposal.source)

@@ -37,8 +37,10 @@ def build_code_agent_task_prompt(
     """Build the readable Code Agent task envelope.
 
     The Code Agent receives a progressive-disclosure index, not a second copy
-    of the model.  The accepted details live in ``modeling_report.md`` and the
-    original problem remains available as a read-only PDF.  Keeping this
+    of the model.  The initial details live in
+    ``preliminary_modeling_report.md``; the final ``modeling_report.md`` is
+    created only after review. The complete source PDF/Markdown is never
+    exposed at this boundary. Keeping this
     function Markdown also makes the exact provider prompt easy to audit.
     """
 
@@ -52,16 +54,21 @@ def build_code_agent_task_prompt(
     repair_paths = [path for path in exchange_paths if path.endswith("model-to-code-revision.md")]
     initial_paths = [path for path in exchange_paths if path.endswith("model-to-code.md")]
     latest_code_reports = [path for path in exchange_paths if path.endswith("code-to-model.md")]
+    preliminary_paths = [path for path in available_paths if path.endswith("/modeling/preliminary_modeling_report.md")]
     modeling_paths = [path for path in available_paths if path.endswith("/modeling/modeling_report.md")]
     problem_paths: list[str] = []
     for item in getattr(context, "readonly_files", ()):
         path = getattr(item, "relative_path", "")
         role = getattr(getattr(item, "role", None), "value", getattr(item, "role", ""))
-        if role == "problem" or path.lower().endswith((".pdf", ".png", ".jpg", ".jpeg")):
+        if role == "problem" and not path.lower().endswith((".pdf", ".png", ".jpg", ".jpeg")):
             problem_paths.append(path)
     output_dir = output_relative or target_relative.rsplit("/", 1)[0] + "/outputs"
     initial_reference = initial_paths[-1] if initial_paths else "首轮 model-to-code.md（按白名单路径读取）"
-    modeling_reference = modeling_paths[-1] if modeling_paths else "同一题目的 modeling_report.md（按白名单路径读取）"
+    modeling_reference = (
+        modeling_paths[-1] if modeling_paths
+        else preliminary_paths[-1] if preliminary_paths
+        else "当前题目的 preliminary_modeling_report.md（按白名单路径读取）"
+    )
     phase = "首轮实现" if iteration == 1 else "Code 返修"
     lines = [
         "# Code Agent 任务信封", "",
@@ -72,12 +79,12 @@ def build_code_agent_task_prompt(
         "",
         "## 唯一来源（先读）", "",
         f"- Model→Code 交接：`{initial_reference if iteration == 1 else (repair_paths[-1] if repair_paths else initial_reference)}`",
-        f"- 统一建模报告：`{modeling_reference}`",
+        f"- 当前建模契约：`{modeling_reference}`",
     ]
     if problem_paths:
-        lines.extend(["- 原始题面（只读 PDF/图片）：", *(f"  - `{path}`" for path in dict.fromkeys(problem_paths))])
+        lines.extend(["- Main Harness 委派的题面上下文（只读 Markdown）：", *(f"  - `{path}`" for path in dict.fromkeys(problem_paths))])
     else:
-        lines.append("- 原始题面：当前白名单没有 PDF/图片；不得自行假设题面参数。")
+        lines.append("- 当前白名单没有 delegated Markdown 题面上下文；不得自行假设题面参数。")
     if latest_code_reports:
         lines.append(f"- 最近一次 Code→Model 报告：`{latest_code_reports[-1]}`")
     lines.extend([
@@ -86,8 +93,8 @@ def build_code_agent_task_prompt(
         "1. 用 workspace 工具读取上面的来源文件；它们是内容唯一来源，不能用 prompt 中的猜测替代。",
         f"2. 首轮必须先将完整、确定性的 Python 源文件写入：`{target_relative}`；源文件写入前不得执行 python_execute 或 validation_run。",
         f"3. 输出目录：将运行产生的文件和图片只写入 `{output_dir}`",
-        "4. 源文件写入后，按建模报告中的验证 ID 执行并留下可复核证据；脚本 stdout 只写简短中文结果，详细机器字段放在 outputs/result.json。",
-        "5. TODO 由 Harness 预置，表示实现生命周期；只能更新既有条目的 status，不得改写、删除或增加任务。",
+        "4. 源文件写入后，按当前建模契约中的验证要求执行并留下可复核证据；脚本 stdout 只写简短中文结果，详细机器字段放在 outputs/result.json。",
+        "5. 如需 TODO，由 Code Agent 自己根据当前实现策略创建和维护；它只描述本轮实现，不得修改 Main Harness 的 DAG 或工作流。",
         "",
         "## 返回要求", "",
         "只返回一个 CodeProposal 交接对象：`logical_name`、`source_path`、`expected_validations`、`timeout_seconds`。",

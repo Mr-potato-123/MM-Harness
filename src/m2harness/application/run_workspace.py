@@ -88,6 +88,12 @@ class RunWorkspace:
         return self.root / ".m2harness" / "checkpoints"
 
     @property
+    def internal_root(self) -> Path:
+        """Run-internal ingestion data; never mounted as the Agent workspace."""
+
+        return self.root / ".m2harness" / "internal"
+
+    @property
     def manifest_path(self) -> Path:
         return self.root / ".m2harness" / "run.json"
 
@@ -105,6 +111,7 @@ class RunWorkspace:
         workspace.workspace_root.mkdir(parents=True, exist_ok=False)
         workspace.artifact_root.mkdir(parents=True, exist_ok=True)
         workspace.checkpoint_root.mkdir(parents=True, exist_ok=True)
+        workspace.internal_root.mkdir(parents=True, exist_ok=True)
         workspace.write_manifest(status="created")
         return workspace
 
@@ -127,6 +134,7 @@ class RunWorkspace:
                 "artifacts": ".m2harness/artifacts",
                 "database": ".m2harness/state.db",
                 "checkpoints": ".m2harness/checkpoints",
+                "internal": ".m2harness/internal (not exposed to agents)",
             },
             **extra,
         }

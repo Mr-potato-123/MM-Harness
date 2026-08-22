@@ -202,18 +202,21 @@ class RunReportStore:
         for snapshot in report.iterations:
             model_dir = base / "modeling" / f"iteration-{snapshot.iteration}"
             canonical_model = base / "exchanges" / f"iteration-{snapshot.iteration}" / "modeling" / "modeling_report.md"
-            records.append(self._write(
-                model_dir / "modeling_report.md",
-                _pointer_or_fallback(
-                    self.workspace_root,
-                    canonical_model,
-                    title="统一建模报告索引",
-                    fallback=snapshot.modeling_report.report.markdown,
-                ),
-                purpose=f"题目 {report.task_id} 第 {snapshot.iteration} 轮统一建模报告正文索引。",
-                role=ReadOnlyFileRole.REFERENCE, task_id=report.task_id,
-                attempt=attempt, iteration=snapshot.iteration, media_type="text/markdown",
-            ))
+            # Initial/revision snapshots intentionally have no unified report.
+            # Create this index only after review has triggered unification.
+            if snapshot.modeling_report is not None:
+                records.append(self._write(
+                    model_dir / "modeling_report.md",
+                    _pointer_or_fallback(
+                        self.workspace_root,
+                        canonical_model,
+                        title="统一建模报告索引",
+                        fallback=snapshot.modeling_report.report.markdown,
+                    ),
+                    purpose=f"题目 {report.task_id} 第 {snapshot.iteration} 轮统一建模报告正文索引。",
+                    role=ReadOnlyFileRole.REFERENCE, task_id=report.task_id,
+                    attempt=attempt, iteration=snapshot.iteration, media_type="text/markdown",
+                ))
             coding_dir = base / "coding" / f"run-{snapshot.iteration:03d}"
             # The canonical Code→Model report lives in the exchange handoff
             # written by solve_problem.  Keep this legacy index tiny so old

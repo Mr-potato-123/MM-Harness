@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import importlib.util
 import json
 import mimetypes
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -27,8 +27,7 @@ from m2harness.infrastructure.db.tool_runs import SQLiteToolAuditStore
 from m2harness.infrastructure.db.sqlite_artifacts import SQLiteArtifactRegistry
 from m2harness.domain.dag import canonical_single_question_dag
 from m2harness.domain.dag import canonical_main_harness_dag
-from m2harness.domain.media import MultimodalInput
-from m2harness.domain.solve_problem import ReadOnlyFileReference, ReadOnlyFileRole, SolveProblemContext
+from m2harness.domain.solve_problem import DisclosedTextFile, ReadOnlyFileReference, ReadOnlyFileRole, SolveProblemContext
 from m2harness.domain.capability import CapabilityRequirement
 from m2harness.domain.tool import ToolCall
 from m2harness.human_control import HumanControlStore
@@ -85,6 +84,60 @@ def _read_input_file(path: Path) -> bytes:
     if len(data) != size:
         raise OSError(f"input file changed while reading: {path}")
     return data
+
+
+def _pdf_to_markdown(data: bytes, *, logical_name: str) -> str:
+    """Convert the complete source PDF to internal Markdown once per run."""
+
+    try:
+        try:
+            import pymupdf as fitz
+        except ImportError:
+            import fitz  # type: ignore[no-redef]
+        document = fitz.open(stream=data, filetype="pdf")
+        try:
+            pages: list[str] = []
+            for number, page in enumerate(document, start=1):
+                text = str(page.get_text("text") or "").replace("\r\n", "\n").strip()
+                pages.append(f"## PDF 第 {number} 页\n\n{text}" if text else f"## PDF 第 {number} 页\n\n（本页无可提取文本）")
+            return "\n\n".join([
+                f"# 原始题面：{logical_name}",
+                "",
+                "本文件是 Harness 在内部摄取阶段生成的完整文本镜像；不得直接注入任何 Agent。",
+                "",
+                *pages,
+            ]).strip() + "\n"
+        finally:
+            document.close()
+    except Exception as exc:
+        raise RuntimeError("PDF ingestion failed; refusing to expose an incomplete problem context") from exc
+
+
+def _question_contexts(full_markdown: str, *, question_count: int) -> dict[str, str]:
+    """Build hierarchical question slices without exposing the full source."""
+
+    matches = list(re.finditer(r"(?m)^\s*任务\s*([1-4])\s*[：:]", full_markdown))
+    if not matches:
+        raise RuntimeError("PDF ingestion found no numbered 任务 sections; refusing to delegate the unsliced full Markdown")
+    intro = full_markdown[:matches[0].start()].strip()
+    sections: dict[int, str] = {}
+    for index, match in enumerate(matches):
+        number = int(match.group(1))
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(full_markdown)
+        sections[number] = full_markdown[match.start():end].strip()
+    result: dict[str, str] = {}
+    for number in range(1, question_count + 1):
+        if number not in sections:
+            raise RuntimeError(f"PDF ingestion did not find context for 任务{number}")
+        inherited = [sections[item] for item in range(1, number + 1) if item in sections]
+        result[f"q{number}"] = "\n\n".join([
+            "# 当前 solve 的题面上下文",
+            "",
+            intro,
+            *inherited,
+            f"\nSCOPE LOCK：本上下文只授权 q{number}；不得实现后续任务。",
+        ]).strip() + "\n"
+    return result
 
 
 def _settings(args: argparse.Namespace) -> HarnessSettings:
@@ -286,11 +339,6 @@ def main(argv: list[str] | None = None) -> int:
         media_type = mimetypes.guess_type(args.input.name)[0] or "application/octet-stream"
         if media_type == "application/pdf" and len(data) > 150 * 1024 * 1024:
             raise ValueError("Qwen PDF input exceeds the 150MB provider limit")
-        multimodal = MultimodalInput(
-            logical_name=args.input.name, media_type=media_type,
-            data_base64=base64.b64encode(data).decode("ascii"),
-            sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
-        )
         runtime = build_local_runtime(
             database_path=run_workspace.database_path,
             artifact_root=run_workspace.artifact_root,
@@ -300,9 +348,17 @@ def main(argv: list[str] | None = None) -> int:
         if not runtime.sandbox.available:
             raise RuntimeError("local_execution_disabled: run-main-qwen requires the trusted host or Docker/VM sandbox")
         staged_name = Path(args.input.name).name
-        staged_path = runtime.tool_environment.resolve_workspace(Path("inputs") / staged_name)
-        staged_path.parent.mkdir(parents=True, exist_ok=True)
-        staged_path.write_bytes(data)
+        # Keep the original bytes and the complete Markdown ingestion mirror
+        # outside the agent workspace. Only question-scoped slices are staged
+        # below workspace/inputs/scoped-context and added to a solve context.
+        internal_source = run_workspace.internal_root / "source" / staged_name
+        internal_source.parent.mkdir(parents=True, exist_ok=True)
+        internal_source.write_bytes(data)
+        full_problem_markdown = _pdf_to_markdown(data, logical_name=staged_name)
+        internal_markdown = run_workspace.internal_root / "ingest" / f"{Path(staged_name).stem}.md"
+        internal_markdown.parent.mkdir(parents=True, exist_ok=True)
+        internal_markdown.write_text(full_problem_markdown, encoding="utf-8")
+        question_contexts = _question_contexts(full_problem_markdown, question_count=args.question_count)
         client = QwenChatClient(
             base_url=os.environ.get("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
             model=model_name,
@@ -324,36 +380,56 @@ def main(argv: list[str] | None = None) -> int:
         )
         runtime = runtime.attach_solve_problem_service(service)
         scope_prompt = (
-            f"{args.problem}\n\nThe Main Harness owns a serial TODO list of {args.question_count} numbered questions. "
-            "Each solve_problem call must analyze exactly its own question scope and must not solve, summarize, "
-            "formulate, code, validate, or report results for later questions. Previous-question results arrive "
-            "only through the compressed dependency context."
+            f"{args.problem}\n\nThe Main Harness owns {args.question_count} serial scoped solve tasks. "
+            "Each solve_problem call receives only its delegated question context; the complete ingested Markdown "
+            "is internal and must never be disclosed."
         )
         base_context = SolveProblemContext(
-            multimodal_inputs=(multimodal,),
-            readonly_files=(ReadOnlyFileReference(
-                relative_path=str((Path("inputs") / staged_name).as_posix()),
-                purpose="Original problem statement or source file selected by the user; read-only input for this solve.",
-                role=ReadOnlyFileRole.PROBLEM, media_type=media_type,
-                sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
-            ),),
+            multimodal_inputs=(), readonly_files=(), disclosed_text_files=(),
             metadata={
                 "run_id": str(run_identity.run_id),
                 "run_name": run_identity.run_name,
                 "run_path_key": runtime.main_harness.report_store.run_path_key(run_identity.run_id),
-                "staged_input_relative_path": str(Path("inputs") / staged_name),
                 "scope": args.scope,
             },
         )
+        def context_for_task(task_id: str, _state: object) -> SolveProblemContext:
+            scoped = question_contexts.get(task_id)
+            if scoped is None:
+                raise RuntimeError(f"no delegated context prepared for {task_id}")
+            scoped_path = runtime.tool_environment.resolve_workspace(Path("inputs") / "scoped-context" / f"{task_id}.md")
+            scoped_path.parent.mkdir(parents=True, exist_ok=True)
+            scoped_path.write_text(scoped, encoding="utf-8")
+            scoped_bytes = scoped.encode("utf-8")
+            relative = scoped_path.relative_to(runtime.tool_environment.workspace_root).as_posix()
+            reference = ReadOnlyFileReference(
+                relative_path=relative,
+                purpose=f"Main Harness delegated context for {task_id}; not the complete source Markdown.",
+                role=ReadOnlyFileRole.PROBLEM, owner_task_id=task_id,
+                media_type="text/markdown", sha256=hashlib.sha256(scoped_bytes).hexdigest(), size_bytes=len(scoped_bytes),
+            )
+            disclosed = DisclosedTextFile(
+                relative_path=relative, purpose=reference.purpose,
+                content=scoped, sha256=reference.sha256 or hashlib.sha256(scoped_bytes).hexdigest(), truncated=False,
+            )
+            return base_context.model_copy(update={
+                "readonly_files": (reference,), "disclosed_text_files": (disclosed,),
+                "metadata": {**base_context.metadata, "delegated_context_path": relative, "delegated_context_scope": task_id},
+            })
         from m2harness.application.langgraph_main_harness import LangGraphMainHarness
         graph_runner = LangGraphMainHarness(
             runtime.main_harness,
             checkpoint_path=run_workspace.checkpoint_root / "main-harness.sqlite",
-            context_for_task=lambda _task_id, _state: base_context,
+            context_for_task=context_for_task,
         )
         state = graph_runner.run(
             scope_prompt,
-            canonical_main_harness_dag(scope=args.scope, task_problem=scope_prompt, question_count=args.question_count),
+            canonical_main_harness_dag(
+                scope=args.scope,
+                task_problem=scope_prompt,
+                task_problems=question_contexts,
+                question_count=args.question_count,
+            ),
             composer=QwenPaperComposer(client, skills=runtime.skills),
             max_iterations=args.max_iterations,
             run_id=run_identity.run_id,
@@ -401,7 +477,6 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(payload, dict) or not isinstance(payload.get("modeling"), dict) or not isinstance(payload.get("preliminary"), list):
             raise ValueError("resume payload must contain modeling and preliminary objects")
         data = _read_input_file(args.input)
-        media_type = mimetypes.guess_type(args.input.name)[0] or "application/octet-stream"
         run_root = args.run_root.resolve()
         runtime = build_local_runtime(
             workspace_root=run_root / ".m2harness" / "workspace",
@@ -412,9 +487,30 @@ def main(argv: list[str] | None = None) -> int:
         if not runtime.sandbox.available:
             raise RuntimeError("local_execution_disabled: resume-main-qwen requires the trusted local host sandbox")
         staged_name = Path(args.input.name).name
-        staged_path = runtime.tool_environment.resolve_workspace(Path("inputs") / staged_name)
-        staged_path.parent.mkdir(parents=True, exist_ok=True)
-        staged_path.write_bytes(data)
+        full_problem_markdown = _pdf_to_markdown(data, logical_name=staged_name)
+        internal_root = run_root / ".m2harness" / "internal"
+        (internal_root / "source").mkdir(parents=True, exist_ok=True)
+        (internal_root / "ingest").mkdir(parents=True, exist_ok=True)
+        (internal_root / "source" / staged_name).write_bytes(data)
+        (internal_root / "ingest" / f"{Path(staged_name).stem}.md").write_text(full_problem_markdown, encoding="utf-8")
+        question_contexts = _question_contexts(full_problem_markdown, question_count=4)
+        scoped_references: dict[str, ReadOnlyFileReference] = {}
+        scoped_disclosures: dict[str, DisclosedTextFile] = {}
+        for task_id, scoped in question_contexts.items():
+            scoped_path = runtime.tool_environment.resolve_workspace(Path("inputs") / "scoped-context" / f"{task_id}.md")
+            scoped_path.parent.mkdir(parents=True, exist_ok=True)
+            scoped_path.write_text(scoped, encoding="utf-8")
+            scoped_bytes = scoped.encode("utf-8")
+            relative = scoped_path.relative_to(runtime.tool_environment.workspace_root).as_posix()
+            digest = hashlib.sha256(scoped_bytes).hexdigest()
+            purpose = f"Main Harness delegated context for {task_id}; not the complete source Markdown."
+            scoped_references[task_id] = ReadOnlyFileReference(
+                relative_path=relative, purpose=purpose, role=ReadOnlyFileRole.PROBLEM,
+                owner_task_id=task_id, media_type="text/markdown", sha256=digest, size_bytes=len(scoped_bytes),
+            )
+            scoped_disclosures[task_id] = DisclosedTextFile(
+                relative_path=relative, purpose=purpose, content=scoped, sha256=digest, truncated=False,
+            )
         client = QwenChatClient(
             base_url=os.environ.get("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
             model=args.model or os.environ.get("QWEN_MODEL", "qwen3.8-max"),
@@ -449,12 +545,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         readonly: list[ReadOnlyFileReference] = []
-        original_ref = ReadOnlyFileReference(
-            relative_path=f"inputs/{staged_name}", purpose="原始题目输入；恢复流程只读使用。",
-            role=ReadOnlyFileRole.PROBLEM, media_type=media_type,
-            sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
-        )
-        readonly.append(original_ref)
+        readonly.append(scoped_references["q1"])
         for relative_path, role, purpose in (
             (f"{q1_prefix}/iteration-1/modeling/modeling_report.md", ReadOnlyFileRole.REFERENCE, "上一轮已接受的完整建模报告。"),
             (f"{q1_prefix}/iteration-1/review/review_report.md", ReadOnlyFileRole.REFERENCE, "上一轮 Review 决定与理由。"),
@@ -466,17 +557,13 @@ def main(argv: list[str] | None = None) -> int:
             reference = resume_reference(relative_path, role, purpose)
             if reference is not None:
                 readonly.append(reference)
-        multimodal = MultimodalInput(
-            logical_name=staged_name, media_type=media_type,
-            data_base64=base64.b64encode(data).decode("ascii"),
-            sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
-        )
         scope_prompt = (
             f"{args.problem}\n\nMain Harness 维护 q1→q2→q3→q4 串行 TODO。"
             "当前只恢复 q1 第 2 轮 Code 阶段；不得重新建模，不得处理后续问题。"
         )
         resume_context = SolveProblemContext(
-            multimodal_inputs=(multimodal,), readonly_files=tuple(readonly),
+            multimodal_inputs=(), readonly_files=tuple(readonly),
+            disclosed_text_files=(scoped_disclosures["q1"],),
             instructions=("Review 已接受建模，仅执行 code 返修；完成后交给 Review 验收。",),
             metadata={
                 "scope": "question-1", "resume_iteration": args.resume_iteration,
@@ -484,19 +571,27 @@ def main(argv: list[str] | None = None) -> int:
                 "resume_revision_target": payload.get("revision_target", "code"),
             },
         )
-        normal_context = resume_context.model_copy(update={
-            "metadata": {"scope": "question-1"},
-            "instructions": (),
-        })
+        def context_for_resume_task(task_id: str, _state: object) -> SolveProblemContext:
+            if task_id == "q1":
+                return resume_context
+            scoped_reference = scoped_references[task_id]
+            return SolveProblemContext(
+                readonly_files=(scoped_reference,),
+                disclosed_text_files=(scoped_disclosures[task_id],),
+                metadata={"scope": f"question-{task_id.removeprefix('q')}"},
+            )
         from m2harness.application.langgraph_main_harness import LangGraphMainHarness
         graph_runner = LangGraphMainHarness(
             runtime.main_harness,
             checkpoint_path=runtime.tool_environment.workspace_root.parent / "main-harness-checkpoints.sqlite",
-            context_for_task=lambda task_id, _state: resume_context if task_id == "q1" else normal_context,
+            context_for_task=context_for_resume_task,
         )
         state = graph_runner.run(
             scope_prompt,
-            canonical_main_harness_dag(scope="question-1", task_problem=scope_prompt, question_count=4),
+            canonical_main_harness_dag(
+                scope="question-1", task_problem=scope_prompt,
+                task_problems=question_contexts, question_count=4,
+            ),
             composer=QwenPaperComposer(client, skills=runtime.skills),
             max_iterations=args.max_iterations,
         )
