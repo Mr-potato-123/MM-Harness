@@ -423,7 +423,14 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                         "call_count": call_count,
                     }
                 last_source_hash = source_hash
-                rewrite_required = bool(timeout_seconds is not None and result.timed_out)
+                # Any non-zero execution result, including an operator-observed
+                # resource stop, is a source-level failure.  Require a
+                # materially changed source before the agent can blindly rerun
+                # it; otherwise a long-running bad algorithm can repeat forever
+                # without giving the Model/Code loop a chance to repair it.
+                rewrite_required = bool(result.exit_code not in (0, None) or result.timed_out)
+                if not payload["ok"]:
+                    payload["next_action"] = "call write_code_source with a materially simpler algorithm, then run python_execute"
                 return json.dumps(payload, ensure_ascii=False)
             except Exception as exc:
                 return json.dumps({

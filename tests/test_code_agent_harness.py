@@ -87,6 +87,24 @@ class CodeAgentHarnessContractTest(unittest.TestCase):
             self.assertFalse(second["ok"])
             self.assertIn("rewrite the target source", second["error"])
 
+    def test_nonzero_execution_requires_source_change_before_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / ".m2harness-code" / "q1" / "iteration-1" / "solve_q1.py"
+            target.parent.mkdir(parents=True)
+            target.write_text("print(1)\n", encoding="utf-8")
+            tool = self._provider(root)._python_execute_tool(
+                ".m2harness-code/q1/iteration-1/solve_q1.py"
+            )
+
+            first = json.loads(tool.invoke({"code": "raise SystemExit(3)"}))
+            self.assertFalse(first["ok"])
+            self.assertFalse(first["timed_out"])
+            self.assertIn("materially simpler", first["next_action"])
+            second = json.loads(tool.invoke({"code": "print(1)"}))
+            self.assertFalse(second["ok"])
+            self.assertIn("rewrite the target source", second["error"])
+
     def test_structured_handoff_accepts_json_validation_array(self) -> None:
         handoff = CodeAgentHandoff.model_validate({
             "source_path": ".m2harness-code/q1/iteration-1/solve_q1.py",
