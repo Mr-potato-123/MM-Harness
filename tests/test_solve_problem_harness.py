@@ -28,7 +28,7 @@ from m2harness import (
     canonical_main_harness_dag,
 )
 from m2harness.models import ArtifactKind, ProducedArtifact, ReportPayload
-from m2harness.application.knowledge import HMMLKnowledgeBase
+from m2harness.application.knowledge import HMMLKnowledgeBase, default_hmml_path
 from m2harness.application.research import DeepResearchService
 from m2harness.domain.knowledge import KnowledgeQuery
 from m2harness.domain.code import CodeProposal
@@ -95,7 +95,7 @@ class FakeCodeProposalProvider:
         self.source = source
 
     def propose(self, task, context, modeling, *, iteration):
-        return CodeProposal(source=self.source, expected_validations=modeling.required_validations)
+        return CodeProposal(source=self.source, timeout_seconds=60, expected_validations=modeling.required_validations)
 
 
 class FakeQwenClient:
@@ -114,7 +114,7 @@ class FakeQwenClient:
         if "decision" in properties:
             return {"decision": "approve", "rationale": "evidence", "accepted_claims": ["result"]}
         if "python_source" in properties or "source" in properties and "logical_name" in properties:
-            return {"source": "import json; print(json.dumps({'validations': {'sanity': True}}))", "logical_name": "generated_solution.py"}
+            return {"source": "import json; print(json.dumps({'validations': {'sanity': True}}))", "logical_name": "generated_solution.py", "timeout_seconds": 60}
         return _report("final").model_dump(mode="json")
 
 
@@ -141,6 +141,22 @@ class SolveProblemHarnessTest(unittest.TestCase):
         self.assertEqual(model.explorations, [3])
         self.assertEqual(len(result.iterations[0].preliminary_reports), 3)
         self.assertEqual(result.iterations[0].review.decision, ModelReviewDecision.REVISE)
+
+    def test_main_context_is_a_projection_not_a_transcript_ledger(self) -> None:
+        task = SolveProblemTask(task_id="q1", title="Question", problem="solve this")
+        context = SolveProblemContext(metadata={
+            "run_id": str(uuid4()),
+            "run_name": "traceable-run",
+            "task_attempt": 1,
+            "model_conversation": [{"message": "old model transcript"}],
+            "code_conversation": [{"message": "old code transcript"}],
+        })
+        projection = SolveProblemService._prepare_context(context, task)
+        self.assertNotIn("model_conversation", projection.metadata)
+        self.assertNotIn("code_conversation", projection.metadata)
+        self.assertEqual(projection.metadata["context_owner"], "main-harness")
+        self.assertIn("context_session_id", projection.metadata)
+        self.assertIn("typed projection", projection.metadata["context_model"])
 
     def test_code_to_model_repair_forces_code_without_reexploration(self) -> None:
         class OverstrictModel(FakeModelAgent):
@@ -177,6 +193,36 @@ class SolveProblemHarnessTest(unittest.TestCase):
             self.assertEqual(next_state.tasks[0].status.value, "completed")
             self.assertEqual(bundle.main_harness.ready_tasks(next_state), ("publish-paper",))
             self.assertEqual(next_state.reports[0].status, SolveProblemStatus.COMPLETED)
+
+    def test_main_harness_dispatch_strips_transcript_metadata_before_solve(self) -> None:
+        class CaptureModel(FakeModelAgent):
+            def __init__(self):
+                super().__init__()
+                self.context = None
+
+            def explore(self, task, context, *, branch_count, iteration):
+                self.context = context
+                return super().explore(task, context, branch_count=branch_count, iteration=iteration)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            model = CaptureModel()
+            bundle = build_local_runtime(
+                workspace_root=root / "workspace", artifact_root=root / "artifacts",
+                database_path=root / "runtime.db", solve_problem_service=SolveProblemService(model, FakeCodeHarness(), max_iterations=1),
+            )
+            state = bundle.main_harness.start("solve", canonical_main_harness_dag())
+            supplied = SolveProblemContext(metadata={
+                "model_conversation": [{"message": "should not cross boundary"}],
+                "code_conversation": [{"message": "should not cross boundary"}],
+                "run_name": "main-run",
+            })
+            bundle.main_harness.dispatch(state, "q1", context=supplied, max_iterations=1)
+            assert model.context is not None
+            self.assertNotIn("model_conversation", model.context.metadata)
+            self.assertNotIn("code_conversation", model.context.metadata)
+            self.assertEqual(model.context.metadata["context_owner"], "main-harness")
+            self.assertTrue(model.context.metadata["context_session_id"].startswith("m2h-main-"))
 
     def test_main_harness_does_not_replay_internal_revision_as_outer_dispatch(self) -> None:
         model = FakeModelAgent()
@@ -322,7 +368,7 @@ class SolveProblemHarnessTest(unittest.TestCase):
             self.assertEqual(disclosed[0].relative_path, "problem.pdf")
             self.assertIn("原始 PDF", disclosed[0].content)
 
-    def test_pdf_is_auto_disclosed_and_embedded_in_each_detailed_handoff(self) -> None:
+    def test_pdf_is_auto_disclosed_while_agent_handoffs_stay_small(self) -> None:
         class PdfAwareModel(FakeModelAgent):
             def __init__(self):
                 super().__init__()
@@ -359,12 +405,13 @@ class SolveProblemHarnessTest(unittest.TestCase):
             model_to_code = next(exchange_root.rglob("model-to-code.md")).read_text(encoding="utf-8")
             code_to_model = next(exchange_root.rglob("code-to-model.md")).read_text(encoding="utf-8")
             model_to_code_revision = next(exchange_root.rglob("model-to-code-revision.md")).read_text(encoding="utf-8")
-            for text in (model_to_code, code_to_model, model_to_code_revision):
-                self.assertIn("原始题面 PDF", text)
-                self.assertIn("problem.pdf", text)
-            self.assertIn("本轮完整建模报告", model_to_code)
-            self.assertIn("本轮完整 Code Harness 报告", code_to_model)
-            self.assertIn("被审查的完整执行报告", model_to_code_revision)
+            self.assertIn("题目", model_to_code)
+            self.assertIn("建模", model_to_code)
+            self.assertIn("产生的文件/图片", code_to_model)
+            self.assertIn("结果", code_to_model)
+            self.assertIn("请修改", model_to_code_revision)
+            self.assertNotIn("原始题面 PDF", code_to_model)
+            self.assertNotIn("原始题面 PDF", model_to_code_revision)
 
     def test_probe_ledger_is_written_for_each_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -388,6 +435,12 @@ class SolveProblemHarnessTest(unittest.TestCase):
             self.assertIn("model_to_code_handoff", names)
             self.assertIn("code_to_model_handoff", names)
             self.assertIn("model_to_code_revision_handoff", names)
+            markers = [item for item in events if item["event"] == "context_marker"]
+            self.assertTrue(markers)
+            self.assertNotIn("message", markers[0]["details"])
+            projections = [item for item in events if item["event"] == "context_projection_updated"]
+            self.assertTrue(projections)
+            self.assertIn("path", projections[0]["details"])
 
     def test_probe_records_model_failure_reason(self) -> None:
         class FailingModel(FakeModelAgent):
@@ -541,14 +594,14 @@ class SolveProblemHarnessTest(unittest.TestCase):
             self.assertLess(model_to_code.stat().st_size, 12_000)
             self.assertLess(code_to_model.stat().st_size, 12_000)
             self.assertIn("输出", model_to_code.read_text(encoding="utf-8"))
-            self.assertIn("输出", code_to_model.read_text(encoding="utf-8"))
+            self.assertIn("产生的文件/图片", code_to_model.read_text(encoding="utf-8"))
+            self.assertIn("结果", code_to_model.read_text(encoding="utf-8"))
             model_to_code_text = model_to_code.read_text(encoding="utf-8")
             code_to_model_text = code_to_model.read_text(encoding="utf-8")
             model_to_code_revision = next(exchange_root.rglob("model-to-code-revision.md")).read_text(encoding="utf-8")
-            self.assertIn("转接理由", model_to_code_text)
-            self.assertIn("转接理由", code_to_model_text)
-            self.assertIn("转接理由", model_to_code_revision)
-            self.assertIn("返修上限", model_to_code_revision)
+            self.assertIn("建模", model_to_code_text)
+            self.assertIn("产生的文件/图片", code_to_model_text)
+            self.assertIn("请修改", model_to_code_revision)
             self.assertNotIn("execution_succeeded", code_to_model_text)
             self.assertNotIn("timed_out", code_to_model_text)
             persisted = RunReportStore(root).persist(run_id, result, attempt=1)
@@ -621,8 +674,9 @@ class SolveProblemHarnessTest(unittest.TestCase):
                 bundle.main_harness.dispatch(state, "q1", max_iterations=1)
 
     def test_reference_hmml_is_searchable_and_report_first(self) -> None:
-        hmml = Path(__file__).parents[1] / "ref_github" / "LLM-MM-Agent" / "MMAgent" / "HMML" / "HMML.json"
-        self.assertTrue(hmml.is_file())
+        hmml = default_hmml_path(Path(__file__).parents[1])
+        self.assertIsNotNone(hmml)
+        assert hmml is not None
         index = HMMLKnowledgeBase(hmml)
         result = index.search(KnowledgeQuery(query="linear programming resource allocation", top_k=3))
         self.assertGreater(result.source_count, 0)
@@ -630,7 +684,9 @@ class SolveProblemHarnessTest(unittest.TestCase):
         self.assertEqual(result.hits[0].entry.metadata["source_kind"], "hmml")
 
     def test_deep_research_is_local_by_default_and_enters_solve_context(self) -> None:
-        hmml = Path(__file__).parents[1] / "ref_github" / "LLM-MM-Agent" / "MMAgent" / "HMML" / "HMML.json"
+        hmml = default_hmml_path(Path(__file__).parents[1])
+        self.assertIsNotNone(hmml)
+        assert hmml is not None
         research = DeepResearchService(HMMLKnowledgeBase(hmml))
         model = FakeModelAgent()
         service = SolveProblemService(model, FakeCodeHarness(), max_iterations=1, research_agent=research)

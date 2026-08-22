@@ -45,8 +45,39 @@ class RunReportStore:
     def __init__(self, workspace_root: Path) -> None:
         self.workspace_root = workspace_root.resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
+        self._run_names: dict[str, str] = {}
         self._probe_locks: dict[str, threading.Lock] = {}
         self._probe_locks_guard = threading.Lock()
+
+    def register_run(self, run_id: UUID, run_name: str, *, metadata: Mapping[str, Any] | None = None) -> Path:
+        """Register a traceable name for one UUID run."""
+
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", run_name).strip(".-")[:180]
+        if not safe_name:
+            raise ValueError("run_name must contain at least one safe character")
+        key = str(run_id)
+        existing = self._run_names.get(key)
+        if existing is not None and existing != safe_name:
+            raise ValueError(f"run {key} is already registered as {existing}")
+        self._run_names[key] = safe_name
+        base = self._run_base(run_id)
+        payload = {
+            "schema_version": 1,
+            "run_id": key,
+            "run_name": safe_name,
+            "registered_at": datetime.now(timezone.utc).isoformat(),
+            "metadata": _probe_value(metadata or {}),
+        }
+        self._write(
+            base / "run.json", json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            purpose="Human-readable identity manifest for one isolated run.",
+            role=ReadOnlyFileRole.REFERENCE, task_id="run", attempt=1,
+            iteration=None, media_type="application/json",
+        )
+        return base
+
+    def _run_base(self, run_id: UUID) -> Path:
+        return Path("reports") / "runs" / self._run_names.get(str(run_id), str(run_id))
 
     def archive_markdown(
         self,
@@ -64,13 +95,13 @@ class RunReportStore:
         """Persist one live Agent exchange before the next stage is called."""
 
         if stage == "modeling":
-            relative = Path("reports") / "runs" / str(run_id) / "tasks" / task_id / f"attempt-{attempt}" / "exchanges" / f"iteration-{iteration}" / "modeling" / (self._safe_name(name) + ".md")
+            relative = self._run_base(run_id) / "tasks" / task_id / f"attempt-{attempt}" / "exchanges" / f"iteration-{iteration}" / "modeling" / (self._safe_name(name) + ".md")
         elif stage == "coding":
-            relative = Path("reports") / "runs" / str(run_id) / "tasks" / task_id / f"attempt-{attempt}" / "exchanges" / f"iteration-{iteration}" / "coding" / (self._safe_name(name) + ".md")
+            relative = self._run_base(run_id) / "tasks" / task_id / f"attempt-{attempt}" / "exchanges" / f"iteration-{iteration}" / "coding" / (self._safe_name(name) + ".md")
         elif stage == "review":
-            relative = Path("reports") / "runs" / str(run_id) / "tasks" / task_id / f"attempt-{attempt}" / "exchanges" / f"iteration-{iteration}" / "review" / (self._safe_name(name) + ".md")
+            relative = self._run_base(run_id) / "tasks" / task_id / f"attempt-{attempt}" / "exchanges" / f"iteration-{iteration}" / "review" / (self._safe_name(name) + ".md")
         elif stage == "handoff":
-            relative = Path("reports") / "runs" / str(run_id) / "tasks" / task_id / f"attempt-{attempt}" / "exchanges" / f"iteration-{iteration}" / "handoff" / (self._safe_name(name) + ".md")
+            relative = self._run_base(run_id) / "tasks" / task_id / f"attempt-{attempt}" / "exchanges" / f"iteration-{iteration}" / "handoff" / (self._safe_name(name) + ".md")
         else:
             raise ValueError(f"unknown solve_problem archive stage: {stage}")
         record = self._write(
@@ -101,8 +132,8 @@ class RunReportStore:
 
         if attempt < 1 or not event.strip() or not actor.strip() or not status.strip():
             raise ValueError("invalid solve probe identity")
-        run_key = str(run_id)
-        base = Path("reports") / "runs" / run_key
+        run_key = self._run_names.get(str(run_id), str(run_id))
+        base = self._run_base(run_id)
         ndjson = (base / "probe.ndjson").as_posix()
         markdown = (base / "probe.md").as_posix()
         payload = {
@@ -147,7 +178,7 @@ class RunReportStore:
             os.fsync(stream.fileno())
 
     def persist(self, run_id: UUID, report: SolveProblemReport, *, attempt: int) -> tuple[ReportFileRecord, ...]:
-        base = Path("reports") / "runs" / str(run_id) / "tasks" / report.task_id / f"attempt-{attempt}"
+        base = self._run_base(run_id) / "tasks" / report.task_id / f"attempt-{attempt}"
         records: list[ReportFileRecord] = []
         for snapshot in report.iterations:
             model_dir = base / "modeling" / f"iteration-{snapshot.iteration}"
@@ -263,7 +294,7 @@ class RunReportStore:
             role=ReadOnlyFileRole.DEPENDENCY_SOLUTION, task_id=report.task_id,
             attempt=attempt, iteration=report.iteration_count or None, media_type="text/markdown",
         ))
-        run_base = Path("reports") / "runs" / str(run_id)
+        run_base = self._run_base(run_id)
         for relative, media_type in ((run_base / "probe.md", "text/markdown"), (run_base / "probe.ndjson", "application/x-ndjson")):
             target = (self.workspace_root / relative).resolve()
             if target.is_file() and not target.is_symlink():
@@ -278,7 +309,7 @@ class RunReportStore:
         return tuple(records)
 
     def persist_publication(self, run_id: UUID, final_report: ReportPayload, final_latex: ProducedArtifact) -> tuple[ReportFileRecord, ...]:
-        base = Path("reports") / "runs" / str(run_id) / "final"
+        base = self._run_base(run_id) / "final"
         latex = final_latex.text.encode("utf-8") if final_latex.text is not None else base64.b64decode(final_latex.base64 or "", validate=True)
         return (
             self._write(

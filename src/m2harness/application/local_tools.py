@@ -417,14 +417,14 @@ def _data_profile(env: LocalToolEnvironment, args: dict[str, Any]) -> dict[str, 
     return {"path": args["path"], "sha256": _digest(data), "rows": len(rows), "columns": columns, "stats": stats, "preview": rows[: min(int(args.get("preview_rows", 10)), 50)]}
 
 
-def _run_python(env: LocalToolEnvironment, code: str, timeout_seconds: int | None, max_output_bytes: int) -> dict[str, Any]:
+def _run_python(env: LocalToolEnvironment, code: str, timeout_seconds: int, max_output_bytes: int) -> dict[str, Any]:
     if not code.strip():
         raise ValueError("code must not be empty")
     if len(code.encode("utf-8")) > MAX_CODE_BYTES:
         raise ValueError(f"code exceeds execution budget ({MAX_CODE_BYTES} bytes)")
     _validate_local_code_policy(code)
-    if timeout_seconds is not None and (not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool) or not 1 <= timeout_seconds <= 86_400):
-        raise ValueError("timeout_seconds is optional; an explicit value is only an operator emergency stop")
+    if not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool) or not 1 <= timeout_seconds <= 86_400:
+        raise ValueError("timeout_seconds is required and must be an integer between 1 and 86,400")
     script = None
     started = time.monotonic()
     try:
@@ -439,7 +439,7 @@ def _run_python(env: LocalToolEnvironment, code: str, timeout_seconds: int | Non
         output = env.sandbox.run((sys.executable, "-I", str(script)), timeout_seconds=timeout_seconds, env=safe_env)
         stdout = output.stdout[:max_output_bytes].decode("utf-8", errors="replace")
         stderr = output.stderr[:max_output_bytes].decode("utf-8", errors="replace")
-        return {"exit_code": output.exit_code, "timed_out": output.timed_out, "stdout": stdout, "stderr": stderr, "duration_ms": int((time.monotonic() - started) * 1000), "output_truncated": len(output.stdout) > max_output_bytes or len(output.stderr) > max_output_bytes}
+        return {"exit_code": output.exit_code, "timed_out": output.timed_out, "cancelled": output.cancelled, "stdout": stdout, "stderr": stderr, "duration_ms": int((time.monotonic() - started) * 1000), "output_truncated": len(output.stdout) > max_output_bytes or len(output.stderr) > max_output_bytes}
     finally:
         if script and script.exists():
             script.unlink(missing_ok=True)
@@ -472,14 +472,12 @@ def _validate_local_code_policy(code: str) -> None:
 
 
 def _python_execute(env: LocalToolEnvironment, args: dict[str, Any]) -> dict[str, Any]:
-    raw_timeout = args.get("timeout_seconds")
-    return _run_python(env, args["code"], raw_timeout if raw_timeout is None else int(raw_timeout), min(int(args.get("max_output_bytes", 100_000)), 1_000_000))
+    return _run_python(env, args["code"], args["timeout_seconds"], min(int(args.get("max_output_bytes", 100_000)), 1_000_000))
 
 
 def _validation_run(env: LocalToolEnvironment, args: dict[str, Any]) -> dict[str, Any]:
-    raw_timeout = args.get("timeout_seconds")
-    result = _run_python(env, args["code"], raw_timeout if raw_timeout is None else int(raw_timeout), min(int(args.get("max_output_bytes", 100_000)), 1_000_000))
-    passed = result["exit_code"] == 0 and not result["timed_out"]
+    result = _run_python(env, args["code"], args["timeout_seconds"], min(int(args.get("max_output_bytes", 100_000)), 1_000_000))
+    passed = result["exit_code"] == 0 and not result["timed_out"] and not result["cancelled"]
     parsed: Any = None
     if result["stdout"].strip():
         try:
@@ -568,6 +566,7 @@ def _solve_problem(env: LocalToolEnvironment, args: dict[str, Any]) -> dict[str,
             service.model_agent, service.code_harness, max_iterations=effective_limit,
             research_agent=service.research_agent, file_reader=service.file_reader,
             archive_writer=service.archive_writer, probe_writer=service.probe_writer,
+            human_control=service.human_control,
         )
         report = run_service.solve(task, context)
     elif hasattr(service, "solve"):
@@ -676,10 +675,10 @@ def register_local_tools(registry: ToolRegistry, env: LocalToolEnvironment) -> T
                      {"required": ["path"], "properties": {"path": {"type": "string"}, "max_bytes": {"type": "integer"}}}), _image_inspect),
         (_definition("data_profile", "data.profile", "Profile CSV, JSON, or JSONL data with deterministic basic statistics.",
                      {"required": ["path"], "properties": {"path": {"type": "string"}, "max_bytes": {"type": "integer"}, "preview_rows": {"type": "integer"}}}), _data_profile),
-        (_definition("python_execute", "python.execute", "Execute Python in the trusted local workspace with no shell; observe its Markdown report until it returns.",
-                     {"required": ["code"], "properties": {"code": {"type": "string"}, "timeout_seconds": {"type": ["integer", "null"]}, "max_output_bytes": {"type": "integer"}}}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write"), timeout=None), _python_execute),
-        (_definition("validation_run", "validation.numerical", "Run a validation script in the trusted local workspace and return its report.",
-                     {"required": ["code"], "properties": {"code": {"type": "string"}, "timeout_seconds": {"type": ["integer", "null"]}, "max_output_bytes": {"type": "integer"}}}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write"), timeout=None), _validation_run),
+        (_definition("python_execute", "python.execute", "Execute Python in the trusted local workspace with no shell and a required finite timeout.",
+                     {"required": ["code", "timeout_seconds"], "properties": {"code": {"type": "string"}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400}, "max_output_bytes": {"type": "integer"}}}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write"), timeout=None), _python_execute),
+        (_definition("validation_run", "validation.numerical", "Run a validation script in the trusted local workspace with a required finite timeout.",
+                     {"required": ["code", "timeout_seconds"], "properties": {"code": {"type": "string"}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400}, "max_output_bytes": {"type": "integer"}}}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write"), timeout=None), _validation_run),
         (_definition("report_render", "report.finalize", "Render a reviewed Markdown report, escaped HTML, and optionally validated LaTeX into the workspace.",
                      {"required": ["markdown"], "properties": {"markdown": {"type": "string"}, "title": {"type": "string"}, "path": {"type": "string"}, "latex": {"type": "string"}, "latex_path": {"type": "string"}, "overwrite": {"type": "boolean"}}}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write")), _report_render),
         (_definition("latex_validate", "report.publish", "Validate a local LaTeX publication contract without executing a TeX compiler.",

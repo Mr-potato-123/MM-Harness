@@ -13,10 +13,12 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 from m2harness.ports.sandbox import ExecResult, ExecSpec, SandboxSpec
 
@@ -28,6 +30,82 @@ class LocalExecOutput:
     timed_out: bool
     stdout: bytes
     stderr: bytes
+    cancelled: bool = False
+
+
+def _run_process(
+    argv: tuple[str, ...],
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    timeout_seconds: int | None,
+    max_output_bytes: int,
+    cancel_check: Callable[[], bool] | None,
+) -> LocalExecOutput:
+    """Run a child while remaining responsive to both deadline and operator stop."""
+
+    process = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+    )
+    stdout = bytearray()
+    stderr = bytearray()
+
+    def drain(stream, target: bytearray) -> None:
+        try:
+            while True:
+                chunk = stream.read(64 * 1024)
+                if not chunk:
+                    return
+                if len(target) < max_output_bytes:
+                    target.extend(chunk[: max_output_bytes - len(target)])
+        except (OSError, ValueError):
+            return
+
+    readers = [
+        threading.Thread(target=drain, args=(process.stdout, stdout), daemon=True),
+        threading.Thread(target=drain, args=(process.stderr, stderr), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+    timed_out = False
+    cancelled = False
+    try:
+        while process.poll() is None:
+            if cancel_check is not None:
+                try:
+                    cancelled = bool(cancel_check())
+                except Exception:
+                    cancelled = False
+            if cancelled:
+                process.terminate()
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                timed_out = True
+                process.terminate()
+                break
+            time.sleep(0.05)
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+    finally:
+        for reader in readers:
+            reader.join(timeout=2)
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+    return LocalExecOutput(
+        tuple(argv), process.returncode, timed_out, bytes(stdout), bytes(stderr), cancelled=cancelled,
+    )
 
 
 class LocalSandboxClient:
@@ -54,7 +132,7 @@ class LocalSandboxClient:
         self._sandboxes[sandbox_id] = spec
         return sandbox_id
 
-    def run(self, argv: tuple[str, ...], *, timeout_seconds: int | None = None, env: Mapping[str, str] | None = None, cwd: Path | None = None) -> LocalExecOutput:
+    def run(self, argv: tuple[str, ...], *, timeout_seconds: int | None = None, env: Mapping[str, str] | None = None, cwd: Path | None = None, cancel_check: Callable[[], bool] | None = None) -> LocalExecOutput:
         if not self.available:
             raise RuntimeError("host_execution_disabled: enable the trusted local backend or configure Docker/VM")
         if not argv or any(not item or "\x00" in item for item in argv):
@@ -70,14 +148,11 @@ class LocalSandboxClient:
         if self.workspace_root != working_directory and self.workspace_root not in working_directory.parents:
             raise ValueError("sandbox working directory escapes workspace")
         working_directory.mkdir(parents=True, exist_ok=True)
-        try:
-            # ``None`` is intentional for hard mathematical-model runs: the
-            # operator observes the append-only probe/event stream instead of
-            # losing a valid result to an arbitrary wall-clock cutoff.
-            process = subprocess.run(tuple(argv), cwd=working_directory, env=safe_env, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout_seconds, shell=False, check=False)
-            return LocalExecOutput(tuple(argv), process.returncode, False, process.stdout[: self.max_output_bytes], process.stderr[: self.max_output_bytes])
-        except subprocess.TimeoutExpired as exc:
-            return LocalExecOutput(tuple(argv), None, True, (exc.stdout or b"")[: self.max_output_bytes], (exc.stderr or b"")[: self.max_output_bytes])
+        return _run_process(
+            tuple(argv), cwd=working_directory, env=safe_env,
+            timeout_seconds=timeout_seconds, max_output_bytes=self.max_output_bytes,
+            cancel_check=cancel_check,
+        )
 
     def execute(self, sandbox_id: uuid.UUID, spec: ExecSpec) -> ExecResult:
         sandbox = self._sandboxes.get(sandbox_id)
@@ -134,7 +209,7 @@ class DockerSandboxClient(LocalSandboxClient):
         except (OSError, subprocess.TimeoutExpired):
             return None
 
-    def run(self, argv: tuple[str, ...], *, timeout_seconds: int | None = None, env: Mapping[str, str] | None = None, cwd: Path | None = None) -> LocalExecOutput:
+    def run(self, argv: tuple[str, ...], *, timeout_seconds: int | None = None, env: Mapping[str, str] | None = None, cwd: Path | None = None, cancel_check: Callable[[], bool] | None = None) -> LocalExecOutput:
         if not self.available:
             raise RuntimeError("sandbox_unavailable: Docker daemon is not ready")
         if not argv:
@@ -166,8 +241,8 @@ class DockerSandboxClient(LocalSandboxClient):
         for key, value in safe_env.items():
             command[image_index:image_index] = ["-e", f"{key}={value}"]
             image_index += 2
-        try:
-            process = subprocess.run(command, cwd=self.workspace_root, env={"PATH": os.environ.get("PATH", "")}, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout_seconds, shell=False, check=False)
-            return LocalExecOutput(tuple(command), process.returncode, False, process.stdout[: self.max_output_bytes], process.stderr[: self.max_output_bytes])
-        except subprocess.TimeoutExpired as exc:
-            return LocalExecOutput(tuple(command), None, True, (exc.stdout or b"")[: self.max_output_bytes], (exc.stderr or b"")[: self.max_output_bytes])
+        return _run_process(
+            tuple(command), cwd=self.workspace_root, env={"PATH": os.environ.get("PATH", "")},
+            timeout_seconds=timeout_seconds, max_output_bytes=self.max_output_bytes,
+            cancel_check=cancel_check,
+        )

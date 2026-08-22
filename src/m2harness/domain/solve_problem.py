@@ -162,6 +162,7 @@ class UnifiedModelingReport(StrictModel):
     main_scheme: str = Field(min_length=1, max_length=30_000)
     required_validations: tuple[str, ...] = Field(min_length=1)
     expected_outputs: tuple[str, ...] = Field(min_length=1)
+    expected_figures: tuple[str, ...] = ()
     coding_instructions: tuple[str, ...] = ()
     rejected_branch_reasons: dict[str, str] = Field(default_factory=dict)
 

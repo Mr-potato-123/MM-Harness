@@ -99,11 +99,11 @@ class CodeAgentHarnessContractTest(unittest.TestCase):
                 ".m2harness-code/q1/iteration-1/solve_q1.py"
             )
 
-            first = json.loads(tool.invoke({"code": "raise SystemExit(3)"}))
+            first = json.loads(tool.invoke({"code": "raise SystemExit(3)", "timeout_seconds": 10}))
             self.assertFalse(first["ok"])
             self.assertFalse(first["timed_out"])
-            self.assertIn("materially simpler", first["next_action"])
-            second = json.loads(tool.invoke({"code": "print(1)"}))
+            self.assertIn("targeted correction", first["next_action"])
+            second = json.loads(tool.invoke({"code": "print(1)", "timeout_seconds": 10}))
             self.assertFalse(second["ok"])
             self.assertIn("rewrite the target source", second["error"])
 

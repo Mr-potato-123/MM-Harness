@@ -13,7 +13,7 @@ from datetime import datetime
 from enum import StrEnum
 import json
 from typing import Protocol
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from pydantic import Field
 
@@ -208,16 +208,29 @@ class MainHarness:
             revision=attempt - 1, metadata=node.metadata,
         )
         solve_context = self._context_for_dispatch(state, node.id, node.depends_on, context)
+        solve_metadata = {
+            key: value for key, value in solve_context.metadata.items()
+            if key not in {"model_conversation", "code_conversation"}
+        }
+        solve_metadata.update({
+            "context_owner": "main-harness",
+            "context_model": "durable MainHarnessState plus report/handoff projections; no transcript replay",
+            "context_session_id": f"m2h-main-{state.run_id}-{task_id}-attempt-{attempt}",
+            "context_policy": "workflow state comes from MainHarnessState; stage evidence comes from allowlisted report paths",
+            "run_id": str(state.run_id),
+            "task_attempt": attempt,
+        })
+        if "run_name" in solve_metadata:
+            solve_metadata["context_event_log"] = f"reports/runs/{solve_metadata['run_name']}/probe.ndjson"
+        else:
+            solve_metadata["context_event_log"] = f"reports/runs/{state.run_id}/probe.ndjson"
         solve_context = solve_context.model_copy(update={
-            "metadata": {
-                **solve_context.metadata,
-                "run_id": str(state.run_id),
-                "task_attempt": attempt,
-            },
+            "metadata": solve_metadata,
         })
         call = ToolCall(
             call_id=uuid4(), tool_name=definition.name, tool_version=definition.version,
-            activity_id=uuid4(), session_id=uuid4(),
+            activity_id=uuid4(),
+            session_id=uuid5(state.run_id, f"solve_problem/{task_id}/attempt-{attempt}"),
             idempotency_key=f"main-harness:{state.run_id}:{task_id}:attempt-{attempt}",
             arguments={"task": task.model_dump(mode="json"), "context": solve_context.model_dump(mode="json"), "max_iterations": max_iterations},
             requested_at=utc_now(),
@@ -502,6 +515,15 @@ class MainHarness:
             recent_instructions = instructions[-10:]
             older = "\n".join(f"- {item}" for item in instructions[:-10])
             instructions = ["Compacted earlier revision history:\n" + compact_text(older, 2_000), *recent_instructions]
+        metadata = {
+            key: value for key, value in context.metadata.items()
+            if key not in {"model_conversation", "code_conversation"}
+        }
+        metadata.update({
+            "context_owner": "main-harness",
+            "context_model": "durable MainHarnessState plus report/handoff projections; no transcript replay",
+            "context_policy": "workflow state comes from MainHarnessState; stage evidence comes from allowlisted report paths",
+        })
         return context.model_copy(update={
             "dependency_report_ids": tuple(dependency_ids),
             "accepted_report_ids": tuple(accepted_ids),
@@ -511,6 +533,7 @@ class MainHarness:
                 tuple(file for solution in dependency_solutions for file in solution.solve_files),
             ),
             "instructions": tuple(instructions),
+            "metadata": metadata,
             "research_report": research_report,
             "compression": {
                 **context.compression,

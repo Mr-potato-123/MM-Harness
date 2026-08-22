@@ -22,6 +22,7 @@ from m2harness.models import ArtifactKind, HarnessSettings, utc_now
 from m2harness.store import HarnessStore
 from m2harness.workflow import SingleQuestionWorkflow
 from m2harness.application.runtime_bundle import build_local_runtime, default_skill_root
+from m2harness.application.run_workspace import RunIdentity, RunWorkspace
 from m2harness.infrastructure.db.tool_runs import SQLiteToolAuditStore
 from m2harness.infrastructure.db.sqlite_artifacts import SQLiteArtifactRegistry
 from m2harness.domain.dag import canonical_single_question_dag
@@ -30,6 +31,7 @@ from m2harness.domain.media import MultimodalInput
 from m2harness.domain.solve_problem import ReadOnlyFileReference, ReadOnlyFileRole, SolveProblemContext
 from m2harness.domain.capability import CapabilityRequirement
 from m2harness.domain.tool import ToolCall
+from m2harness.human_control import HumanControlStore
 
 MAX_INPUT_FILE_BYTES = 200 * 1024 * 1024
 
@@ -145,6 +147,10 @@ def build_parser() -> argparse.ArgumentParser:
     resume_qwen.add_argument("--model", default=None)
     resume_qwen.add_argument("--code-agent", choices=("dsh", "qwen"), default=os.environ.get("M2HARNESS_CODE_AGENT", "dsh"), help="Code Agent 运行时；默认使用持久 DSH Session")
     resume_qwen.add_argument("--max-iterations", type=int, default=3, help="总迭代上限：初始实现轮 + 最多两轮返修")
+    toy_ui = commands.add_parser("toy-ui", help="serve the local monitor and human-interrupt UI")
+    toy_ui.add_argument("--workspace", type=Path, default=Path(".m2harness/workspace"))
+    toy_ui.add_argument("--host", default="127.0.0.1")
+    toy_ui.add_argument("--port", type=int, default=8765)
     commands.add_parser("catalog")
     preflight = commands.add_parser("preflight")
     preflight.add_argument("--input", type=Path, default=None)
@@ -170,6 +176,10 @@ def main(argv: list[str] | None = None) -> int:
     store.initialize()
     if args.command == "init":
         _emit({"database": str(settings.database_path.resolve()), "artifacts": str(settings.artifact_root.resolve()), "schema": 1})
+        return 0
+    if args.command == "toy-ui":
+        from m2harness.toy_frontend import serve_toy_ui
+        serve_toy_ui(args.workspace, host=args.host, port=args.port)
         return 0
     if args.command == "create-project":
         _emit(store.create_project(args.name))
@@ -265,6 +275,14 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("--max-iterations must be between 1 and 20")
         if args.question_count < 1 or args.question_count > 4:
             raise ValueError("--question-count must be between 1 and 4")
+        model_name = args.model or os.environ.get("QWEN_MODEL", "qwen3.8-max")
+        run_identity = RunIdentity.create(
+            scope=args.scope,
+            input_name=args.input.name,
+            model=model_name,
+            code_agent=args.code_agent,
+        )
+        run_workspace = RunWorkspace.create(settings.database_path.parent / "runs", run_identity)
         media_type = mimetypes.guess_type(args.input.name)[0] or "application/octet-stream"
         if media_type == "application/pdf" and len(data) > 150 * 1024 * 1024:
             raise ValueError("Qwen PDF input exceeds the 150MB provider limit")
@@ -273,7 +291,12 @@ def main(argv: list[str] | None = None) -> int:
             data_base64=base64.b64encode(data).decode("ascii"),
             sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
         )
-        runtime = build_local_runtime(database_path=settings.database_path, artifact_root=settings.artifact_root, allow_host_sandbox=True)
+        runtime = build_local_runtime(
+            database_path=run_workspace.database_path,
+            artifact_root=run_workspace.artifact_root,
+            workspace_root=run_workspace.workspace_root,
+            allow_host_sandbox=True,
+        )
         if not runtime.sandbox.available:
             raise RuntimeError("local_execution_disabled: run-main-qwen requires the trusted host or Docker/VM sandbox")
         staged_name = Path(args.input.name).name
@@ -282,8 +305,14 @@ def main(argv: list[str] | None = None) -> int:
         staged_path.write_bytes(data)
         client = QwenChatClient(
             base_url=os.environ.get("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-            model=args.model or os.environ.get("QWEN_MODEL", "qwen3.8-max"),
+            model=model_name,
         )
+        runtime.main_harness.report_store.register_run(
+            run_identity.run_id,
+            run_identity.run_name,
+            metadata={"scope": args.scope, "input_name": args.input.name, "model": model_name, "code_agent": args.code_agent},
+        )
+        human_control = HumanControlStore(runtime.tool_environment.workspace_root)
         service_builder = build_dsh_solve_problem_service if args.code_agent == "dsh" else build_qwen_solve_problem_service
         service = service_builder(
             sandbox=runtime.sandbox, workspace_root=runtime.tool_environment.workspace_root,
@@ -291,6 +320,7 @@ def main(argv: list[str] | None = None) -> int:
             tool_runtime=runtime.tool_runtime, capabilities=runtime.capabilities,
             archive_writer=runtime.main_harness.report_store,
             client=client, max_iterations=args.max_iterations,
+            human_control=human_control,
         )
         runtime = runtime.attach_solve_problem_service(service)
         scope_prompt = (
@@ -308,6 +338,8 @@ def main(argv: list[str] | None = None) -> int:
                 sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
             ),),
             metadata={
+                "run_id": str(run_identity.run_id),
+                "run_name": run_identity.run_name,
                 "staged_input_relative_path": str(Path("inputs") / staged_name),
                 "scope": args.scope,
             },
@@ -315,7 +347,7 @@ def main(argv: list[str] | None = None) -> int:
         from m2harness.application.langgraph_main_harness import LangGraphMainHarness
         graph_runner = LangGraphMainHarness(
             runtime.main_harness,
-            checkpoint_path=runtime.tool_environment.workspace_root.parent / "main-harness-checkpoints.sqlite",
+            checkpoint_path=run_workspace.checkpoint_root / "main-harness.sqlite",
             context_for_task=lambda _task_id, _state: base_context,
         )
         state = graph_runner.run(
@@ -323,9 +355,10 @@ def main(argv: list[str] | None = None) -> int:
             canonical_main_harness_dag(scope=args.scope, task_problem=scope_prompt, question_count=args.question_count),
             composer=QwenPaperComposer(client, skills=runtime.skills),
             max_iterations=args.max_iterations,
+            run_id=run_identity.run_id,
         )
         if state.final_report is None or state.final_latex_paper is None:
-            run_report_root = runtime.tool_environment.workspace_root / "reports" / "runs" / str(state.run_id)
+            run_report_root = runtime.tool_environment.workspace_root / "reports" / "runs" / run_identity.run_name
             raise RuntimeError(
                 "Main Harness paper composer returned no final publication; "
                 f"run_id={state.run_id}; probe={run_report_root / 'probe.md'}; "
@@ -385,6 +418,7 @@ def main(argv: list[str] | None = None) -> int:
             base_url=os.environ.get("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
             model=args.model or os.environ.get("QWEN_MODEL", "qwen3.8-max"),
         )
+        human_control = HumanControlStore(runtime.tool_environment.workspace_root)
         service_builder = build_dsh_solve_problem_service if args.code_agent == "dsh" else build_qwen_solve_problem_service
         service = service_builder(
             sandbox=runtime.sandbox, workspace_root=runtime.tool_environment.workspace_root,
@@ -392,6 +426,7 @@ def main(argv: list[str] | None = None) -> int:
             tool_runtime=runtime.tool_runtime, capabilities=runtime.capabilities,
             archive_writer=runtime.main_harness.report_store,
             client=client, max_iterations=args.max_iterations,
+            human_control=human_control,
         )
         runtime = runtime.attach_solve_problem_service(service)
         workspace_root = runtime.tool_environment.workspace_root

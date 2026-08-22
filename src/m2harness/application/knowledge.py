@@ -143,6 +143,9 @@ def default_hmml_path(root: Path | None = None) -> Path | None:
         if os.environ.get("M2HARNESS_HMML_PATH") else None,
         base / "knowledge" / "HMML.json",
         base / "ref_github" / "LLM-MM-Agent" / "MMAgent" / "HMML" / "HMML.json",
+        # A sibling clone is the common local development layout:
+        # <parent>/MM-Harness and <parent>/LLM-MM-Agent.
+        base.parent / "LLM-MM-Agent" / "MMAgent" / "HMML" / "HMML.json",
         base.parent / "MM" / "_Harness" / "ref_github" / "LLM-MM-Agent" / "MMAgent" / "HMML" / "HMML.json",
     )
     for candidate in candidates:

@@ -7,8 +7,8 @@ it: progressive-disclosure paths, local execution/evidence validation,
 iteration policy and review handoffs.
 
 The adapter deliberately consumes the framework through public APIs.  It does
-not reimplement a model/tool loop and it never kills a running invocation when
-an operator's observation window expires.
+not reimplement a model/tool loop; an explicit human interrupt may stop the
+current generated-script invocation.
 """
 
 from __future__ import annotations
@@ -25,8 +25,10 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from m2harness.domain.code import CodeProposal
+from m2harness.application.code_agent_prompts import CODE_AGENT_SYSTEM_PROMPT, build_code_agent_task_prompt
 from m2harness.domain.solve_problem import SolveProblemContext, SolveProblemTask, UnifiedModelingReport
 from m2harness.errors import ActivityExecutionError
+from m2harness.human_control import HumanControlStore, HumanInterruptRequested
 from m2harness.infrastructure.code_harness import CodeProposalProvider, _validate_python_policy
 from m2harness.infrastructure.local_sandbox import LocalSandboxClient
 
@@ -42,10 +44,8 @@ class CodeAgentHandoff(BaseModel):
 
     source_path: str = Field(min_length=1, max_length=1_000)
     logical_name: str = Field(pattern=r"^[A-Za-z0-9._-]+\.py$", max_length=200)
-    # No default wall-clock limit is part of the Code→Model report contract.
-    # An explicit value is a per-execution budget chosen by the Code Agent;
-    # there is no global Code Agent wall-clock or step limit.
-    timeout_seconds: int | None = Field(default=None, ge=1)
+    # The Code Agent must choose and return a finite per-execution budget.
+    timeout_seconds: int = Field(ge=1, le=86_400)
     # JSON structured-output providers emit arrays, not Python tuples.  Keep
     # the wire contract JSON-native here and normalize to a tuple at the
     # domain boundary in ``propose``.  ``strict=True`` is intentional for the
@@ -69,6 +69,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         checkpoint_path: Path | None = None,
         event_root: Path | None = None,
         skills: list[str] | None = None,
+        human_control: HumanControlStore | None = None,
     ) -> None:
         self.workspace_root = workspace_root.resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
@@ -79,6 +80,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         self.event_root = (event_root or (self.workspace_root / ".m2harness-code" / "deepagents-events")).resolve()
         self.event_root.mkdir(parents=True, exist_ok=True)
         self.skills = skills or []
+        self.human_control = human_control
         self._agent: Any | None = None
         self._agent_target: str | None = None
         self._checkpoint_context: Any | None = None
@@ -92,8 +94,10 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         prompt = self._build_prompt(task, context, modeling, iteration=iteration, target_relative=target_relative)
         prompt_path.write_text(prompt, encoding="utf-8")
         run_id = str(context.metadata.get("run_id", "unscoped")) if isinstance(context.metadata, dict) else "unscoped"
-        safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
-        event_path = self.event_root / f"{safe_run_id}-{task.task_id}.ndjson"
+        run_name = str(context.metadata.get("run_name", run_id)) if isinstance(context.metadata, dict) else run_id
+        safe_run_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_name)
+        attempt = int(context.metadata.get("task_attempt", 1)) if isinstance(context.metadata, dict) else 1
+        event_path = self.event_root / safe_run_name / f"task-{task.task_id}__attempt-{attempt}.ndjson"
         final_state = self._run_agent(task, context, modeling, iteration=iteration, prompt=prompt, event_path=event_path)
         handoff = self._handoff_from_state(final_state)
         target = self._resolve_agent_path(handoff.source_path)
@@ -110,6 +114,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             metadata={
                 "agent_runtime": "deepagents",
                 "session_id": self._session_id(task, context),
+                "source_path": handoff.source_path,
                 "event_log": str(event_path.relative_to(self.workspace_root).as_posix()),
                 "prompt_file": str(prompt_path.relative_to(self.workspace_root).as_posix()),
             },
@@ -125,7 +130,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             self._agent = None
             self._agent_target = None
 
-    def _ensure_agent(self, context: SolveProblemContext, target_relative: str) -> Any:
+    def _ensure_agent(self, context: SolveProblemContext, target_relative: str, run_id: str) -> Any:
         if self._agent is not None and self._agent_target == target_relative:
             return self._agent
         try:
@@ -145,7 +150,10 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         backend = FilesystemBackend(root_dir=self.workspace_root, virtual_mode=True)
         permissions = self._permissions(context, target_relative, FilesystemPermission)
         if self._checkpointer is None:
-            self._checkpoint_context = SqliteSaver.from_conn_string(str(self.checkpoint_path))
+            safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
+            run_checkpoint = self.checkpoint_path.parent / "deepagents-checkpoints" / safe_run_id / "agent.sqlite"
+            run_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            self._checkpoint_context = SqliteSaver.from_conn_string(str(run_checkpoint))
             self._checkpointer = self._checkpoint_context.__enter__()
             self._checkpointer.setup()
         system_prompt = (
@@ -170,9 +178,18 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             "建立 MILP 后必须先做小规模可行性烟雾检查；到达终点后的活动标志约束不得与 a_0=1、a_T=0 和终点位置约束互相矛盾，禁止使用会令到达终点后 a_t<0 的不等式。"
             "路线实现硬性自检：候选路线的节点序列必须显式包含需要停留的补给平台（不能只把补给需求按总量加到初始资源上）；允许重复访问作业点，或给出可检查的上界/支配证明说明为何不会漏掉重复访问。若 bfs_path(a,b) 返回含起点和终点的节点列表，移动日必须遍历 path[1:]（第1天到达第一个相邻节点），不得用 path[0:distance] 导致终点和补给平台被跳过。到达终点当天立即结算并停止，不得用 END 填充后续消耗日。"
             "在正式求解前必须运行最小路径烟雾测试：验证 START→END 的首个移动位置是其相邻节点、最后一个移动位置是 END；验证一条经过 SUPPLY 的候选路线确实产生补给记录且补给前后 O/H/F、M 和 O+H+F<=CAP 均满足。禁止使用名为 solve_simplified 的总量估算作为主求解器，也不得在未逐日模拟时声称 V1-V3 已通过。"
-            "最终脚本必须在 stdout 返回一份可审查的中文 Markdown 执行报告，内容包括完整路径、每日行动与 O/H/F/M/Z、目标值、算法偏差、验证过程和限制；可以附带 JSON，但 JSON 中的 false 只是待审查提示，不是 Harness 失败信号。"
+            "最终脚本必须在 stdout 返回一份简短、可读的中文 Markdown 结果：直接说明是否完成、关键结论、重要数值、限制和产生的文件/图片位置；不要在 stdout 打印完整 JSON、验证字段清单或大段逐日表格，详细机器数据写入 outputs/result.json。"
             "必须把同一份可审查结果保存到当前 iteration 的 outputs/result.md（必要时另存 outputs/result.json）；不要只返回 all_valid 或孤立的 true/false。"
         )
+        system_prompt += (
+            "\n\nMANDATORY M2Harness execution contract: every python_execute call MUST include an explicit finite "
+            "timeout_seconds integer from 1 through 86400. Never omit it, use null, or rely on an implicit "
+            "unbounded run. The final CodeAgentHandoff MUST also include timeout_seconds."
+        )
+        # The legacy block above is retained only as a compatibility reference
+        # while prompt snapshots migrate.  The live agent receives the small,
+        # role-only policy; task details are supplied by _build_prompt below.
+        system_prompt = CODE_AGENT_SYSTEM_PROMPT
         model_identifier = getattr(self.model, "model_name", None) or getattr(self.model, "model", None)
         if model_identifier:
             register_harness_profile(
@@ -189,7 +206,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             todo_write, todo_read = self._todo_tools(target_relative)
             self._agent = create_deep_agent(
                 model=self.model,
-                tools=[todo_write, todo_read, self._write_code_source_tool(target_relative), self._python_execute_tool(target_relative)],
+                tools=[todo_write, todo_read, self._write_code_source_tool(target_relative), self._python_execute_tool(target_relative, run_id)],
                 backend=backend,
                 permissions=permissions,
                 skills=self.skills or None,
@@ -374,7 +391,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
 
         return write_todos, read_todos
 
-    def _python_execute_tool(self, target_relative: str) -> Any:
+    def _python_execute_tool(self, target_relative: str, run_id: str = "unscoped") -> Any:
         """Expose only the fixed local Python boundary to DeepAgents."""
         from langchain_core.tools import tool
 
@@ -387,12 +404,12 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         rewrite_required = False
 
         @tool("python_execute")
-        def python_execute(code: str, timeout_seconds: int | None = None) -> str:
+        def python_execute(code: str, timeout_seconds: int) -> str:
             """在本地受控沙箱中执行一段 Python 验证代码；不得联网或运行 shell。"""
             if not isinstance(code, str) or not code.strip():
                 return json.dumps({"ok": False, "error": "code must be non-empty"}, ensure_ascii=False)
-            if timeout_seconds is not None and (not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool) or timeout_seconds < 1):
-                return json.dumps({"ok": False, "error": "timeout_seconds 必须是正整数；默认省略表示不设单次时限"}, ensure_ascii=False)
+            if not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool) or not 1 <= timeout_seconds <= 86_400:
+                return json.dumps({"ok": False, "error": "timeout_seconds must be a 正整数 between 1 and 86400; the field is required"}, ensure_ascii=False)
             nonlocal call_count
             nonlocal last_source_hash, rewrite_required
             call_count += 1
@@ -404,7 +421,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                         "ok": False,
                         "error": "rewrite the target source before retrying；上一次显式紧急停止后必须先修改目标源码，再次运行验证",
                         "call_count": call_count,
-                        "next_action": "call write_code_source with a materially simpler algorithm, then run python_execute",
+                        "next_action": "source_change_required_before_next_execution; use stderr evidence to make a targeted correction",
                     }, ensure_ascii=False)
                 result = sandbox.run(
                     # ``-I`` ignores PYTHON* environment variables, so make
@@ -414,11 +431,17 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                     timeout_seconds=timeout_seconds,
                     cwd=target_directory,
                     env={"PYTHONIOENCODING": "utf-8", "M2HARNESS_NETWORK": "deny"},
+                    cancel_check=(
+                        (lambda: self.human_control.is_interrupted(run_id))
+                        if self.human_control is not None and run_id != "unscoped" else None
+                    ),
                 )
                 payload = {
-                        "ok": result.exit_code == 0 and not result.timed_out,
+                        "ok": result.exit_code == 0 and not result.timed_out and not result.cancelled,
                         "exit_code": result.exit_code,
                         "timed_out": result.timed_out,
+                        "cancelled": result.cancelled,
+                        "interrupted": result.cancelled,
                         "stdout": result.stdout.decode("utf-8", errors="replace")[:200_000],
                         "stderr": result.stderr.decode("utf-8", errors="replace")[:200_000],
                         "call_count": call_count,
@@ -429,28 +452,31 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                 # materially changed source before the agent can blindly rerun
                 # it; otherwise a long-running bad algorithm can repeat forever
                 # without giving the Model/Code loop a chance to repair it.
-                rewrite_required = bool(result.exit_code not in (0, None) or result.timed_out)
+                rewrite_required = bool(result.exit_code not in (0, None) or result.timed_out or result.cancelled)
                 if not payload["ok"]:
-                    payload["next_action"] = "call write_code_source with a materially simpler algorithm, then run python_execute"
+                    payload["next_action"] = "source_change_required_before_next_execution; use stderr evidence to make a targeted correction"
                 return json.dumps(payload, ensure_ascii=False)
             except Exception as exc:
                 return json.dumps({
                     "ok": False,
                     "error": str(exc)[:4_000],
-                    "next_action": "rewrite source and retry",
+                    "next_action": "stop_and_return_failure_evidence; no retry is allowed until the source changes",
                 }, ensure_ascii=False)
 
         return python_execute
 
     def _run_agent(self, task: SolveProblemTask, context: SolveProblemContext, modeling: UnifiedModelingReport, *, iteration: int, prompt: str, event_path: Path) -> dict[str, Any]:
         target_relative = self._target_path(task, context, iteration)
-        agent = self._ensure_agent(context, target_relative)
+        run_id = str(context.metadata.get("run_id", "unscoped")) if isinstance(context.metadata, dict) else "unscoped"
+        agent = self._ensure_agent(context, target_relative, run_id)
         config = {
             "configurable": {"thread_id": self._session_id(task, context)},
             "metadata": {
                 "m2h_task_id": task.task_id,
                 "m2h_iteration": iteration,
+                "m2h_attempt": int(context.metadata.get("task_attempt", 1)) if isinstance(context.metadata, dict) else 1,
                 "m2h_run_id": str(context.metadata.get("run_id", "unscoped")) if isinstance(context.metadata, dict) else "unscoped",
+                "m2h_run_name": str(context.metadata.get("run_name", context.metadata.get("run_id", "unscoped"))) if isinstance(context.metadata, dict) else "unscoped",
                 "m2h_runtime": "deepagents",
             },
             # LangGraph requires a finite integer, but the Code Agent must not
@@ -468,6 +494,8 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         baseline_initialized = False
         try:
             for state in agent.stream({"messages": [{"role": "user", "content": prompt}]}, config=config, stream_mode="values"):
+                if self.human_control is not None and run_id != "unscoped" and self.human_control.is_interrupted(run_id):
+                    raise HumanInterruptRequested(run_id, task.task_id, iteration, "operator requested interrupt", context=context)
                 if not isinstance(state, dict):
                     continue
                 final_state = state
@@ -521,6 +549,16 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                     "kind": "state",
                     "state": _summarize_state(state),
                 })
+        except HumanInterruptRequested:
+            self._append_event(event_path, {
+                "seq": sequence + 1,
+                "occurred_at": datetime.now(UTC).isoformat(),
+                "task_id": task.task_id,
+                "iteration": iteration,
+                "kind": "human_interrupt",
+                "error": "operator requested interrupt",
+            })
+            raise
         except Exception as exc:
             self._append_event(event_path, {
                 "seq": sequence + 1,
@@ -611,20 +649,37 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
     def _target_path(self, task: SolveProblemTask, context: SolveProblemContext, iteration: int) -> str:
         logical = "solve_" + re.sub(r"[^A-Za-z0-9_-]+", "_", task.task_id) + ".py"
         run_id = "unscoped"
+        run_name = "unscoped"
         if isinstance(context.metadata, dict):
             run_id = str(context.metadata.get("run_id", run_id))
-        safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
-        return str(Path(".m2harness-code") / "runs" / safe_run_id / task.task_id / f"iteration-{iteration}" / logical).replace("\\", "/")
+            run_name = str(context.metadata.get("run_name", run_id))
+            attempt = int(context.metadata.get("task_attempt", 1))
+        else:
+            attempt = 1
+        safe_run_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_name)
+        return str(Path(".m2harness-code") / "runs" / safe_run_name / f"task-{task.task_id}" / f"attempt-{attempt}" / f"iteration-{iteration}" / logical).replace("\\", "/")
 
     @staticmethod
     def _session_id(task: SolveProblemTask, context: SolveProblemContext | None = None) -> str:
         run_id = "unscoped"
         if context is not None and isinstance(context.metadata, dict):
             run_id = str(context.metadata.get("run_id", run_id))
+            attempt = int(context.metadata.get("task_attempt", 1))
+        else:
+            attempt = 1
         safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
-        return f"m2h-deepagents-code-{safe_run_id}-{task.task_id}"
+        return f"m2h-deepagents-code-{safe_run_id}-{task.task_id}-attempt-{attempt}"
 
     def _build_prompt(self, task: SolveProblemTask, context: SolveProblemContext, modeling: UnifiedModelingReport, *, iteration: int, target_relative: str) -> str:
+        return build_code_agent_task_prompt(
+            task,
+            context,
+            modeling,
+            iteration=iteration,
+            target_relative=target_relative,
+            output_relative=target_relative.rsplit("/", 1)[0] + "/outputs",
+            session_managed=True,
+        )
         exchange_paths = sorted(
             item.relative_path for item in context.readonly_files
             if "/exchanges/" in item.relative_path.replace("\\", "/")
@@ -640,6 +695,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                 "latest_repair_handoff_path": repair_contract,
                 "required_validations": list(modeling.required_validations),
                 "expected_outputs": list(modeling.expected_outputs),
+                "expected_figures": list(modeling.expected_figures),
             }
         payload = {
             "task": task.model_dump(mode="json"),
@@ -659,8 +715,6 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             # Revision rounds keep the Code session but receive the latest
             # Model→Code instructions explicitly; no re-modeling is needed.
             "model_to_code_repair_instructions": list(context.instructions[-32:]),
-            "model_conversation_tail": list(context.metadata.get("model_conversation", ())) [-12:]
-            if isinstance(context.metadata.get("model_conversation", ()), (list, tuple)) else [],
         }
         return (
             "当前为第 %d 轮 Code Agent 实现。继续复用本任务的 LangGraph thread/session；只读清单之外的路径不得打开。"

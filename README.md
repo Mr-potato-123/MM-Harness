@@ -107,6 +107,20 @@ m2harness run-main-qwen .\2026B.pdf --problem "Solve the attached problem" --max
 This executes `Main Harness → solve_problem → Model/Code/Review → global paper
 composer`; the local sandbox and HMML index remain on the machine.
 
+For a local human-in-the-loop monitor, start the toy UI in a second terminal
+using the same workspace:
+
+```powershell
+m2harness toy-ui --workspace .m2harness/workspace --port 8765
+# open http://127.0.0.1:8765
+```
+
+The UI only displays run status and recent probe events. Its two controls add a
+suggestion to the next `solve_problem` safe point or request an interrupt. An
+interrupt also propagates into the generated-script sandbox and terminates the
+current child process. Every Code Agent proposal and `python_execute` call must
+carry a finite `timeout_seconds` value from 1 through 86400.
+
 The wheel carries the complete 19-skill bundled library (including referenced
 checklists/evals) under `share/m2harness/skills`; an installed CLI does not
 depend on the source checkout's `skills/` directory. The repository path is

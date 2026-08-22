@@ -29,6 +29,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from m2harness.application.solve_problem import ModelAgentPort
+from m2harness.application.code_agent_prompts import CODE_AGENT_SYSTEM_PROMPT, build_code_agent_task_prompt
 from m2harness.application.solve_problem import SolveProblemArchivePort, SolveProblemService, WorkspaceReadOnlyFileReader
 from m2harness.domain.code import CodeProposal
 from m2harness.domain.media import MultimodalInput
@@ -115,11 +116,13 @@ class MainHarnessToolBridge:
     # DSH supplies its own equivalent Todo middleware in its profile.
     TODO_TOOLS = frozenset({"todo_read", "todo_write"})
 
-    def __init__(self, runtime: ToolRuntime, capabilities: CapabilityRegistry, *, session_id: UUID | None = None, workspace_root: Path | None = None) -> None:
+    def __init__(self, runtime: ToolRuntime, capabilities: CapabilityRegistry, *, session_id: UUID | None = None, workspace_root: Path | None = None, run_id: str | None = None, task_attempt: int = 1) -> None:
         self.runtime = runtime
         self.capabilities = capabilities
         self.session_id = session_id or uuid4()
         self.workspace_root = workspace_root.resolve() if workspace_root is not None else None
+        self.run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id or "unscoped")
+        self.task_attempt = task_attempt
         self._todo_ledgers: dict[str, TodoLedger] = {}
 
     def definitions(self) -> list[dict[str, Any]]:
@@ -167,7 +170,7 @@ class MainHarnessToolBridge:
             if ledger is None:
                 todo_root = None
                 if self.workspace_root is not None:
-                    todo_root = self.workspace_root / ".m2harness-code" / task_id / "todo.json"
+                    todo_root = self.workspace_root / ".m2harness-code" / "runs" / self.run_id / f"task-{task_id}" / f"attempt-{self.task_attempt}" / "todo.json"
                 ledger = TodoLedger(task_id, todo_root)
                 self._todo_ledgers[task_id] = ledger
             if name == "todo_read":
@@ -243,8 +246,12 @@ def _content_parts(context: SolveProblemContext, prompt: str, *, deepseek: bool 
 
 
 def _context_json(context: SolveProblemContext) -> dict[str, Any]:
-    """Serialize context without duplicating binary multimodal bytes in text."""
+    """Serialize the current context projection, never a legacy transcript."""
     value = context.model_dump(mode="json")
+    metadata = value.get("metadata")
+    if isinstance(metadata, dict):
+        metadata.pop("model_conversation", None)
+        metadata.pop("code_conversation", None)
     value["multimodal_inputs"] = [
         {key: item[key] for key in ("logical_name", "media_type", "sha256", "size_bytes")}
         for item in value.get("multimodal_inputs", [])
@@ -326,6 +333,7 @@ def _modeling_payload(modeling: UnifiedModelingReport, context: SolveProblemCont
         "selected_branch_ids": list(modeling.selected_branch_ids),
         "required_validations": list(modeling.required_validations),
         "expected_outputs": list(modeling.expected_outputs),
+        "expected_figures": list(modeling.expected_figures),
     }
 
 
@@ -643,8 +651,13 @@ def _scope_instruction(task: SolveProblemTask) -> str:
     )
     ledger = (
         "\n上下文约束：Model Agent 与 Code Agent 使用彼此隔离的上下文；Model Agent 只延续 "
-        "context.metadata.model_conversation，Code Agent 只延续 context.metadata.code_conversation。"
-        "返修迭代不得重置各自上下文；两者只通过精简、结构化的交接报告交流，详细文件按清单路径按需读取。"
+        "The Main Harness owns the durable event stream; agents use typed projections and allowlisted handoff paths."
+        "返修迭代不得重置各自上下文；两者只通过精简的自然语言交接交流，详细文件按清单路径按需读取。机器字段留在 Harness 内部，不要把它们重复写进交接正文。"
+    )
+    ledger = (
+        "\nContext policy: Main Harness owns durable workflow state and the event stream. "
+        "Agents receive the current typed projection and allowlisted handoff paths. "
+        "No model_conversation or code_conversation transcript is carried in context.metadata."
     )
     if not scope:
         return language + ledger
@@ -686,7 +699,7 @@ class QwenModelAgent(ModelAgentPort):
         return tuple(reports)
 
     def synthesize(self, task, context, preliminary, *, iteration):
-        value = self._request(task, context, f"用中文选择并统一第 {iteration} 轮的最佳路线，只针对当前范围。给出一个可执行主方案和必需验证，不得扩展到其他问题。", UnifiedModelingReport.model_json_schema(), evidence={"preliminary_reports": [item.model_dump(mode="json") for item in preliminary]}, skill_names=("model-selection", "modeling-core", "dimensional-analysis", "uncertainty-quantification", "sensitivity-analysis", "numerical-validation"))
+        value = self._request(task, context, f"用中文选择并统一第 {iteration} 轮的最佳路线，只针对当前范围。给出一个可执行主方案、必需验证、预期输出和需要绘制的图；没有必要的图就返回空列表。不得扩展到其他问题。", UnifiedModelingReport.model_json_schema(), evidence={"preliminary_reports": [item.model_dump(mode="json") for item in preliminary]}, skill_names=("model-selection", "modeling-core", "dimensional-analysis", "uncertainty-quantification", "sensitivity-analysis", "numerical-validation"))
         return UnifiedModelingReport.model_validate(value, strict=False)
 
     def review(self, task, context, modeling, coding, *, iteration):
@@ -739,15 +752,23 @@ class QwenCodeProposalProvider(CodeProposalProvider):
         self.workspace_root = workspace_root.resolve() if workspace_root is not None else None
 
     def propose(self, task, context, modeling, *, iteration):
+        raw_run_id = str(context.metadata.get("run_id", "unscoped")) if isinstance(context.metadata, dict) else "unscoped"
+        raw_run_name = str(context.metadata.get("run_name", raw_run_id)) if isinstance(context.metadata, dict) else raw_run_id
+        safe_run_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw_run_name)
+        attempt = int(context.metadata.get("task_attempt", 1)) if isinstance(context.metadata, dict) else 1
+        logical_name = "solve_" + re.sub(r"[^A-Za-z0-9_-]+", "_", task.task_id) + ".py"
+        source_path = f".m2harness-code/runs/{safe_run_name}/task-{task.task_id}/attempt-{attempt}/iteration-{iteration}/{logical_name}"
         system = build_agent_system_prompt(
             AgentRole.CODE,
             output_contract=(
                 "Return one CodeProposal JSON object containing a complete deterministic Python script. The script must "
-                "print a readable Chinese Markdown execution report; a JSON summary is optional and its false fields are "
+                "print a short, readable Chinese Markdown result with the conclusion, key numbers, limitations and "
+                "generated file/image locations; do not print a full JSON or a large daily table. A JSON summary is optional and its false fields are "
                 "advisory only. Write the report and result files only under "
-                f".m2harness-code/{task.task_id}/iteration-{iteration}/outputs."
+                f"{source_path.rsplit('/', 1)[0]}/outputs."
             ),
         ) + _scope_instruction(task)
+        system = CODE_AGENT_SYSTEM_PROMPT + _scope_instruction(task)
         exchange_paths = sorted(
             item.relative_path for item in context.readonly_files
             if "/exchanges/" in item.relative_path.replace("\\", "/")
@@ -759,35 +780,71 @@ class QwenCodeProposalProvider(CodeProposalProvider):
         # provider must not mistake an old modeling report for a new repair.
         handoff_paths = ([repair_handoffs[-1]] if repair_handoffs else ([initial_handoffs[-1]] if initial_handoffs else []))
         handoff_paths.extend(path for path in exchange_paths if path not in handoff_paths and path.endswith("code-to-model.md"))
-        prompt = json.dumps(_compact_provider_payload({"task": task.model_dump(mode="json"), "context": _context_json(context), "modeling": _modeling_payload(modeling, context, iteration), "iteration": iteration, "handoff_paths": handoff_paths, "skill_context": _skill_context(self.skills, ("coding-contract", "code-debugging", "dimensional-analysis", "visualization", "scientific-figure-design", "numerical-validation")), "schema": CodeProposal.model_json_schema()}), ensure_ascii=False)
+        prompt = json.dumps({
+            "task_contract": build_code_agent_task_prompt(
+                task,
+                context,
+                modeling,
+                iteration=iteration,
+                target_relative=source_path,
+                output_relative=source_path.rsplit("/", 1)[0] + "/outputs",
+            ),
+            "handoff_paths": handoff_paths,
+            # Keep the selected implementation skills discoverable, but no
+            # longer concatenate the complete Model/Code policy stack into
+            # the same prompt.
+            "skill_context": _skill_context(self.skills, ("modeling-core", "coding-contract", "code-debugging", "numerical-validation")),
+        }, ensure_ascii=False)
+        prompt_path: Path | None = None
+        if self.workspace_root is not None:
+            prompt_path = self.workspace_root / Path(*source_path.split("/")).parent / "code-agent-prompt.md"
+            prompt_path.parent.mkdir(parents=True, exist_ok=True)
+            prompt_path.write_text(prompt, encoding="utf-8")
         try:
             if self.tool_runtime is not None and self.capabilities is not None:
                 logical_name = "solve_" + re.sub(r"[^A-Za-z0-9_-]+", "_", task.task_id) + ".py"
-                source_path = f".m2harness-code/{task.task_id}/iteration-{iteration}/{logical_name}"
+                raw_run_id = str(context.metadata.get("run_id", "unscoped")) if isinstance(context.metadata, dict) else "unscoped"
+                attempt = int(context.metadata.get("task_attempt", 1)) if isinstance(context.metadata, dict) else 1
+                source_path = f".m2harness-code/runs/{safe_run_name}/task-{task.task_id}/attempt-{attempt}/iteration-{iteration}/{logical_name}"
                 tool_prompt = prompt + json.dumps({
                     "tool_protocol": [
                         "You are a small Code Agent Harness. Use the supplied workspace tools for all file inspection and edits.",
                         "全过程使用中文交流、注释和验证说明；只在代码标识符中保留必要英文。",
-                        "Continue only the isolated Code Agent context from context.metadata.code_conversation; do not reset it on a revision iteration. Model Agent context is separate and arrives only through the handoff contract.",
+                        "Continue from the current typed projection and newest allowlisted handoff paths; do not reset the accepted modeling contract on a revision iteration.",
                         "首轮读取 model-to-code.md；返修轮优先读取最新的 model-to-code-revision.md。返修交接只包含增量修改指令，旧建模全文只能按路径按需读取，不得把旧报告当成新的返修要求。",
                         f"Write the complete deterministic Python source with workspace_write to {source_path}.",
                         "If the source is too large for one tool call, write it in ordered chunks: first workspace_write with overwrite=true, then workspace_write with append=true; never omit or summarize source chunks.",
                         "Use workspace_read/workspace_search to inspect staged inputs and existing files, and python_execute or validation_run for checks.",
                         "Do not replace the accepted modeling main scheme with a materially different algorithm or search space. If an implementation deviation is unavoidable, record it explicitly and do not claim stronger optimality than the evidence supports.",
                         "After the first complete implementation, run the checks needed for the required validations; do not silently replace the accepted model. Once a reproducible feasible result and its optimality/convergence evidence are available, write the final script and return the handoff JSON.",
-                        "Do not put source code in the final JSON. Return only logical_name, source_path, and expected_validations after the file is written and checked; do not invent a wall-clock timeout.",
+                        "Do not put source code in the final JSON. Return logical_name, source_path, expected_validations, and a finite timeout_seconds integer (1..86400) after the file is written and checked. The timeout is mandatory.",
                     ],
                     "final_schema": {
                         "type": "object", "additionalProperties": False,
-                        "required": ["logical_name", "source_path", "expected_validations"],
+                        "required": ["logical_name", "source_path", "expected_validations", "timeout_seconds"],
                         "properties": {
                             "logical_name": {"type": "string", "pattern": r"^[A-Za-z0-9._-]+\\.py$"},
                             "source_path": {"type": "string"},
                             "expected_validations": {"type": "array", "items": {"type": "string"}},
+                            "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
                         },
                     },
                 }, ensure_ascii=False)
-                bridge = MainHarnessToolBridge(self.tool_runtime, self.capabilities, workspace_root=self.workspace_root)
+                tool_prompt = prompt + "\n\n" + json.dumps({
+                    "tool_protocol": "Use only the supplied workspace tools. Write the complete source to the exact target path, run a changed-source validation when repairing, and then return one handoff JSON. Never repeat an identical tool call.",
+                    "target_source": source_path,
+                    "output_directory": source_path.rsplit("/", 1)[0] + "/outputs",
+                    "final_schema": {"required": ["logical_name", "source_path", "expected_validations", "timeout_seconds"]},
+                }, ensure_ascii=False)
+                if prompt_path is not None:
+                    prompt_path.write_text(tool_prompt, encoding="utf-8")
+                bridge = MainHarnessToolBridge(
+                    self.tool_runtime,
+                    self.capabilities,
+                    workspace_root=self.workspace_root,
+                    run_id=raw_run_name,
+                    task_attempt=attempt,
+                )
                 value = self.client.tool_agent_json(
                     system=system + "\nThis Code Agent has a Main Harness tool lane. Never claim a file was written unless a workspace_write tool result confirms it.",
                     content=_content_parts(context, tool_prompt, deepseek=bool(getattr(self.client, "_deepseek_mode", False))), schema=CodeProposal.model_json_schema(),
@@ -798,6 +855,7 @@ class QwenCodeProposalProvider(CodeProposalProvider):
                     if not read_result.get("ok"):
                         raise ValueError(f"Code Agent source_path could not be read: {read_result.get('error_message', 'unknown error')}")
                     value["source"] = (read_result.get("output") or {}).get("content", "")
+                    value["source_path"] = str(value["source_path"])
                     value.pop("source_path", None)
                 value.pop("source_path", None)
             else:
@@ -806,6 +864,12 @@ class QwenCodeProposalProvider(CodeProposalProvider):
             if isinstance(source, str) and source.strip().startswith("```"):
                 source = re.sub(r"^```(?:python)?\s*|\s*```$", "", source.strip(), flags=re.IGNORECASE)
                 value["source"] = source
+            if isinstance(value, dict) and source_path:
+                value.setdefault("metadata", {})
+                if isinstance(value["metadata"], dict):
+                    value["metadata"].update({"source_path": source_path, "agent_runtime": "qwen"})
+                    if prompt_path is not None:
+                        value["metadata"]["prompt_file"] = prompt_path.relative_to(self.workspace_root).as_posix()
             return CodeProposal.model_validate(value, strict=False)
         except Exception as exc:
             raise ActivityExecutionError(f"Qwen Code Proposal is invalid: {exc}") from exc
@@ -855,23 +919,24 @@ class QwenPaperComposer:
         return composition.final_report, artifact
 
 
-def build_qwen_solve_problem_service(*, sandbox, workspace_root, research_agent=None, skills=None, client: QwenChatClient | None = None, max_iterations: int = 3, tool_runtime: ToolRuntime | None = None, capabilities: CapabilityRegistry | None = None, archive_writer: SolveProblemArchivePort | None = None) -> SolveProblemService:
+def build_qwen_solve_problem_service(*, sandbox, workspace_root, research_agent=None, skills=None, client: QwenChatClient | None = None, max_iterations: int = 3, tool_runtime: ToolRuntime | None = None, capabilities: CapabilityRegistry | None = None, archive_writer: SolveProblemArchivePort | None = None, human_control=None) -> SolveProblemService:
     """Compose the target solve tool after ``build_local_runtime()`` created its sandbox."""
     qwen = client or QwenChatClient()
     from m2harness.infrastructure.code_harness import LocalPythonCodeHarness
 
     model_agent = QwenModelAgent(qwen, skills=skills)
-    code_harness = LocalPythonCodeHarness(QwenCodeProposalProvider(qwen, skills=skills, tool_runtime=tool_runtime, capabilities=capabilities, workspace_root=Path(workspace_root)), sandbox, workspace_root)
+    code_harness = LocalPythonCodeHarness(QwenCodeProposalProvider(qwen, skills=skills, tool_runtime=tool_runtime, capabilities=capabilities, workspace_root=Path(workspace_root)), sandbox, workspace_root, human_control=human_control)
     return SolveProblemService(
         model_agent, code_harness, max_iterations=max_iterations,
         research_agent=research_agent,
         file_reader=WorkspaceReadOnlyFileReader(workspace_root),
         archive_writer=archive_writer,
         probe_writer=archive_writer if hasattr(archive_writer, "record_probe") else None,
+        human_control=human_control,
     )
 
 
-def build_dsh_solve_problem_service(*, sandbox, workspace_root, research_agent=None, skills=None, client: QwenChatClient | None = None, max_iterations: int = 3, archive_writer: SolveProblemArchivePort | None = None, dsh_config=None, tool_runtime: ToolRuntime | None = None, capabilities: CapabilityRegistry | None = None) -> SolveProblemService:
+def build_dsh_solve_problem_service(*, sandbox, workspace_root, research_agent=None, skills=None, client: QwenChatClient | None = None, max_iterations: int = 3, archive_writer: SolveProblemArchivePort | None = None, dsh_config=None, tool_runtime: ToolRuntime | None = None, capabilities: CapabilityRegistry | None = None, human_control=None) -> SolveProblemService:
     """Compose the production LangGraph/DeepAgents Code Harness.
 
     ``dsh`` remains the stable CLI selector for compatibility with existing
@@ -888,14 +953,16 @@ def build_dsh_solve_problem_service(*, sandbox, workspace_root, research_agent=N
         Path(workspace_root), sandbox,
         base_url=qwen.base_url, model_name=qwen.model, api_key=qwen.api_key,
         skills=_deepagents_skill_paths(skills, Path(workspace_root)),
+        human_control=human_control,
     )
-    code_harness = LocalPythonCodeHarness(provider, sandbox, Path(workspace_root))
+    code_harness = LocalPythonCodeHarness(provider, sandbox, Path(workspace_root), human_control=human_control)
     return SolveProblemService(
         model_agent, code_harness, max_iterations=max_iterations,
         research_agent=research_agent,
         file_reader=WorkspaceReadOnlyFileReader(Path(workspace_root)),
         archive_writer=archive_writer,
         probe_writer=archive_writer if hasattr(archive_writer, "record_probe") else None,
+        human_control=human_control,
     )
 
 

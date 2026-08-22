@@ -40,12 +40,15 @@ class M2AgentAuditMiddleware(AgentMiddleware):
         metadata = self._metadata(runtime)
         task_id = str(metadata.get("m2h_task_id", "unscoped"))
         run_id = str(metadata.get("m2h_run_id", "unscoped"))
-        safe_run_id = "".join(char if char.isalnum() or char in "_.-" else "_" for char in run_id)
-        path = self.event_root / f"{safe_run_id}-{task_id}.ndjson"
+        run_name = str(metadata.get("m2h_run_name", run_id))
+        attempt = str(metadata.get("m2h_attempt", "1"))
+        safe_run_name = "".join(char if char.isalnum() or char in "_.-" else "_" for char in run_name)
+        path = self.event_root / safe_run_name / f"task-{task_id}__attempt-{attempt}.ndjson"
         payload: dict[str, Any] = {
             "occurred_at": datetime.now(UTC).isoformat(),
             "kind": f"middleware.{kind}",
             "task_id": task_id,
+            "attempt": metadata.get("m2h_attempt", 1),
             "iteration": metadata.get("m2h_iteration"),
             "runtime": metadata.get("m2h_runtime", "langchain"),
             **extra,

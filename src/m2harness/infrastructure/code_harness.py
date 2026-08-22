@@ -4,7 +4,8 @@
     one ``CodeProposal`` from a ``UnifiedModelingReport``; this adapter validates,
     materializes, executes, captures a Markdown report, and returns that report
     to the same Model Agent through Code→Model. Execution is observable and may
-    run until it naturally finishes; no default wall-clock deadline is imposed.
+    run within the finite timeout carried by the proposal; the local operator
+    can also interrupt it.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from m2harness.domain.solve_problem import (
     CodingHarnessReport, ReadOnlyFileReference, ReadOnlyFileRole,
     SolveProblemContext, SolveProblemTask, UnifiedModelingReport,
 )
+from m2harness.human_control import HumanControlStore, HumanInterruptRequested
 from m2harness.infrastructure.local_sandbox import LocalSandboxClient
 from m2harness.models import ArtifactKind, ProducedArtifact, ReportPayload
 
@@ -56,12 +58,13 @@ def _validate_python_policy(source: str) -> None:
 
 
 class LocalPythonCodeHarness:
-    def __init__(self, provider: CodeProposalProvider, sandbox: LocalSandboxClient, workspace_root: Path, *, max_output_bytes: int = 1_000_000) -> None:
+    def __init__(self, provider: CodeProposalProvider, sandbox: LocalSandboxClient, workspace_root: Path, *, max_output_bytes: int = 1_000_000, human_control: HumanControlStore | None = None) -> None:
         self.provider = provider
         self.sandbox = sandbox
         self.workspace_root = workspace_root.resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self.max_output_bytes = max_output_bytes
+        self.human_control = human_control
 
     def execute(self, task: SolveProblemTask, context: SolveProblemContext, modeling: UnifiedModelingReport, *, iteration: int) -> CodingHarnessReport:
         try:
@@ -74,7 +77,21 @@ class LocalPythonCodeHarness:
                 # UTF-8 on the Windows host as well as in Docker.
                 (sys.executable, "-I", "-X", "utf8", str(script_path)), timeout_seconds=proposal.timeout_seconds,
                 env={"PYTHONIOENCODING": "utf-8", "M2HARNESS_NETWORK": "deny"},
+                # Relative outputs belong to the exact task/attempt/iteration
+                # lane that produced the source.  Using the workspace root
+                # here was the main source of cross-run output contamination.
+                cwd=script_path.parent,
+                cancel_check=(
+                    (lambda: self.human_control.is_interrupted(str(context.metadata["run_id"])))
+                    if self.human_control is not None and context.metadata.get("run_id") else None
+                ),
             )
+            if output.cancelled and self.human_control is not None and context.metadata.get("run_id"):
+                raise HumanInterruptRequested(
+                    str(context.metadata["run_id"]), task.task_id, iteration,
+                    "operator requested interrupt during generated script execution",
+                    context=context,
+                )
             stdout = output.stdout[:self.max_output_bytes].decode("utf-8", errors="replace")
             stderr = output.stderr[:self.max_output_bytes].decode("utf-8", errors="replace")
             parsed = self._parse_json(stdout)
@@ -109,7 +126,7 @@ class LocalPythonCodeHarness:
             if parsed is not None and not validation_evidence:
                 issues.append("未提供逐项结构化证据索引；Model Agent 应直接使用 Markdown 报告")
             metrics = parsed.get("metrics", {}) if isinstance(parsed, dict) and isinstance(parsed.get("metrics", {}), dict) else {}
-            log = json.dumps({"exit_code": output.exit_code, "timed_out": output.timed_out, "stdout": stdout, "stderr": stderr}, ensure_ascii=False, indent=2)
+            log = json.dumps({"exit_code": output.exit_code, "timed_out": output.timed_out, "cancelled": output.cancelled, "stdout": stdout, "stderr": stderr}, ensure_ascii=False, indent=2)
             report_markdown = "\n".join([
                 "# Code Harness 执行报告",
                 "",
@@ -143,6 +160,8 @@ class LocalPythonCodeHarness:
                     ProducedArtifact(logical_name=proposal.logical_name.removesuffix(".py") + ".execution.json", kind=ArtifactKind.LOG, media_type="application/json", text=log),
                 ], generated_files=generated_files,
             )
+        except HumanInterruptRequested:
+            raise
         except Exception as exc:
             return CodingHarnessReport(
                 report=ReportPayload(title="Local Code Harness failure", summary="Code execution did not produce accepted evidence.", markdown="# Code Harness\n\nExecution failed before acceptance.", claims=[], limitations=[str(exc)[:2_000]]),
@@ -150,10 +169,16 @@ class LocalPythonCodeHarness:
             )
 
     def _write_script(self, task: SolveProblemTask, proposal: CodeProposal, *, iteration: int) -> Path:
-        # Separate task/iteration lanes prevent parallel root DAG nodes from
-        # overwriting one another while preserving the shared workspace for
-        # staged input data and generated output files.
-        target = (self.workspace_root / ".m2harness-code" / task.task_id / f"iteration-{iteration}" / proposal.logical_name).resolve()
+        # Providers that own a run-scoped source lane advertise it in metadata.
+        # Keep the old fallback only for direct unit-test/legacy callers; a
+        # production provider must never silently fall back to an unscoped
+        # task directory.
+        declared = proposal.metadata.get("source_path") if proposal.metadata else None
+        if declared:
+            normalized = declared.replace("\\", "/").lstrip("/")
+            target = (self.workspace_root / Path(*normalized.split("/"))).resolve()
+        else:
+            target = (self.workspace_root / ".m2harness-code" / task.task_id / f"iteration-{iteration}" / proposal.logical_name).resolve()
         if self.workspace_root not in target.parents:
             raise ValueError("generated script escapes workspace")
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -179,14 +204,18 @@ class LocalPythonCodeHarness:
                 role=ReadOnlyFileRole.GENERATED, owner_task_id=task.task_id,
                 media_type="text/x-python", sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
             ))
-        output_dir = (self.workspace_root / ".m2harness-code" / task.task_id / f"iteration-{iteration}" / "outputs").resolve()
+        output_dir = (
+            script_path.parent / "outputs"
+            if script_path is not None
+            else self.workspace_root / ".m2harness-code" / task.task_id / f"iteration-{iteration}" / "outputs"
+        ).resolve()
         candidates: list[Path] = []
         if output_dir.is_dir():
             candidates.extend(sorted(output_dir.rglob("*")))
         # Mature Code Agent runtimes expose their durable event stream as an
         # ordinary review artifact.  Only provider-declared relative paths are
         # admitted; arbitrary metadata cannot grant filesystem access.
-        for metadata_key in ("event_log", "prompt_file"):
+        for metadata_key in ("event_log", "prompt_file", "session_manifest", "prompt_index"):
             declared_path = (metadata or {}).get(metadata_key)
             if not declared_path:
                 continue
@@ -213,7 +242,11 @@ class LocalPythonCodeHarness:
             mutable_audit_log = False
             if metadata:
                 declared_event = (metadata.get("event_log") or "").replace("\\", "/")
-                mutable_audit_log = path.relative_to(self.workspace_root).as_posix() == declared_event
+                declared_prompt_index = (metadata.get("prompt_index") or "").replace("\\", "/")
+                mutable_audit_log = (
+                    path.relative_to(self.workspace_root).as_posix() == declared_event
+                    or path.relative_to(self.workspace_root).as_posix() == declared_prompt_index
+                )
             result.append(ReadOnlyFileReference(
                 relative_path=path.relative_to(self.workspace_root).as_posix(),
                 purpose=(
