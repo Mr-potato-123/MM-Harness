@@ -972,21 +972,22 @@ class SolveProblemService:
 
 
 def _preliminary_markdown(report: PreliminaryModelingReport) -> str:
+    """Render exactly one preliminary report body.
+
+    The typed fields remain the internal contract sent to Code Agent.  They
+    are deliberately not rendered once as a synthetic outline and again as
+    the provider's Markdown, which previously made one report look like two.
+    Exploration is an upstream input to this report, not another report
+    appended to it.
+    """
+
     lines = [
-        f"# 初步建模路线：{report.branch_id}",
-        "", "## 候选方案", "", report.candidate_scheme,
-        "", "## 假设", "", *(f"- {item}" for item in report.assumptions),
-        "", "## 必须验证", "", *(f"- {item}" for item in report.required_validations),
-        "", "## 预期输出", "", *(f"- {item}" for item in report.expected_outputs),
-        "", "## 预期图", "", *(f"- {item}" for item in report.expected_figures),
-        "", "## 编码提示", "", *(f"- {item}" for item in report.coding_instructions),
-        "", "## 风险", "", *(f"- {item}" for item in report.risks),
-        "", "## 探索总结", "",
-        report.exploration_summary.markdown if report.exploration_summary is not None else "（兼容旧适配器：未单独返回探索总结。）",
-        "", "## Model Agent 报告", "", report.report.markdown,
+        f"# 初步建模报告：{report.report.title}",
+        "",
+        report.report.markdown.strip(),
     ]
-    if report.requested_file_paths:
-        lines.extend(["", "## 请求的只读文件", "", *(f"- `{item}`" for item in report.requested_file_paths)])
+    if report.report.limitations:
+        lines.extend(["", "## 当前限制", "", *(f"- {item}" for item in report.report.limitations)])
     return "\n".join(lines).strip() + "\n"
 
 
