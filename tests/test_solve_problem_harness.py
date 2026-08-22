@@ -281,7 +281,7 @@ class SolveProblemHarnessTest(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 reader.disclose(SolveProblemContext(readonly_files=(reference,)), ("not-allowed.md",))
 
-    def test_binary_progressive_disclosure_is_skipped_not_fatal(self) -> None:
+    def test_pdf_progressive_disclosure_keeps_original_path_and_text_marker(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             data = b"%PDF-1.7\x00\xffbinary"
@@ -294,7 +294,53 @@ class SolveProblemHarnessTest(unittest.TestCase):
             disclosed = WorkspaceReadOnlyFileReader(root).disclose(
                 SolveProblemContext(readonly_files=(reference,)), ("problem.pdf",)
             )
-            self.assertEqual(disclosed, ())
+            self.assertEqual(len(disclosed), 1)
+            self.assertEqual(disclosed[0].relative_path, "problem.pdf")
+            self.assertIn("原始 PDF", disclosed[0].content)
+
+    def test_pdf_is_auto_disclosed_and_embedded_in_each_detailed_handoff(self) -> None:
+        class PdfAwareModel(FakeModelAgent):
+            def __init__(self):
+                super().__init__()
+                self.first_context = None
+
+            def explore(self, task, context, *, branch_count, iteration):
+                self.first_context = context
+                return super().explore(task, context, branch_count=branch_count, iteration=iteration)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            raw = b"%PDF-1.7\noriginal problem bytes"
+            pdf = root / "problem.pdf"
+            pdf.write_bytes(raw)
+            reference = ReadOnlyFileReference(
+                relative_path="problem.pdf", purpose="原始题面 PDF",
+                role=ReadOnlyFileRole.PROBLEM, media_type="application/pdf",
+                sha256=hashlib.sha256(raw).hexdigest(), size_bytes=len(raw),
+            )
+            model = PdfAwareModel()
+            run_id = uuid4()
+            result = SolveProblemService(
+                model, FakeCodeHarness(), max_iterations=2,
+                file_reader=WorkspaceReadOnlyFileReader(root),
+                archive_writer=RunReportStore(root),
+            ).solve(
+                SolveProblemTask(task_id="q1", title="Q", problem="P"),
+                SolveProblemContext(readonly_files=(reference,), metadata={"run_id": str(run_id)}),
+            )
+            self.assertEqual(result.status, SolveProblemStatus.COMPLETED)
+            assert model.first_context is not None
+            self.assertTrue(any(item.relative_path == "problem.pdf" for item in model.first_context.disclosed_text_files))
+            exchange_root = root / "reports" / "runs" / str(run_id) / "tasks" / "q1" / "attempt-1" / "exchanges"
+            model_to_code = next(exchange_root.rglob("model-to-code.md")).read_text(encoding="utf-8")
+            code_to_review = next(exchange_root.rglob("code-to-review.md")).read_text(encoding="utf-8")
+            review_to_next = next(exchange_root.rglob("review-to-next-stage.md")).read_text(encoding="utf-8")
+            for text in (model_to_code, code_to_review, review_to_next):
+                self.assertIn("原始题面 PDF", text)
+                self.assertIn("problem.pdf", text)
+            self.assertIn("本轮完整建模报告", model_to_code)
+            self.assertIn("本轮完整 Code Harness 报告", code_to_review)
+            self.assertIn("被审查的完整执行报告", review_to_next)
 
     def test_probe_ledger_is_written_for_each_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

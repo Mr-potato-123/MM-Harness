@@ -178,6 +178,26 @@ class WorkspaceReadOnlyFileReader:
             if remaining <= 0:
                 break
             limit = min(self.max_file_bytes, remaining)
+            if reference.media_type.lower() == "application/pdf" or requested.lower().endswith(".pdf"):
+                # The original PDF remains a binary, read-only allowlisted
+                # input and is also sent through the multimodal lane.  For a
+                # textual handoff, disclose a local extraction of the same
+                # original bytes instead of silently dropping the request.
+                # If PyMuPDF is unavailable or the fixture is not a valid PDF,
+                # return an explicit path/digest marker rather than pretending
+                # that the original was inaccessible.
+                extracted = self._extract_pdf_text(raw, limit)
+                content = extracted or (
+                    f"[原始 PDF 二进制题面未做文本抽取；请通过只读路径打开原文件。]\\n"
+                    f"path={requested}\\nmedia_type={reference.media_type}\\n"
+                    f"sha256={digest}\\nsize_bytes={len(raw)}"
+                )
+                result.append(DisclosedTextFile(
+                    relative_path=requested, purpose=reference.purpose + "；原始 PDF 只读输入及其本地文本披露。",
+                    content=content[:limit], sha256=digest, truncated=len(content.encode("utf-8")) > limit,
+                ))
+                total += min(len(content.encode("utf-8")), limit)
+                continue
             sample = raw[:limit]
             try:
                 content = sample.decode("utf-8")
@@ -196,6 +216,39 @@ class WorkspaceReadOnlyFileReader:
             ))
             total += len(sample)
         return tuple(result)
+
+    @staticmethod
+    def _extract_pdf_text(raw: bytes, limit: int) -> str:
+        """Extract bounded text locally while preserving the original PDF path."""
+
+        try:
+            try:
+                import pymupdf as fitz
+            except ImportError:
+                import fitz  # type: ignore[no-redef]
+            document = fitz.open(stream=raw, filetype="pdf")
+            try:
+                chunks: list[str] = []
+                used = 0
+                for page_number, page in enumerate(document, start=1):
+                    text = str(page.get_text("text") or "")
+                    if not text:
+                        continue
+                    chunk = f"\\n--- PDF 原文第 {page_number} 页 ---\\n{text}"
+                    remaining = limit - used
+                    if remaining <= 0:
+                        break
+                    encoded = chunk.encode("utf-8")
+                    if len(encoded) > remaining:
+                        chunks.append(encoded[:remaining].decode("utf-8", errors="ignore"))
+                        break
+                    chunks.append(chunk)
+                    used += len(encoded)
+                return "".join(chunks).strip()
+            finally:
+                document.close()
+        except Exception:
+            return ""
 
 
 @dataclass(frozen=True)
@@ -253,6 +306,35 @@ class SolveProblemService:
                 top_k=min(12, max(4, task.max_branches * 2)),
             )
             current_context = current_context.model_copy(update={"research_report": research})
+        # The original problem PDF is always part of the boundary contract,
+        # not an optional binary that disappears when an Agent asks for
+        # progressive disclosure.  Keep the original allowlisted path and
+        # proactively add a bounded local text extraction to the same context
+        # so every detailed report/handoff can show both forms of the source.
+        pdf_paths = tuple(dict.fromkeys(
+            item.relative_path for item in current_context.readonly_files
+            if item.role == ReadOnlyFileRole.PROBLEM
+            and (item.media_type.lower() == "application/pdf" or item.relative_path.lower().endswith(".pdf"))
+        ))
+        if pdf_paths and self.file_reader is not None:
+            self._probe(current_context, task, None, "problem_pdf_disclosure_start", "Main Harness", "started", {
+                "paths": list(pdf_paths),
+            })
+            try:
+                disclosed_pdf = self.file_reader.disclose(current_context, pdf_paths)
+            except Exception as exc:
+                self._probe(current_context, task, None, "problem_pdf_disclosure_failed", "Main Harness", "failed", {
+                    "paths": list(pdf_paths), "error": str(exc)[:2_000],
+                })
+                raise
+            if disclosed_pdf:
+                current_context = current_context.model_copy(update={
+                    "disclosed_text_files": (*current_context.disclosed_text_files, *disclosed_pdf),
+                })
+            self._probe(current_context, task, None, "problem_pdf_disclosure_complete", "Main Harness", "completed", {
+                "requested_paths": list(pdf_paths),
+                "disclosed_paths": [item.relative_path for item in disclosed_pdf],
+            })
         iterations: list[SolveProblemIteration] = []
         revision_instructions: tuple[str, ...] = ()
         revision_target = RevisionTarget.FULL
@@ -534,7 +616,7 @@ class SolveProblemService:
             current_context = self._archive(
                 current_context, task, iteration_number, "handoff", "review-to-next-stage",
                 _compact_review_to_next_stage_handoff(
-                    task, current_context, review, iteration_number,
+                    task, current_context, modeling, coding, review, iteration_number,
                     max_revision_rounds=self.revision_round_limit,
                 ),
                 purpose=f"Explicit Review Agent decision handoff for {task.task_id}, iteration {iteration_number}.",
@@ -894,6 +976,50 @@ def _handoff_budget_lines(iteration: int, max_revision_rounds: int) -> list[str]
     ]
 
 
+def _problem_pdf_lines(context: SolveProblemContext) -> list[str]:
+    """Render the original PDF as an explicit read-only handoff input."""
+
+    files = [
+        item for item in context.readonly_files
+        if item.role == ReadOnlyFileRole.PROBLEM
+        and (item.media_type.lower() == "application/pdf" or item.relative_path.lower().endswith(".pdf"))
+    ]
+    multimodal_names = {item.logical_name for item in context.multimodal_inputs}
+    if not files:
+        return ["- 未提供原始 PDF；请勿假设题面已被读取。"]
+    lines: list[str] = []
+    for item in files:
+        name = Path(item.relative_path).name
+        lines.extend([
+            f"- 原始文件：`{item.relative_path}`",
+            f"  - 作用：{item.purpose}",
+            f"  - 只读角色：`{item.role.value}`；媒体类型：`{item.media_type}`",
+            f"  - sha256：`{item.sha256 or '运行时核验'}`；大小：`{item.size_bytes if item.size_bytes is not None else '运行时核验'} bytes`",
+            f"  - 多模态输入：`{'已提供' if name in multimodal_names else '未单独提供'}`",
+            "  - 披露规则：原始 PDF 不复制进交接 Markdown；Agent 只能按此白名单路径只读打开，文本抽取作为同一上下文的辅助证据。",
+        ])
+    return lines
+
+
+def _disclosed_text_lines(context: SolveProblemContext) -> list[str]:
+    """Include the exact disclosed text in detailed handoffs, when present."""
+
+    if not context.disclosed_text_files:
+        return ["- （暂无已披露文本；二进制原文仍以只读路径提供。）"]
+    lines: list[str] = []
+    for item in context.disclosed_text_files:
+        lines.extend([
+            f"### `{item.relative_path}`",
+            f"- 作用：{item.purpose}",
+            f"- sha256（原始文件）：`{item.sha256}`；是否截断：`{item.truncated}`",
+            "",
+            "```text",
+            item.content,
+            "```",
+        ])
+    return lines
+
+
 def _compact_model_to_code_handoff(
     task: SolveProblemTask,
     context: SolveProblemContext,
@@ -903,7 +1029,7 @@ def _compact_model_to_code_handoff(
     *,
     max_revision_rounds: int = MAX_REVISION_ROUNDS,
 ) -> str:
-    """Short, human-readable index; typed modeling remains in the call context."""
+    """Detailed Model→Code report and handoff in one durable Markdown file."""
 
     lines = [
         "# 交接：Model Agent → Code Agent", "",
@@ -918,7 +1044,15 @@ def _compact_model_to_code_handoff(
         f"- 期望输出：{'; '.join(modeling.expected_outputs[:12])}",
         f"- 编码指令：{'; '.join(modeling.coding_instructions[:16])}",
         f"- 初步路线数：{len(preliminary)}",
+        "", "## 原始题面 PDF（只读原文输入）", "", *_problem_pdf_lines(context),
+        "", "## 已披露题面文本（与原始 PDF 对应）", "", *_disclosed_text_lines(context),
         "", "## 只读文件索引", "", *_handoff_file_table(context, task.task_id),
+        "", "## 本轮完整建模报告（与本交接同时归档）", "",
+        *_modeling_markdown(modeling).splitlines(),
+        "", "## 初步路线报告全文", "",
+        *[line for item in preliminary for line in (
+            [f"### 路线 `{item.branch_id}`", "", *_preliminary_markdown(item).splitlines(), ""]
+        )],
         "", "## Model Agent 上下文最近事件", "", *_conversation_lines(context, "model"),
         "", "## Code Agent 必须完成", "",
         "- 只实现本题范围；使用受限工具写入、读取和验证源代码。",
@@ -936,10 +1070,11 @@ def _compact_code_to_review_handoff(
     *,
     max_revision_rounds: int = MAX_REVISION_ROUNDS,
 ) -> str:
+    """Detailed Code→Review report and handoff in one durable Markdown file."""
     lines = [
         "# 交接：Code Harness → Review Agent", "",
         f"- 题目：`{task.task_id}` — {task.title}", f"- 迭代：`{iteration}`",
-        "- 同一共享会话中的执行→审查交接；本文件只列可核验摘要和路径。",
+        "- 同一共享会话中的执行→审查交接；本文件同时保存完整执行报告、证据索引和转接契约。",
         "- 转接理由：Code Agent 已返回本轮执行结果；Review Agent 现在只负责核验声明、验证证据和产物完整性，并决定批准或指定最窄返修目标。",
         *_handoff_budget_lines(iteration, max_revision_rounds),
         "", "## 执行摘要", "",
@@ -954,7 +1089,11 @@ def _compact_code_to_review_handoff(
         "", "## 产物索引", "",
         *(f"- `{item.logical_name}` ({item.kind.value})" for item in coding.artifacts[:16]),
         *(f"- `{item.relative_path}` ({item.role.value})" for item in coding.generated_files),
+        "", "## 原始题面 PDF（只读原文输入）", "", *_problem_pdf_lines(context),
+        "", "## 已披露题面文本（与原始 PDF 对应）", "", *_disclosed_text_lines(context),
         "", "## 只读文件索引", "", *_handoff_file_table(context, task.task_id),
+        "", "## 本轮完整 Code Harness 报告（与本交接同时归档）", "",
+        *_coding_markdown(coding).splitlines(),
         "", "## Code Agent 上下文最近事件", "", *_conversation_lines(context, "code"),
         "", "## Review Agent 必须完成", "",
         "- 以 Markdown 执行报告、源代码、exit_code 和产物逐项核验；不得因单个 false 索引字段直接否决。",
@@ -967,11 +1106,14 @@ def _compact_code_to_review_handoff(
 def _compact_review_to_next_stage_handoff(
     task: SolveProblemTask,
     context: SolveProblemContext,
+    modeling: UnifiedModelingReport,
+    coding: CodingHarnessReport,
     review: SolveProblemReview,
     iteration: int,
     *,
     max_revision_rounds: int = MAX_REVISION_ROUNDS,
 ) -> str:
+    """Detailed Review→next-stage handoff retaining the reports it judged."""
     instruction_lines = [f"- {item}" for item in review.revision_instructions] or [
         "- 无返修指令；若执行成功，进入最终报告。"
     ]
@@ -992,6 +1134,11 @@ def _compact_review_to_next_stage_handoff(
         "", "## 审查结论", "", f"- 理由：{review.rationale[:2400]}",
         "", "## 必须执行的返修指令", "", *instruction_lines,
         "", "## 请求披露的文件", "", *requested_lines,
+        "", "## 原始题面 PDF（只读原文输入）", "", *_problem_pdf_lines(context),
+        "", "## 已披露题面文本（与原始 PDF 对应）", "", *_disclosed_text_lines(context),
+        "", "## 被审查的完整建模报告", "", *_modeling_markdown(modeling).splitlines(),
+        "", "## 被审查的完整执行报告", "", *_coding_markdown(coding).splitlines(),
+        "", "## 本轮完整 Review 报告", "", *_review_markdown(review).splitlines(),
         "", "## 下轮 Model Agent 上下文", "", *_conversation_lines(context, "model"),
         "", "## 仍可见的文件索引", "", *_handoff_file_table(context, task.task_id),
     ]
