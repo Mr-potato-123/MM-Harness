@@ -417,14 +417,14 @@ def _data_profile(env: LocalToolEnvironment, args: dict[str, Any]) -> dict[str, 
     return {"path": args["path"], "sha256": _digest(data), "rows": len(rows), "columns": columns, "stats": stats, "preview": rows[: min(int(args.get("preview_rows", 10)), 50)]}
 
 
-def _run_python(env: LocalToolEnvironment, code: str, timeout_seconds: int, max_output_bytes: int) -> dict[str, Any]:
+def _run_python(env: LocalToolEnvironment, code: str, timeout_seconds: int | None, max_output_bytes: int) -> dict[str, Any]:
     if not code.strip():
         raise ValueError("code must not be empty")
     if len(code.encode("utf-8")) > MAX_CODE_BYTES:
         raise ValueError(f"code exceeds execution budget ({MAX_CODE_BYTES} bytes)")
     _validate_local_code_policy(code)
-    if timeout_seconds < 1 or timeout_seconds > 600:
-        raise ValueError("timeout_seconds must be between 1 and 600")
+    if timeout_seconds is not None and (not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool) or not 1 <= timeout_seconds <= 86_400):
+        raise ValueError("timeout_seconds is optional; an explicit value is only an operator emergency stop")
     script = None
     started = time.monotonic()
     try:
@@ -472,11 +472,13 @@ def _validate_local_code_policy(code: str) -> None:
 
 
 def _python_execute(env: LocalToolEnvironment, args: dict[str, Any]) -> dict[str, Any]:
-    return _run_python(env, args["code"], int(args.get("timeout_seconds", 60)), min(int(args.get("max_output_bytes", 100_000)), 1_000_000))
+    raw_timeout = args.get("timeout_seconds")
+    return _run_python(env, args["code"], raw_timeout if raw_timeout is None else int(raw_timeout), min(int(args.get("max_output_bytes", 100_000)), 1_000_000))
 
 
 def _validation_run(env: LocalToolEnvironment, args: dict[str, Any]) -> dict[str, Any]:
-    result = _run_python(env, args["code"], int(args.get("timeout_seconds", 120)), min(int(args.get("max_output_bytes", 100_000)), 1_000_000))
+    raw_timeout = args.get("timeout_seconds")
+    result = _run_python(env, args["code"], raw_timeout if raw_timeout is None else int(raw_timeout), min(int(args.get("max_output_bytes", 100_000)), 1_000_000))
     passed = result["exit_code"] == 0 and not result["timed_out"]
     parsed: Any = None
     if result["stdout"].strip():
@@ -640,7 +642,7 @@ def _web_search(env: LocalToolEnvironment, args: dict[str, Any]) -> dict[str, An
     }
 
 
-def _definition(name: str, capability: str, description: str, input_schema: dict[str, Any], *, side_effect: str = "none", policy: ToolPolicy | None = None, timeout: int = 60, output_limit_bytes: int = 1_048_576) -> ToolDefinition:
+def _definition(name: str, capability: str, description: str, input_schema: dict[str, Any], *, side_effect: str = "none", policy: ToolPolicy | None = None, timeout: int | None = 60, output_limit_bytes: int = 1_048_576) -> ToolDefinition:
     return ToolDefinition(
         name=name, version="1", description=description, input_schema={"type": "object", "additionalProperties": False, **input_schema}, output_schema={"type": "object"},
         required_capability=CapabilityRef(name=capability), side_effect=side_effect,
@@ -674,10 +676,10 @@ def register_local_tools(registry: ToolRegistry, env: LocalToolEnvironment) -> T
                      {"required": ["path"], "properties": {"path": {"type": "string"}, "max_bytes": {"type": "integer"}}}), _image_inspect),
         (_definition("data_profile", "data.profile", "Profile CSV, JSON, or JSONL data with deterministic basic statistics.",
                      {"required": ["path"], "properties": {"path": {"type": "string"}, "max_bytes": {"type": "integer"}, "preview_rows": {"type": "integer"}}}), _data_profile),
-        (_definition("python_execute", "python.execute", "Execute bounded Python in the local workspace with no shell and a scrubbed environment.",
-                     {"required": ["code"], "properties": {"code": {"type": "string"}, "timeout_seconds": {"type": "integer"}, "max_output_bytes": {"type": "integer"}}}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write"), timeout=600), _python_execute),
-        (_definition("validation_run", "validation.numerical", "Run a bounded validation script and return pass/fail plus optional JSON output.",
-                     {"required": ["code"], "properties": {"code": {"type": "string"}, "timeout_seconds": {"type": "integer"}, "max_output_bytes": {"type": "integer"}}}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write"), timeout=600), _validation_run),
+        (_definition("python_execute", "python.execute", "Execute Python in the trusted local workspace with no shell; observe its Markdown report until it returns.",
+                     {"required": ["code"], "properties": {"code": {"type": "string"}, "timeout_seconds": {"type": ["integer", "null"]}, "max_output_bytes": {"type": "integer"}}}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write"), timeout=None), _python_execute),
+        (_definition("validation_run", "validation.numerical", "Run a validation script in the trusted local workspace and return its report.",
+                     {"required": ["code"], "properties": {"code": {"type": "string"}, "timeout_seconds": {"type": ["integer", "null"]}, "max_output_bytes": {"type": "integer"}}}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write"), timeout=None), _validation_run),
         (_definition("report_render", "report.finalize", "Render a reviewed Markdown report, escaped HTML, and optionally validated LaTeX into the workspace.",
                      {"required": ["markdown"], "properties": {"markdown": {"type": "string"}, "title": {"type": "string"}, "path": {"type": "string"}, "latex": {"type": "string"}, "latex_path": {"type": "string"}, "overwrite": {"type": "boolean"}}}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write")), _report_render),
         (_definition("latex_validate", "report.publish", "Validate a local LaTeX publication contract without executing a TeX compiler.",
@@ -691,7 +693,7 @@ def register_local_tools(registry: ToolRegistry, env: LocalToolEnvironment) -> T
                              "max_branches": {"type": "integer", "minimum": 1, "maximum": 16}, "revision": {"type": "integer", "minimum": 0}, "metadata": {"type": "object"},
                          }},
                          "context": {"type": "object"}, "max_iterations": {"type": "integer", "minimum": 1, "maximum": 20},
-                     }}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write"), timeout=3_600, output_limit_bytes=32 * 1024 * 1024), _solve_problem),
+                     }}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write"), timeout=None, output_limit_bytes=32 * 1024 * 1024), _solve_problem),
         (_definition("knowledge_search", "knowledge.search", "Search the local HMML/modeling knowledge index; results are evidence hints, not Harness instructions.",
                      {"required": ["query"], "properties": {"query": {"type": "string", "minLength": 1}, "top_k": {"type": "integer", "minimum": 1, "maximum": 50}}}), _knowledge_search),
         (_definition("dag_task_table", "workflow.plan", "Validate and normalize the mainline DAG task table; its terminal task must publish the final LaTeX paper.",

@@ -22,6 +22,7 @@ from m2harness import (
     SolveProblemStatus,
     SolveProblemTask,
     SolveProblemReview,
+    RevisionTarget,
     UnifiedModelingReport,
     build_local_runtime,
     canonical_main_harness_dag,
@@ -140,6 +141,27 @@ class SolveProblemHarnessTest(unittest.TestCase):
         self.assertEqual(model.explorations, [3])
         self.assertEqual(len(result.iterations[0].preliminary_reports), 3)
         self.assertEqual(result.iterations[0].review.decision, ModelReviewDecision.REVISE)
+
+    def test_code_to_model_repair_forces_code_without_reexploration(self) -> None:
+        class OverstrictModel(FakeModelAgent):
+            def review(self, task, context, modeling, coding, *, iteration):
+                self.reviews += 1
+                if self.reviews == 1:
+                    return SolveProblemReview(
+                        decision=ModelReviewDecision.REVISE,
+                        rationale="代码报告缺少一项可复现证据",
+                        revision_target=RevisionTarget.MODEL,
+                        revision_instructions=("在现有源码中补齐该证据并重新执行",),
+                    )
+                return SolveProblemReview(decision=ModelReviewDecision.APPROVE, rationale="报告已补齐")
+
+        model = OverstrictModel()
+        result = SolveProblemService(model, FakeCodeHarness(), max_iterations=2).solve(
+            SolveProblemTask(task_id="q1", title="Q", problem="P", difficulty=4),
+        )
+        self.assertEqual(result.status, SolveProblemStatus.COMPLETED)
+        self.assertEqual(model.explorations, [2])
+        self.assertEqual(result.iterations[0].review.revision_target.value, "code")
 
     def test_main_harness_dispatches_only_solve_problem_nodes_and_unlocks_terminal(self) -> None:
         service = SolveProblemService(FakeModelAgent(), FakeCodeHarness(), max_iterations=2)
@@ -333,14 +355,14 @@ class SolveProblemHarnessTest(unittest.TestCase):
             self.assertTrue(any(item.relative_path == "problem.pdf" for item in model.first_context.disclosed_text_files))
             exchange_root = root / "reports" / "runs" / str(run_id) / "tasks" / "q1" / "attempt-1" / "exchanges"
             model_to_code = next(exchange_root.rglob("model-to-code.md")).read_text(encoding="utf-8")
-            code_to_review = next(exchange_root.rglob("code-to-review.md")).read_text(encoding="utf-8")
-            review_to_next = next(exchange_root.rglob("review-to-next-stage.md")).read_text(encoding="utf-8")
-            for text in (model_to_code, code_to_review, review_to_next):
+            code_to_model = next(exchange_root.rglob("code-to-model.md")).read_text(encoding="utf-8")
+            model_to_code_revision = next(exchange_root.rglob("model-to-code-revision.md")).read_text(encoding="utf-8")
+            for text in (model_to_code, code_to_model, model_to_code_revision):
                 self.assertIn("原始题面 PDF", text)
                 self.assertIn("problem.pdf", text)
             self.assertIn("本轮完整建模报告", model_to_code)
-            self.assertIn("本轮完整 Code Harness 报告", code_to_review)
-            self.assertIn("被审查的完整执行报告", review_to_next)
+            self.assertIn("本轮完整 Code Harness 报告", code_to_model)
+            self.assertIn("被审查的完整执行报告", model_to_code_revision)
 
     def test_probe_ledger_is_written_for_each_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -362,8 +384,8 @@ class SolveProblemHarnessTest(unittest.TestCase):
             events = [json.loads(line) for line in probe.read_text(encoding="utf-8").splitlines()]
             names = {item["event"] for item in events}
             self.assertIn("model_to_code_handoff", names)
-            self.assertIn("code_to_review_handoff", names)
-            self.assertIn("review_to_next_stage_handoff", names)
+            self.assertIn("code_to_model_handoff", names)
+            self.assertIn("model_to_code_revision_handoff", names)
 
     def test_probe_records_model_failure_reason(self) -> None:
         class FailingModel(FakeModelAgent):
@@ -513,18 +535,20 @@ class SolveProblemHarnessTest(unittest.TestCase):
             self.assertTrue(expected.issubset(names), names)
             self.assertGreaterEqual(len(list(exchange_root.rglob("*.md"))), 7)
             model_to_code = next(exchange_root.rglob("model-to-code.md"))
-            code_to_review = next(exchange_root.rglob("code-to-review.md"))
+            code_to_model = next(exchange_root.rglob("code-to-model.md"))
             self.assertLess(model_to_code.stat().st_size, 12_000)
-            self.assertLess(code_to_review.stat().st_size, 12_000)
+            self.assertLess(code_to_model.stat().st_size, 12_000)
             self.assertIn("输出", model_to_code.read_text(encoding="utf-8"))
-            self.assertIn("输出", code_to_review.read_text(encoding="utf-8"))
+            self.assertIn("输出", code_to_model.read_text(encoding="utf-8"))
             model_to_code_text = model_to_code.read_text(encoding="utf-8")
-            code_to_review_text = code_to_review.read_text(encoding="utf-8")
-            review_to_next = next(exchange_root.rglob("review-to-next-stage.md")).read_text(encoding="utf-8")
+            code_to_model_text = code_to_model.read_text(encoding="utf-8")
+            model_to_code_revision = next(exchange_root.rglob("model-to-code-revision.md")).read_text(encoding="utf-8")
             self.assertIn("转接理由", model_to_code_text)
-            self.assertIn("转接理由", code_to_review_text)
-            self.assertIn("转接理由", review_to_next)
-            self.assertIn("返修上限", review_to_next)
+            self.assertIn("转接理由", code_to_model_text)
+            self.assertIn("转接理由", model_to_code_revision)
+            self.assertIn("返修上限", model_to_code_revision)
+            self.assertNotIn("execution_succeeded", code_to_model_text)
+            self.assertNotIn("timed_out", code_to_model_text)
             persisted = RunReportStore(root).persist(run_id, result, attempt=1)
             self.assertTrue(any("/exchanges/" in item.relative_path.replace("\\", "/") for item in persisted))
 
@@ -704,7 +728,7 @@ class SolveProblemHarnessTest(unittest.TestCase):
             self.assertIn("Skill: modeling-core", code_prompt["skill_context"])
             self.assertNotIn("## Explicit omissions", code_prompt["skill_context"])
             self.assertIn("The Main Harness owns", client.systems[0])
-            self.assertIn("independent Review Agent", client.systems[2])
+            self.assertIn("同一个 Model Agent", json.dumps(client.calls[2], ensure_ascii=False))
             self.assertIn("Code Agent", client.systems[4])
             self.assertEqual(final.title, "final")
             self.assertEqual(proposal.logical_name, "generated_solution.py")

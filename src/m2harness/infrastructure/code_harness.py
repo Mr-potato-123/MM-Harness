@@ -1,10 +1,10 @@
-"""PI-inspired bounded local Code Harness.
+"""PI-inspired local Code Harness.
 
-The Code Harness owns realization, not modeling decisions.  A provider supplies
-one ``CodeProposal`` from a ``UnifiedModelingReport``; this adapter validates,
-materializes, executes, captures bounded output, and returns evidence to the
-Model Agent.  It never marks a run successful solely because source code was
-generated.
+    The Code Harness owns realization, not modeling decisions. A provider supplies
+    one ``CodeProposal`` from a ``UnifiedModelingReport``; this adapter validates,
+    materializes, executes, captures a Markdown report, and returns that report
+    to the same Model Agent through Code→Model. Execution is observable and may
+    run until it naturally finishes; no default wall-clock deadline is imposed.
 """
 
 from __future__ import annotations
@@ -99,25 +99,23 @@ class LocalPythonCodeHarness:
             succeeded = output.exit_code == 0 and not output.timed_out and bool(stdout_report)
             issues: list[str] = []
             if output.timed_out:
-                issues.append("execution timed out")
+                issues.append("运行观察未在本次返回中结束；请 Model Agent 依据探针和报告决定是否继续")
             if output.exit_code not in (0, None):
-                issues.append(f"execution exited with code {output.exit_code}")
+                issues.append(f"程序返回了可观察的退出状态：{output.exit_code}")
             if stdout_report and parsed is None:
                 issues.append("stdout was retained as a Markdown execution report; no JSON validation map was supplied")
             if any(value is False for value in validations.values()):
-                issues.append("the executable reported one or more false validation hints; Review Agent must inspect the Markdown evidence")
+                issues.append("程序提供了 false 验证索引；Model Agent 必须以 Markdown 报告和可复现证据核验")
             if parsed is not None and not validation_evidence:
-                issues.append("no per-item validation_evidence field was supplied; Review Agent must use the Markdown report")
+                issues.append("未提供逐项结构化证据索引；Model Agent 应直接使用 Markdown 报告")
             metrics = parsed.get("metrics", {}) if isinstance(parsed, dict) and isinstance(parsed.get("metrics", {}), dict) else {}
             log = json.dumps({"exit_code": output.exit_code, "timed_out": output.timed_out, "stdout": stdout, "stderr": stderr}, ensure_ascii=False, indent=2)
             report_markdown = "\n".join([
                 "# Code Harness 执行报告",
                 "",
-                "本报告由本地沙箱生成。stdout 不要求是 JSON；若不是 JSON，将按 Markdown 原文交给 Review Agent 审查。",
+                "本报告由本地执行通道生成。stdout 原样作为 Markdown 报告交给同一个 Model Agent 的 Code→Model 返修阶段；结构化字段只作探针索引。",
                 "",
-                f"- exit_code: `{output.exit_code}`",
-                f"- timed_out: `{output.timed_out}`",
-                f"- stdout_chars: `{len(stdout_report)}`",
+                "- 运行状态：见下方原始 Markdown、stderr 与探针记录；本交接不以 timeout/failed 结构化字段裁决。",
                 "",
                 "## 程序原始报告",
                 "",

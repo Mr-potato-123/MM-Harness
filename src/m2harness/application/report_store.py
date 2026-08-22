@@ -127,7 +127,7 @@ class RunReportStore:
             target = (self.workspace_root / markdown).resolve()
             if not target.exists():
                 self._write(Path(markdown), "# Solve Problem 探针\n\n" +
-                            "本文件记录 Model、Code、Review 与文件披露边界；完整交接内容见同一 run 下各题目的 `exchanges/`。\n\n",
+                            "本文件记录 Model、Code、Code→Model 返修与文件披露边界；完整交接内容见同一 run 下各题目的 `exchanges/`。\n\n",
                             purpose="Live operator probe index for solve_problem.", role=ReadOnlyFileRole.REFERENCE,
                             task_id="probe", attempt=1, iteration=None, media_type="text/markdown")
             self._append_text(Path(markdown), md_line, encoding="utf-8")
@@ -196,7 +196,8 @@ class RunReportStore:
                 )
             records.append(self._write(
                 review_dir / "review_report.md", "\n".join([
-                    f"# Review Agent 审查决定：{snapshot.review.decision.value}", "",
+                    f"# Model Agent 代码返修意见：{snapshot.review.decision.value}", "",
+                    "本报告来自同一 Model Agent 读取 Code→Model 交接后的返修阶段；不重新建模。",
                     "## 转接理由", "", transfer_reason,
                     "## 理由", "", snapshot.review.rationale,
                     "", "## 返修目标", "", f"`{snapshot.review.revision_target.value}`",
@@ -204,15 +205,15 @@ class RunReportStore:
                     "", "## 返修指令", "", *(f"- {item}" for item in snapshot.review.revision_instructions),
                     "", "## 请求读取的只读文件", "", *(f"- `{item}`" for item in snapshot.review.requested_file_paths),
                 ]).strip() + "\n",
-                purpose=f"Review Agent decision for {report.task_id}, iteration {snapshot.iteration}.",
+                purpose=f"Model Agent Code repair decision for {report.task_id}, iteration {snapshot.iteration}.",
                 role=ReadOnlyFileRole.REFERENCE, task_id=report.task_id,
                 attempt=attempt, iteration=snapshot.iteration, media_type="text/markdown",
             ))
             if snapshot.review.revision_instructions:
                 records.append(self._write(
                     review_dir / "revision_instructions.md",
-                    "# Review Agent 返修指令\n\n" + "\n".join(f"- {item}" for item in snapshot.review.revision_instructions) + "\n",
-                    purpose=f"Review Agent 在 {report.task_id} 第 {snapshot.iteration} 轮后的返修指令。",
+                    "# Model Agent → Code Agent 返修指令\n\n" + "\n".join(f"- {item}" for item in snapshot.review.revision_instructions) + "\n",
+                    purpose=f"Model Agent 在 {report.task_id} 第 {snapshot.iteration} 轮后的 Code 返修指令。",
                     role=ReadOnlyFileRole.REFERENCE, task_id=report.task_id,
                     attempt=attempt, iteration=snapshot.iteration, media_type="text/markdown",
                 ))

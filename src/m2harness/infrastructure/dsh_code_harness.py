@@ -370,13 +370,10 @@ class DshCodeProposalProvider(CodeProposalProvider):
         expected = handoff.get("expected_validations", modeling.required_validations)
         if not isinstance(expected, list) or not all(isinstance(item, str) and item for item in expected):
             raise DshRuntimeError("DSH Code Agent expected_validations must be a string array")
-        timeout = handoff.get("timeout_seconds", 300)
-        if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= 600:
-            raise DshRuntimeError("DSH Code Agent timeout_seconds must be an integer in [1, 600]")
         return CodeProposal(
             source=source,
             logical_name=target.name,
-            timeout_seconds=timeout,
+            timeout_seconds=None,
             expected_validations=tuple(dict.fromkeys(expected)),
             metadata={"agent_runtime": "dsh", "session_id": f"m2h-code-{task.task_id}", "event_log": str(event_file.relative_to(self.workspace_root).as_posix())},
         )
@@ -396,6 +393,9 @@ class DshCodeProposalProvider(CodeProposalProvider):
             "modeling_contract": modeling.model_dump(mode="json"),
             "allowlisted_readonly_paths": allowlisted,
             "already_disclosed_text": disclosed,
+            "model_to_code_repair_instructions": list(context.instructions[-32:]),
+            "model_conversation_tail": list(context.metadata.get("model_conversation", ())) [-12:]
+            if isinstance(context.metadata.get("model_conversation", ()), (list, tuple)) else [],
             "target_source_path": source_path,
             "output_contract": {
                 "logical_name": logical_name,
@@ -410,7 +410,7 @@ class DshCodeProposalProvider(CodeProposalProvider):
             "只读渐进披露：只能打开 allowlisted_readonly_paths 中列出的路径；路径本身不等于授权其他目录。需要更多内容时先读取清单中的路径，不能扫描工作区或凭空声称文件内容。\n"
             "使用 DSH 自带文件/命令工具写入和检查目标源文件。所有生成输出只能写到目标源文件所在 iteration 目录的 outputs 子目录。不得访问网络、密钥、主 Harness 数据库或发布工具。\n"
             "完成一次完整实现后，只做必需验证；如果验证失败，基于实际错误定点修复，最多遵守上游返修预算，不进行无界的求解器重写。\n"
-            "源文件写入并验证后，最终回答必须只包含一个 JSON 对象（可用 m2harness_handoff 字段包裹），字段为 source_path、logical_name、timeout_seconds、expected_validations；不要把源代码放进最终回答。\n\n"
+            "源文件写入并验证后，最终回答必须只包含一个 JSON 对象（可用 m2harness_handoff 字段包裹），字段为 source_path、logical_name、expected_validations；默认不设置执行时限，不要把源代码放进最终回答。\n\n"
             + json.dumps(payload, ensure_ascii=False, indent=2)
         )
         return header

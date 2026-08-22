@@ -1,7 +1,7 @@
-"""Bounded local subprocess sandbox adapter.
+"""Trusted local subprocess execution adapter.
 
 This adapter is intentionally explicit about its security level: it provides
-fixed-argv execution, scrubbed environment, workspace cwd, timeout, and output
+fixed-argv execution, scrubbed environment, workspace cwd, and output
 budgets. It is the default execution boundary for the trusted single-user
 local Harness. A hostile multi-tenant deployment must replace it with a
 container/VM implementation of the same ``SandboxClient`` port.
@@ -54,7 +54,7 @@ class LocalSandboxClient:
         self._sandboxes[sandbox_id] = spec
         return sandbox_id
 
-    def run(self, argv: tuple[str, ...], *, timeout_seconds: int, env: Mapping[str, str] | None = None, cwd: Path | None = None) -> LocalExecOutput:
+    def run(self, argv: tuple[str, ...], *, timeout_seconds: int | None = None, env: Mapping[str, str] | None = None, cwd: Path | None = None) -> LocalExecOutput:
         if not self.available:
             raise RuntimeError("host_execution_disabled: enable the trusted local backend or configure Docker/VM")
         if not argv or any(not item or "\x00" in item for item in argv):
@@ -71,6 +71,9 @@ class LocalSandboxClient:
             raise ValueError("sandbox working directory escapes workspace")
         working_directory.mkdir(parents=True, exist_ok=True)
         try:
+            # ``None`` is intentional for hard mathematical-model runs: the
+            # operator observes the append-only probe/event stream instead of
+            # losing a valid result to an arbitrary wall-clock cutoff.
             process = subprocess.run(tuple(argv), cwd=working_directory, env=safe_env, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout_seconds, shell=False, check=False)
             return LocalExecOutput(tuple(argv), process.returncode, False, process.stdout[: self.max_output_bytes], process.stderr[: self.max_output_bytes])
         except subprocess.TimeoutExpired as exc:
@@ -131,7 +134,7 @@ class DockerSandboxClient(LocalSandboxClient):
         except (OSError, subprocess.TimeoutExpired):
             return None
 
-    def run(self, argv: tuple[str, ...], *, timeout_seconds: int, env: Mapping[str, str] | None = None, cwd: Path | None = None) -> LocalExecOutput:
+    def run(self, argv: tuple[str, ...], *, timeout_seconds: int | None = None, env: Mapping[str, str] | None = None, cwd: Path | None = None) -> LocalExecOutput:
         if not self.available:
             raise RuntimeError("sandbox_unavailable: Docker daemon is not ready")
         if not argv:

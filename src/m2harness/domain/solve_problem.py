@@ -45,7 +45,7 @@ class ModelReviewDecision(StrEnum):
 
 
 class RevisionTarget(StrEnum):
-    """Smallest workflow segment that must be repeated after review."""
+    """Compatibility values; active Code→Model repair routing always uses CODE."""
 
     CODE = "code"
     MODEL = "model"

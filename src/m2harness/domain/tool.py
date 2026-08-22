@@ -30,7 +30,10 @@ class ToolDefinition(ToolModel):
     required_capability: CapabilityRef
     side_effect: Literal["none", "sandboxed-write", "external-write"] = "none"
     idempotency_required: bool = True
-    timeout_seconds: int = Field(default=60, ge=1, le=86_400)
+    # ``None`` means the local trusted Code Agent tool is observed through
+    # probes until it returns. Other tools may retain an explicit operator
+    # timeout.
+    timeout_seconds: int | None = Field(default=60, ge=1, le=86_400)
     output_limit_bytes: int = Field(default=1_048_576, ge=1, le=100_000_000)
     policy: ToolPolicy = ToolPolicy()
 

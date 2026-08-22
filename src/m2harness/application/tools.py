@@ -261,7 +261,10 @@ class ToolRuntime:
             "boolean": isinstance(value, bool),
             "null": value is None,
         }
-        if expected in valid and not valid[expected]:
+        if isinstance(expected, list):
+            if not any(valid.get(item, False) for item in expected):
+                raise ValueError(f"{path} must be one of: {', '.join(map(str, expected))}")
+        elif expected in valid and not valid[expected]:
             raise ValueError(f"{path} must be {expected}")
         if "enum" in schema and value not in schema["enum"]:
             raise ValueError(f"{path} must be one of: {', '.join(map(str, schema['enum']))}")

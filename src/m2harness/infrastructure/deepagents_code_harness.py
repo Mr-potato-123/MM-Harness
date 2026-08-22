@@ -42,10 +42,9 @@ class CodeAgentHandoff(BaseModel):
 
     source_path: str = Field(min_length=1, max_length=1_000)
     logical_name: str = Field(pattern=r"^[A-Za-z0-9._-]+\.py$", max_length=200)
-    # A code validation is a bounded evidence probe, not an unbounded batch
-    # job.  The model may still return arbitrarily large source/output, but a
-    # single local validation must yield control to the harness in 180s.
-    timeout_seconds: int = Field(default=120, ge=1, le=180)
+    # No default wall-clock limit is part of the Code→Model report contract.
+    # An explicit value is accepted only as an operator emergency stop.
+    timeout_seconds: int | None = Field(default=None, ge=1, le=86_400)
     # JSON structured-output providers emit arrays, not Python tuples.  Keep
     # the wire contract JSON-native here and normalize to a tuple at the
     # domain boundary in ``propose``.  ``strict=True`` is intentional for the
@@ -156,17 +155,17 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             "源代码必须写入交接中指定的 target_source_path，验证输出只能写入同一 iteration 目录的 outputs 子目录。\n"
             "交接信息已经包含建模契约和必要路径，不要循环读取报告清单。第一步直接调用 write_code_source 写入完整源代码（尽量不超过 350 行）；若工具返回 complete=false，必须用 append=true 继续写后续源码块，直到 complete=true，再调用 python_execute 验证。必要时用 read_file 读取一次源文件，不要在写源代码前连续调用 ls/read_file。"
             "write_todos 只在初始化或状态真正变化时调用；相同清单不要重复写入。python_execute 超时或重写源码后，禁止再次调用 write_todos，直接运行 python_execute；若工具返回 next_action，严格按其下一步执行。"
-            "完成后必须使用结构化输出字段 source_path、logical_name、timeout_seconds、expected_validations；不要把源代码放进最终回答。"
+            "完成后必须使用结构化输出字段 source_path、logical_name、expected_validations；不要把源代码放进最终回答。默认不设置执行时限。"
         )
         system_prompt += (
             "\n\nM2Harness 运行约束：本 Code Agent 只可使用 write_todos、write_code_source 和 python_execute。"
             "不要调用 ls、read_file、write_file、edit_file、glob、grep、execute 或 delete；这些文件工具已被运行时移除。"
             "Model→Code 交接契约已经完整放在本次用户消息中，不需要再次读取文件。只能生成一个目标 Python 文件，禁止创建辅助源码文件。"
             "python_execute 的当前工作目录就是目标源码所在的 iteration 目录；使用相对路径检查该文件和 outputs，不要把 Windows 绝对路径传给任何工具。"
-            "源码写入后最多执行四次语法/运行验证；若失败，立即修复并再次写入完整源码，禁止重复读取同一输出或循环诊断。第四次验证工具返回后必须立即输出结构化交接，不得再次调用工具。"
+            "源码写入后持续执行必要的语法/运行验证；若失败，依据探针和实际报告修复后再运行，不设置固定次数或墙钟时限。"
             "如果任何工具结果包含 forced_stop=true 或 next_action 要求返回 CodeAgentHandoff，必须立刻返回结构化交接，绝对不能再次调用 write_code_source、python_execute、Todo 或其他工具。"
-            "python_execute 已经负责外部超时；Windows 没有 signal.SIGALRM，验证代码禁止自行安装 SIGALRM 或假设 solve_dp 等不存在的函数。验证源码时只运行 import runpy; runpy.run_path('solve_q1.py', run_name='__main__')，并读取其 stdout JSON。"
-            "资源补给不得对三种资源做无界三重数量枚举；必须使用候选边界、需求驱动枚举或支配剪枝，并在超时后改变算法复杂度。"
+            "python_execute 只负责可观测执行；Windows 没有 signal.SIGALRM，验证代码禁止自行安装 SIGALRM 或假设 solve_dp 等不存在的函数。验证源码时只运行 import runpy; runpy.run_path('solve_q1.py', run_name='__main__')，并读取其 stdout Markdown。"
+            "资源补给不得对三种资源做无界三重数量枚举；必须使用候选边界、需求驱动枚举或支配剪枝，并在探针显示资源异常或操作员显式停止后改变算法复杂度。"
             "建立 MILP 后必须先做小规模可行性烟雾检查；到达终点后的活动标志约束不得与 a_0=1、a_T=0 和终点位置约束互相矛盾，禁止使用会令到达终点后 a_t<0 的不等式。"
             "路线实现硬性自检：候选路线的节点序列必须显式包含需要停留的补给平台（不能只把补给需求按总量加到初始资源上）；允许重复访问作业点，或给出可检查的上界/支配证明说明为何不会漏掉重复访问。若 bfs_path(a,b) 返回含起点和终点的节点列表，移动日必须遍历 path[1:]（第1天到达第一个相邻节点），不得用 path[0:distance] 导致终点和补给平台被跳过。到达终点当天立即结算并停止，不得用 END 填充后续消耗日。"
             "在正式求解前必须运行最小路径烟雾测试：验证 START→END 的首个移动位置是其相邻节点、最后一个移动位置是 END；验证一条经过 SUPPLY 的候选路线确实产生补给记录且补给前后 O/H/F、M 和 O+H+F<=CAP 均满足。禁止使用名为 solve_simplified 的总量估算作为主求解器，也不得在未逐日模拟时声称 V1-V3 已通过。"
@@ -387,12 +386,12 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         rewrite_required = False
 
         @tool("python_execute")
-        def python_execute(code: str, timeout_seconds: int = 60) -> str:
+        def python_execute(code: str, timeout_seconds: int | None = None) -> str:
             """在本地受控沙箱中执行一段 Python 验证代码；不得联网或运行 shell。"""
             if not isinstance(code, str) or not code.strip():
                 return json.dumps({"ok": False, "error": "code must be non-empty"}, ensure_ascii=False)
-            if not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 180:
-                return json.dumps({"ok": False, "error": "timeout_seconds must be 1..180"}, ensure_ascii=False)
+            if timeout_seconds is not None and (not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool) or not 1 <= timeout_seconds <= 180):
+                return json.dumps({"ok": False, "error": "显式紧急停止值必须为 1..180；默认省略 timeout_seconds"}, ensure_ascii=False)
             nonlocal call_count
             nonlocal last_source_hash, rewrite_required
             call_count += 1
@@ -400,22 +399,12 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                 _validate_python_policy(code)
                 source_hash = hashlib.sha256(target_path.read_bytes()).hexdigest() if target_path.is_file() else "missing"
                 if rewrite_required and source_hash == last_source_hash:
-                    payload = {
+                    return json.dumps({
                         "ok": False,
-                        "error": "the previous validation timed out; rewrite the target source before running it again",
+                        "error": "rewrite the target source before retrying；上一次显式紧急停止后必须先修改目标源码，再次运行验证",
                         "call_count": call_count,
                         "next_action": "call write_code_source with a materially simpler algorithm, then run python_execute",
-                    }
-                    if call_count >= 4:
-                        self._forced_handoff_targets.add(target_relative)
-                        payload.update({
-                            "next_action": "return the structured CodeAgentHandoff now; do not call another tool",
-                            "forced_stop": True,
-                            "source_path": "/" + target_relative,
-                            "logical_name": Path(target_relative).name,
-                        })
-                    return json.dumps(payload, ensure_ascii=False)
-                rewrite_required = False
+                    }, ensure_ascii=False)
                 result = sandbox.run(
                     # ``-I`` ignores PYTHON* environment variables, so make
                     # UTF-8 explicit for Chinese diagnostics from the inner
@@ -434,22 +423,13 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                         "call_count": call_count,
                     }
                 last_source_hash = source_hash
-                rewrite_required = result.timed_out
-                if call_count >= 4:
-                    self._forced_handoff_targets.add(target_relative)
-                    payload["next_action"] = "return the structured CodeAgentHandoff now; do not call another tool"
-                    payload["forced_stop"] = True
-                    payload["source_path"] = "/" + target_relative
-                    payload["logical_name"] = Path(target_relative).name
+                rewrite_required = bool(timeout_seconds is not None and result.timed_out)
                 return json.dumps(payload, ensure_ascii=False)
             except Exception as exc:
-                if call_count >= 4:
-                    self._forced_handoff_targets.add(target_relative)
                 return json.dumps({
                     "ok": False,
                     "error": str(exc)[:4_000],
-                    "forced_stop": call_count >= 4,
-                    "next_action": "return the structured CodeAgentHandoff now; do not call another tool" if call_count >= 4 else "rewrite source and retry",
+                    "next_action": "rewrite source and retry",
                 }, ensure_ascii=False)
 
         return python_execute
@@ -650,11 +630,16 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             ],
             "required_validations": list(modeling.required_validations),
             "expected_outputs": list(modeling.expected_outputs),
+            # Revision rounds keep the Code session but receive the latest
+            # Model→Code instructions explicitly; no re-modeling is needed.
+            "model_to_code_repair_instructions": list(context.instructions[-32:]),
+            "model_conversation_tail": list(context.metadata.get("model_conversation", ())) [-12:]
+            if isinstance(context.metadata.get("model_conversation", ()), (list, tuple)) else [],
         }
         return (
             "当前为第 %d 轮 Code Agent 实现。继续复用本任务的 LangGraph thread/session；只读清单之外的路径不得打开。"
             "以下是本轮 Model→Code 结构化交接：\n\n%s\n\n"
-            "验收硬契约：脚本必须以 exit_code=0 结束，并在 stdout 返回可读 Markdown 报告；Review Agent 依据报告、源代码和本地执行日志审查声明。"
+            "验收硬契约：脚本应返回可读 Markdown 报告；同一个 Model Agent 在 Code→Model 阶段依据报告、源代码和本地探针给出返修意见。"
             "JSON validations/validation_evidence 若存在只作辅助索引，不能因为某个 false 字段直接判定失败；必须把完整 Markdown 结果写入当前 iteration 的 outputs/result.md。"
         ) % (iteration, json.dumps(payload, ensure_ascii=False, indent=2))
 

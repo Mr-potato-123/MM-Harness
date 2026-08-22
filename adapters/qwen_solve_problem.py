@@ -294,7 +294,10 @@ def _compact_evidence(value: Any) -> Any:
         if key in {"text", "base64"}:
             continue
         if key == "markdown" and isinstance(item, str):
-            result[key] = compact_text(item, 2_000)
+            # Reports are the Code→Model protocol. Never reduce a report to a
+            # short abstract here; lower-priority research/context is what the
+            # compactor may trim when a provider request is oversized.
+            result[key] = item
         elif key == "artifacts" and isinstance(item, list):
             result[key] = [
                 {field: artifact.get(field) for field in ("logical_name", "kind", "media_type", "metadata") if field in artifact}
@@ -664,19 +667,24 @@ class QwenModelAgent(ModelAgentPort):
         )
         value = self._request(
             task, context,
-            f"用中文审查第 {iteration} 轮的统一建模报告和代码执行报告，只针对当前范围。 "
-            "精确的 Code→Review 交接已存于白名单路径；如需内容请使用 "
-            "requested_file_paths 请求路径。以本地 exit_code、stdout 中的 Markdown 执行报告、源代码和执行日志为审查依据；validations/validation_evidence 只是辅助索引，不能因单个 false 字段直接否决。"
-            "如果主方案、算法或搜索覆盖范围偏离已接受建模契约，必须列为 deviation 并要求返修或明确降级声明。"
-            "只有 Markdown 报告中的关键声明能由本地执行、源代码或产物复现且范围与实际算法一致时才批准，否则选择最窄的返修目标并给出中文具体指令。",
+            f"用中文读取第 {iteration} 轮 Code→Model 交接，作为同一个 Model Agent 的代码返修阶段。 "
+            "不要重新 explore、synthesize 或重建模型；统一建模契约已经锁定。只根据 Code Agent 的完整 Markdown 报告、stdout、源代码路径、输出路径和探针记录，逐条核验本轮实现并给 Code Agent 可执行的返修意见。"
+            "交接中的结构化字段只能用于定位文件，不能把 timeout、execution_failed 或单个 false 索引当作裁决；报告本身和可复现证据才是依据。"
+            "若需要源码或输出，使用 requested_file_paths 请求白名单路径。无论发现何种问题，decision 为 revise/reject 时 revision_target 必须为 code，指令必须说明要改哪段代码、如何重新执行和需要补充什么报告证据。",
             SolveProblemReview.model_json_schema(),
             evidence={
                 "modeling_report": modeling.model_dump(mode="json"),
-                "coding_report": coding.model_dump(mode="json"),
+                # Code→Model is report-first. Keep structural fields only as
+                # path/evidence indexes; do not route timeout/failed booleans
+                # into the Model Agent's repair decision.
+                "code_report_markdown": coding.report.markdown,
+                "validation_evidence": coding.validation_evidence,
+                "generated_files": [item.model_dump(mode="json") for item in coding.generated_files],
                 "handoff_paths": handoff_paths,
+                "probe_path": f"reports/runs/{context.metadata.get('run_id', 'current')}/probe.ndjson",
             },
             skill_names=("report-review", "claim-evidence", "numerical-validation", "model-diagnostics"),
-            role=AgentRole.REVIEW,
+            role=AgentRole.MODEL,
         )
         return SolveProblemReview.model_validate(value, strict=False)
 
@@ -722,15 +730,15 @@ class QwenCodeProposalProvider(CodeProposalProvider):
                         "If the source is too large for one tool call, write it in ordered chunks: first workspace_write with overwrite=true, then workspace_write with append=true; never omit or summarize source chunks.",
                         "Use workspace_read/workspace_search to inspect staged inputs and existing files, and python_execute or validation_run for checks.",
                         "Do not replace the accepted modeling main scheme with a materially different algorithm or search space. If an implementation deviation is unavoidable, record it explicitly and do not claim stronger optimality than the evidence supports.",
-                        "After the first complete implementation, run only the checks needed for the required validations; do not spend unbounded turns on exploratory solver surgery. Once a reproducible feasible result and its optimality/time-limit evidence are available, write the final script and return the handoff JSON.",
-                        "Do not put source code in the final JSON. Return only logical_name, source_path, timeout_seconds, and expected_validations after the file is written and checked.",
+                        "After the first complete implementation, run the checks needed for the required validations; do not silently replace the accepted model. Once a reproducible feasible result and its optimality/convergence evidence are available, write the final script and return the handoff JSON.",
+                        "Do not put source code in the final JSON. Return only logical_name, source_path, and expected_validations after the file is written and checked; do not invent a wall-clock timeout.",
                     ],
                     "final_schema": {
                         "type": "object", "additionalProperties": False,
-                        "required": ["logical_name", "source_path", "timeout_seconds", "expected_validations"],
+                        "required": ["logical_name", "source_path", "expected_validations"],
                         "properties": {
                             "logical_name": {"type": "string", "pattern": r"^[A-Za-z0-9._-]+\\.py$"},
-                            "source_path": {"type": "string"}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600},
+                            "source_path": {"type": "string"},
                             "expected_validations": {"type": "array", "items": {"type": "string"}},
                         },
                     },
