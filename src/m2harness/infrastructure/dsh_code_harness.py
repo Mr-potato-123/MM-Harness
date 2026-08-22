@@ -400,7 +400,7 @@ class DshCodeProposalProvider(CodeProposalProvider):
             "output_contract": {
                 "logical_name": logical_name,
                 "required_validations": list(modeling.required_validations),
-                "required_evidence": "脚本 stdout 必须包含一个 JSON 对象，所有 required validations 均为 true，并为每项提供非空、可复现的 validation_evidence。",
+                "required_evidence": "脚本 stdout 必须包含可审查的中文 Markdown 执行报告；JSON validations/validation_evidence 仅作辅助索引，false 不得单独作为失败依据。",
             },
         }
         header = (

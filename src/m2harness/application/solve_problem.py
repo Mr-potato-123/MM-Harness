@@ -680,7 +680,9 @@ def _coding_markdown(report: CodingHarnessReport) -> str:
         f"# Coding Harness Report: {report.report.title}", "", report.report.markdown,
         "", f"- Execution succeeded: `{report.execution_succeeded}`",
         "", "## Validations", "", *(f"- `{key}`: `{value}`" for key, value in report.validations.items()),
-        "", "## Validation Evidence", "", *(f"- `{key}`: {value}" for key, value in report.validation_evidence.items()),
+        "", "## Validation Evidence Index", "", *(f"- `{key}`: {value}" for key, value in report.validation_evidence.items()),
+        "", "## 原始 Markdown 报告", "",
+        "代码 stdout 已由 Code Harness 原样嵌入上面的 `report.markdown`；Review Agent 应以该 Markdown、源代码和本地执行日志为主，不得因孤立的 false 字段直接否决。",
         "", "## Metrics", "", *(f"- `{key}`: `{value}`" for key, value in report.metrics.items()),
         "", "## Issues", "", *(f"- {item}" for item in report.issues),
         "", "## Generated Files", "", *(f"- `{item.relative_path}` — {item.purpose}" for item in report.generated_files),
@@ -890,7 +892,7 @@ def _compact_model_to_code_handoff(
         "", "## Model Agent 上下文最近事件", "", *_conversation_lines(context, "model"),
         "", "## Code Agent 必须完成", "",
         "- 只实现本题范围；使用受限工具写入、读取和验证源代码。",
-        "- 每个验证项返回可复现证据；不得只报 true。",
+        "- 返回一份可审查的 Markdown 执行报告；JSON 验证字段只是索引，不能用孤立的 false 代替审查。",
     ]
     return "\n".join(lines).strip() + "\n"
 
@@ -914,7 +916,7 @@ def _compact_code_to_review_handoff(
         f"- 执行成功：`{coding.execution_succeeded}`",
         f"- 预期输出：{'; '.join(modeling.expected_outputs[:12])}",
         f"- 必须验证：{'; '.join(modeling.required_validations[:16])}",
-        f"- 验证：{json.dumps(coding.validations, ensure_ascii=False)}",
+        f"- 验证索引（非最终裁决）：{json.dumps(coding.validations, ensure_ascii=False)}",
         *(f"- 证据：`{key}` — {value}" for key, value in list(coding.validation_evidence.items())[:16]),
         *(f"- 指标：`{key}` = `{value}`" for key, value in list(coding.metrics.items())[:16]),
         *(f"- 问题：{item}" for item in coding.issues[:12]),
@@ -925,7 +927,7 @@ def _compact_code_to_review_handoff(
         "", "## 只读文件索引", "", *_handoff_file_table(context, task.task_id),
         "", "## Code Agent 上下文最近事件", "", *_conversation_lines(context, "code"),
         "", "## Review Agent 必须完成", "",
-        "- 逐项核验验证证据；只批准有可复现证据的声明。",
+        "- 以 Markdown 执行报告、源代码、exit_code 和产物逐项核验；不得因单个 false 索引字段直接否决。",
         "- 需要源代码或输出时，只请求清单中的路径。",
         f"- 建模主方案摘要：{modeling.main_scheme[:1000]}",
     ]

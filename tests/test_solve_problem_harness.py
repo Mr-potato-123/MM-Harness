@@ -540,7 +540,7 @@ class SolveProblemHarnessTest(unittest.TestCase):
             self.assertTrue(result.ok, result.error_message)
             self.assertEqual(result.output["source"], "local_knowledge_base")
 
-    def test_pi_style_local_code_harness_requires_json_validation_evidence(self) -> None:
+    def test_pi_style_local_code_harness_accepts_markdown_or_json_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             bundle = build_local_runtime(workspace_root=root / "w", artifact_root=root / "a", database_path=root / "r.db")
@@ -569,7 +569,16 @@ class SolveProblemHarnessTest(unittest.TestCase):
                 FakeCodeProposalProvider("import json; print(json.dumps({'validations': {'sanity': True}}))"),
                 bundle.sandbox, root / "w",
             ).execute(SolveProblemTask(task_id="q1", title="Q", problem="P"), SolveProblemContext(), modeling, iteration=2)
-            self.assertFalse(self_reported.execution_succeeded)
+            self.assertTrue(self_reported.execution_succeeded)
+            self.assertIn("原始报告", self_reported.report.markdown)
+
+            markdown = LocalPythonCodeHarness(
+                FakeCodeProposalProvider("print('# 第 1 问执行报告\\n\\n路径已生成，资源平衡证据见本报告。')"),
+                bundle.sandbox, root / "w",
+            ).execute(SolveProblemTask(task_id="q1", title="Q", problem="P"), SolveProblemContext(), modeling, iteration=4)
+            self.assertTrue(markdown.execution_succeeded)
+            self.assertEqual(markdown.validations, {})
+            self.assertIn("第 1 问执行报告", markdown.report.markdown)
 
             blocked = LocalPythonCodeHarness(FakeCodeProposalProvider("import socket; print('bad')"), bundle.sandbox, root / "w")
             failed = blocked.execute(SolveProblemTask(task_id="q1", title="Q", problem="P"), SolveProblemContext(), modeling, iteration=1)

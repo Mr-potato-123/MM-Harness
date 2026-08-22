@@ -666,9 +666,9 @@ class QwenModelAgent(ModelAgentPort):
             task, context,
             f"用中文审查第 {iteration} 轮的统一建模报告和代码执行报告，只针对当前范围。 "
             "精确的 Code→Review 交接已存于白名单路径；如需内容请使用 "
-            "requested_file_paths 请求路径。以 Coding Report 的 execution_succeeded、validations 和 validation_evidence 为执行权威；输出目录中的文件不能替代 stdout/exit_code 证据。"
+            "requested_file_paths 请求路径。以本地 exit_code、stdout 中的 Markdown 执行报告、源代码和执行日志为审查依据；validations/validation_evidence 只是辅助索引，不能因单个 false 字段直接否决。"
             "如果主方案、算法或搜索覆盖范围偏离已接受建模契约，必须列为 deviation 并要求返修或明确降级声明。"
-            "只有所有验证都有可复现证据且声明范围与实际算法一致时才批准，否则选择最窄的返修目标并给出中文具体指令。",
+            "只有 Markdown 报告中的关键声明能由本地执行、源代码或产物复现且范围与实际算法一致时才批准，否则选择最窄的返修目标并给出中文具体指令。",
             SolveProblemReview.model_json_schema(),
             evidence={
                 "modeling_report": modeling.model_dump(mode="json"),
@@ -698,8 +698,9 @@ class QwenCodeProposalProvider(CodeProposalProvider):
             AgentRole.CODE,
             output_contract=(
                 "Return one CodeProposal JSON object containing a complete deterministic Python script. The script must "
-                "print one final JSON object with validations, non-empty validation_evidence for every required ID, and "
-                f"optional metrics; write files only under .m2harness-code/{task.task_id}/iteration-{iteration}/outputs."
+                "print a readable Chinese Markdown execution report; a JSON summary is optional and its false fields are "
+                "advisory only. Write the report and result files only under "
+                f".m2harness-code/{task.task_id}/iteration-{iteration}/outputs."
             ),
         ) + _scope_instruction(task)
         handoff_paths = sorted(

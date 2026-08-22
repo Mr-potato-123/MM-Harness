@@ -69,43 +69,74 @@ class LocalPythonCodeHarness:
             _validate_python_policy(proposal.source)
             script_path = self._write_script(task, proposal, iteration=iteration)
             output = self.sandbox.run(
-                (sys.executable, "-I", str(script_path)), timeout_seconds=proposal.timeout_seconds,
+                # ``-I`` deliberately ignores PYTHON* environment variables;
+                # add ``-X utf8`` explicitly so Chinese Markdown reports stay
+                # UTF-8 on the Windows host as well as in Docker.
+                (sys.executable, "-I", "-X", "utf8", str(script_path)), timeout_seconds=proposal.timeout_seconds,
                 env={"PYTHONIOENCODING": "utf-8", "M2HARNESS_NETWORK": "deny"},
             )
             stdout = output.stdout[:self.max_output_bytes].decode("utf-8", errors="replace")
             stderr = output.stderr[:self.max_output_bytes].decode("utf-8", errors="replace")
             parsed = self._parse_json(stdout)
             required = tuple(dict.fromkeys((*modeling.required_validations, *proposal.expected_validations)))
-            validations = {name: bool(parsed.get("validations", {}).get(name, False)) for name in required} if isinstance(parsed, dict) else {name: False for name in required}
+            # The executable is allowed to return a human-readable Markdown
+            # report.  JSON ``validations: false`` is only an agent hint now;
+            # it is not a Harness failure signal.  Review receives the exact
+            # stdout in ``report.markdown`` and decides whether the claims are
+            # supported by the reproducible local run.
+            reported_validations = parsed.get("validations", {}) if isinstance(parsed, dict) else {}
+            validations = {
+                str(name): value for name, value in reported_validations.items()
+                if isinstance(name, str) and isinstance(value, bool)
+            } if isinstance(reported_validations, dict) else {}
             evidence_payload = parsed.get("validation_evidence", {}) if isinstance(parsed, dict) else {}
             validation_evidence = {
                 name: str(evidence_payload.get(name, "")).strip()[:8_000]
                 for name in required
-            } if isinstance(evidence_payload, dict) else {name: "" for name in required}
-            succeeded = (
-                output.exit_code == 0 and not output.timed_out and bool(parsed is not None)
-                and all(validations.values())
-                and all(validation_evidence.get(name) for name in required)
-            )
+                if isinstance(evidence_payload, dict) and str(evidence_payload.get(name, "")).strip()
+            }
+            stdout_report = stdout.strip()
+            succeeded = output.exit_code == 0 and not output.timed_out and bool(stdout_report)
             issues: list[str] = []
             if output.timed_out:
                 issues.append("execution timed out")
             if output.exit_code not in (0, None):
                 issues.append(f"execution exited with code {output.exit_code}")
-            if parsed is None:
-                issues.append("stdout did not contain one JSON evidence object")
-            if not all(validations.values()):
-                issues.append("one or more required validations failed or were absent")
-            if not all(validation_evidence.get(name) for name in required):
-                issues.append("one or more required validations lacked reproducible evidence")
+            if stdout_report and parsed is None:
+                issues.append("stdout was retained as a Markdown execution report; no JSON validation map was supplied")
+            if any(value is False for value in validations.values()):
+                issues.append("the executable reported one or more false validation hints; Review Agent must inspect the Markdown evidence")
+            if parsed is not None and not validation_evidence:
+                issues.append("no per-item validation_evidence field was supplied; Review Agent must use the Markdown report")
             metrics = parsed.get("metrics", {}) if isinstance(parsed, dict) and isinstance(parsed.get("metrics", {}), dict) else {}
             log = json.dumps({"exit_code": output.exit_code, "timed_out": output.timed_out, "stdout": stdout, "stderr": stderr}, ensure_ascii=False, indent=2)
+            report_markdown = "\n".join([
+                "# Code Harness 执行报告",
+                "",
+                "本报告由本地沙箱生成。stdout 不要求是 JSON；若不是 JSON，将按 Markdown 原文交给 Review Agent 审查。",
+                "",
+                f"- exit_code: `{output.exit_code}`",
+                f"- timed_out: `{output.timed_out}`",
+                f"- stdout_chars: `{len(stdout_report)}`",
+                "",
+                "## 程序原始报告",
+                "",
+                "````text",
+                stdout_report or "（程序没有输出报告）",
+                "````",
+                "",
+                "## stderr",
+                "",
+                "````text",
+                stderr.strip() or "（无）",
+                "````",
+            ])
             generated_files = self._generated_files(
                 task, iteration, script_path=script_path,
                 metadata=proposal.metadata,
             )
             return CodingHarnessReport(
-                report=ReportPayload(title="Local Code Harness execution", summary="Execution evidence captured locally.", markdown="# Code Harness\n\nExecution evidence was captured locally.", claims=["Source was parsed and executed by the configured local sandbox."], limitations=issues),
+                report=ReportPayload(title="Local Code Harness execution", summary="Execution report captured locally.", markdown=report_markdown, claims=["Source was parsed and executed by the configured local sandbox."], limitations=issues),
                 execution_succeeded=succeeded, validations=validations,
                 validation_evidence=validation_evidence,
                 metrics={key: value for key, value in metrics.items() if isinstance(value, (str, int, float, bool))},
