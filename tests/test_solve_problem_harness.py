@@ -178,7 +178,7 @@ class SolveProblemHarnessTest(unittest.TestCase):
             self.assertEqual(bundle.main_harness.ready_tasks(next_state), ("publish-paper",))
             self.assertEqual(next_state.reports[0].status, SolveProblemStatus.COMPLETED)
 
-    def test_main_harness_reuses_revision_instructions_on_next_dispatch(self) -> None:
+    def test_main_harness_does_not_replay_internal_revision_as_outer_dispatch(self) -> None:
         model = FakeModelAgent()
         service = SolveProblemService(model, FakeCodeHarness(), max_iterations=1)
         with tempfile.TemporaryDirectory() as temp:
@@ -186,9 +186,11 @@ class SolveProblemHarnessTest(unittest.TestCase):
             bundle = build_local_runtime(workspace_root=root / "workspace", artifact_root=root / "artifacts", database_path=root / "runtime.db", solve_problem_service=service)
             state = bundle.main_harness.start("solve", canonical_main_harness_dag())
             state = bundle.main_harness.dispatch(state, "q1", max_iterations=1)
-            self.assertEqual(state.tasks[0].status.value, "revision_required")
-            bundle.main_harness.dispatch(state, "q1", max_iterations=1)
-            self.assertIn("add the sanity check", model.instructions_seen[1])
+            self.assertEqual(state.tasks[0].status.value, "completed")
+            self.assertEqual(len(state.reports), 1)
+            self.assertEqual(state.reports[0].iteration_count, 1)
+            with self.assertRaisesRegex(ValueError, "not ready"):
+                bundle.main_harness.dispatch(state, "q1", max_iterations=1)
 
     def test_main_harness_rollback_invalidates_descendants_and_keeps_history(self) -> None:
         service = SolveProblemService(FakeModelAgent(), FakeCodeHarness(), max_iterations=2)
@@ -552,7 +554,7 @@ class SolveProblemHarnessTest(unittest.TestCase):
             persisted = RunReportStore(root).persist(run_id, result, attempt=1)
             self.assertTrue(any("/exchanges/" in item.relative_path.replace("\\", "/") for item in persisted))
 
-    def test_solve_problem_caps_revisions_at_two_rounds(self) -> None:
+    def test_solve_problem_caps_revisions_at_two_rounds_and_writes_total_report(self) -> None:
         class AlwaysReviseModel(FakeModelAgent):
             def review(self, task, context, modeling, coding, *, iteration):
                 self.reviews += 1
@@ -566,10 +568,12 @@ class SolveProblemHarnessTest(unittest.TestCase):
         result = SolveProblemService(model, FakeCodeHarness(), max_iterations=20).solve(
             SolveProblemTask(task_id="q1", title="Q", problem="P"),
         )
-        self.assertEqual(result.status, SolveProblemStatus.REVISION_REQUIRED)
+        self.assertEqual(result.status, SolveProblemStatus.COMPLETED)
         self.assertEqual(result.iteration_count, 3)
         self.assertEqual(len(result.iterations), 3)
         self.assertEqual(model.reviews, 3)
+        self.assertIsNotNone(result.final_report)
+        self.assertIsNone(result.error)
 
     def test_solve_problem_can_resume_from_serialized_modeling_at_code_stage(self) -> None:
         model = FakeModelAgent()
@@ -593,7 +597,7 @@ class SolveProblemHarnessTest(unittest.TestCase):
         self.assertEqual(len(result.iterations), 2)
         self.assertEqual(model.explorations, [])
 
-    def test_main_harness_caps_resumed_revision_rounds_at_two(self) -> None:
+    def test_main_harness_caps_internal_revision_rounds_without_outer_retry(self) -> None:
         class AlwaysReviseModel(FakeModelAgent):
             def review(self, task, context, modeling, coding, *, iteration):
                 self.reviews += 1
@@ -611,10 +615,9 @@ class SolveProblemHarnessTest(unittest.TestCase):
             )
             state = bundle.main_harness.start("P", canonical_main_harness_dag())
             state = bundle.main_harness.dispatch(state, "q1", max_iterations=1)
-            self.assertEqual(state.tasks[0].status.value, "revision_required")
-            state = bundle.main_harness.dispatch(state, "q1", max_iterations=1)
-            self.assertEqual(state.tasks[0].status.value, "revision_required")
-            with self.assertRaisesRegex(ValueError, "maximum of 2"):
+            self.assertEqual(state.tasks[0].status.value, "completed")
+            self.assertEqual(state.reports[0].iteration_count, 1)
+            with self.assertRaisesRegex(ValueError, "not ready"):
                 bundle.main_harness.dispatch(state, "q1", max_iterations=1)
 
     def test_reference_hmml_is_searchable_and_report_first(self) -> None:

@@ -615,11 +615,27 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         return f"m2h-deepagents-code-{safe_run_id}-{task.task_id}"
 
     def _build_prompt(self, task: SolveProblemTask, context: SolveProblemContext, modeling: UnifiedModelingReport, *, iteration: int, target_relative: str) -> str:
+        exchange_paths = sorted(
+            item.relative_path for item in context.readonly_files
+            if "/exchanges/" in item.relative_path.replace("\\", "/")
+        )
+        if iteration == 1:
+            modeling_contract: dict[str, Any] = modeling.model_dump(mode="json")
+        else:
+            initial_contract = next((path for path in exchange_paths if path.endswith("model-to-code.md")), "首轮 model-to-code.md（按白名单路径读取）")
+            repair_contract = next((path for path in reversed(exchange_paths) if path.endswith("model-to-code-revision.md")), "最新 model-to-code-revision.md（按白名单路径读取）")
+            modeling_contract = {
+                "continuation": "沿用首轮已锁定的建模契约；本轮只执行 Code 返修，不重新建模。",
+                "initial_contract_path": initial_contract,
+                "latest_repair_handoff_path": repair_contract,
+                "required_validations": list(modeling.required_validations),
+                "expected_outputs": list(modeling.expected_outputs),
+            }
         payload = {
             "task": task.model_dump(mode="json"),
             "iteration": iteration,
             "target_source_path": "/" + target_relative,
-            "modeling_contract": modeling.model_dump(mode="json"),
+            "modeling_contract": modeling_contract,
             "readonly_allowlist": [
                 {"path": item.relative_path, "purpose": item.purpose, "role": item.role.value, "sha256": item.sha256}
                 for item in context.readonly_files

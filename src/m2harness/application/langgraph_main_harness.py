@@ -1,8 +1,9 @@
 """Durable LangGraph runtime for the M2Harness top-level workflow.
 
 ``MainHarness`` remains the domain authority: it validates DAG transitions,
-leases the ``solve_problem`` tool, persists reports, and enforces the two-round
-revision policy.  This module supplies the framework runtime around that
+leases the ``solve_problem`` tool, persists reports, and lets each atomic
+``solve_problem`` call own its initial implementation plus at most two Code
+repair rounds.  This module supplies the framework runtime around that
 authority, giving operators durable graph checkpoints and a stream of explicit
 dispatch/compose events without duplicating the domain state machine.
 """

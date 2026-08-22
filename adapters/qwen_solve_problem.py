@@ -308,6 +308,27 @@ def _compact_evidence(value: Any) -> Any:
     return result
 
 
+def _modeling_payload(modeling: UnifiedModelingReport, context: SolveProblemContext, iteration: int) -> dict[str, Any]:
+    """Pass the full model once, then a compact continuation reference."""
+
+    if iteration == 1:
+        return modeling.model_dump(mode="json")
+    paths = sorted(
+        item.relative_path for item in context.readonly_files
+        if "/exchanges/" in item.relative_path.replace("\\", "/")
+    )
+    initial = next((path for path in paths if path.endswith("model-to-code.md")), "首轮 model-to-code.md（按白名单路径读取）")
+    latest = next((path for path in reversed(paths) if path.endswith("model-to-code-revision.md")), "最新 model-to-code-revision.md（按白名单路径读取）")
+    return {
+        "continuation": "沿用首轮已锁定的建模契约；当前仅进行 Code 证据审查/返修，不重新建模。",
+        "initial_contract_path": initial,
+        "latest_repair_handoff_path": latest,
+        "selected_branch_ids": list(modeling.selected_branch_ids),
+        "required_validations": list(modeling.required_validations),
+        "expected_outputs": list(modeling.expected_outputs),
+    }
+
+
 @dataclass
 class QwenChatClient:
     """Small synchronous JSON client; transport is injectable for tests."""
@@ -673,7 +694,7 @@ class QwenModelAgent(ModelAgentPort):
             "若需要源码或输出，使用 requested_file_paths 请求白名单路径。无论发现何种问题，decision 为 revise/reject 时 revision_target 必须为 code，指令必须说明要改哪段代码、如何重新执行和需要补充什么报告证据。",
             SolveProblemReview.model_json_schema(),
             evidence={
-                "modeling_report": modeling.model_dump(mode="json"),
+                "modeling_report": _modeling_payload(modeling, context, iteration),
                 # Code→Model is report-first. Keep structural fields only as
                 # path/evidence indexes; do not route timeout/failed booleans
                 # into the Model Agent's repair decision.
@@ -689,7 +710,15 @@ class QwenModelAgent(ModelAgentPort):
         return SolveProblemReview.model_validate(value, strict=False)
 
     def compose_final_report(self, task, context, modeling, coding, review, *, iteration):
-        value = self._request(task, context, f"用中文编写当前范围在第 {iteration} 轮通过审查后的最终单题报告。只使用已验证的 Coding Report 证据，保留限制，并把后续题目需要的机器值放入 structured.downstream_outputs。", ReportPayload.model_json_schema(), evidence={"modeling_report": modeling.model_dump(mode="json"), "coding_report": coding.model_dump(mode="json"), "review": review.model_dump(mode="json")}, skill_names=("report-rendering", "scientific-writing", "claim-evidence", "report-review"), role=AgentRole.PAPER)
+        value = self._request(
+            task,
+            context,
+            f"用中文编写当前范围第 {iteration} 轮的总题目报告。若本轮 review 已通过，按已验证证据陈述结论；若这是 solve 内部第三轮上限，必须明确列出仍未闭合的限制，不得伪称已通过。只使用最后一次 Code→Model 报告、已锁定的建模契约和 review 证据；不要重新 explore、synthesize 或重建模型。把后续题目需要的机器值放入 structured.downstream_outputs。",
+            ReportPayload.model_json_schema(),
+            evidence={"modeling_report": _modeling_payload(modeling, context, iteration), "coding_report": coding.model_dump(mode="json"), "review": review.model_dump(mode="json")},
+            skill_names=("report-rendering", "scientific-writing", "claim-evidence", "report-review"),
+            role=AgentRole.PAPER,
+        )
         return ReportPayload.model_validate(value, strict=False)
 
 
@@ -711,11 +740,18 @@ class QwenCodeProposalProvider(CodeProposalProvider):
                 f".m2harness-code/{task.task_id}/iteration-{iteration}/outputs."
             ),
         ) + _scope_instruction(task)
-        handoff_paths = sorted(
+        exchange_paths = sorted(
             item.relative_path for item in context.readonly_files
             if "/exchanges/" in item.relative_path.replace("\\", "/")
         )
-        prompt = json.dumps(_compact_provider_payload({"task": task.model_dump(mode="json"), "context": _context_json(context), "modeling": modeling.model_dump(mode="json"), "iteration": iteration, "handoff_paths": handoff_paths, "skill_context": _skill_context(self.skills, ("coding-contract", "code-debugging", "dimensional-analysis", "visualization", "scientific-figure-design", "numerical-validation")), "schema": CodeProposal.model_json_schema()}), ensure_ascii=False)
+        repair_handoffs = [path for path in exchange_paths if path.endswith("model-to-code-revision.md")]
+        initial_handoffs = [path for path in exchange_paths if path.endswith("model-to-code.md")]
+        # A repair Code Agent receives the newest delta instruction first. The
+        # initial full contract is included only as a fallback/reference; the
+        # provider must not mistake an old modeling report for a new repair.
+        handoff_paths = ([repair_handoffs[-1]] if repair_handoffs else ([initial_handoffs[-1]] if initial_handoffs else []))
+        handoff_paths.extend(path for path in exchange_paths if path not in handoff_paths and path.endswith("code-to-model.md"))
+        prompt = json.dumps(_compact_provider_payload({"task": task.model_dump(mode="json"), "context": _context_json(context), "modeling": _modeling_payload(modeling, context, iteration), "iteration": iteration, "handoff_paths": handoff_paths, "skill_context": _skill_context(self.skills, ("coding-contract", "code-debugging", "dimensional-analysis", "visualization", "scientific-figure-design", "numerical-validation")), "schema": CodeProposal.model_json_schema()}), ensure_ascii=False)
         try:
             if self.tool_runtime is not None and self.capabilities is not None:
                 logical_name = "solve_" + re.sub(r"[^A-Za-z0-9_-]+", "_", task.task_id) + ".py"
@@ -725,7 +761,7 @@ class QwenCodeProposalProvider(CodeProposalProvider):
                         "You are a small Code Agent Harness. Use the supplied workspace tools for all file inspection and edits.",
                         "全过程使用中文交流、注释和验证说明；只在代码标识符中保留必要英文。",
                         "Continue only the isolated Code Agent context from context.metadata.code_conversation; do not reset it on a revision iteration. Model Agent context is separate and arrives only through the handoff contract.",
-                        "First read the latest model-to-code handoff under the supplied allowlisted exchange paths with workspace_read; it is the auditable contract for this implementation.",
+                        "首轮读取 model-to-code.md；返修轮优先读取最新的 model-to-code-revision.md。返修交接只包含增量修改指令，旧建模全文只能按路径按需读取，不得把旧报告当成新的返修要求。",
                         f"Write the complete deterministic Python source with workspace_write to {source_path}.",
                         "If the source is too large for one tool call, write it in ordered chunks: first workspace_write with overwrite=true, then workspace_write with append=true; never omit or summarize source chunks.",
                         "Use workspace_read/workspace_search to inspect staged inputs and existing files, and python_execute or validation_run for checks.",

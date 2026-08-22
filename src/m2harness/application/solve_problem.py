@@ -411,7 +411,7 @@ class SolveProblemService:
                         current_context, task, iteration_number, "modeling",
                         f"preliminary-{preliminary_report.branch_id}",
                         _preliminary_markdown(preliminary_report),
-                        purpose=f"Model Agent preliminary route {preliminary_report.branch_id} for {task.task_id}, iteration {iteration_number}.",
+                        purpose=f"题目 {task.task_id} 第 {iteration_number} 轮 Model Agent 初步路线 {preliminary_report.branch_id}。",
                         role=ReadOnlyFileRole.REFERENCE,
                     )
                 current_context = self._record_conversation(
@@ -434,7 +434,7 @@ class SolveProblemService:
                         current_context = self._archive(
                             current_context, task, iteration_number, "handoff", "disclosure-failure",
                             _disclosure_failure_markdown(task, iteration_number, requested, exc),
-                            purpose=f"Progressive disclosure failure before the next Model Agent boundary for {task.task_id}.",
+                            purpose=f"题目 {task.task_id} 下一次 Model Agent 交接前的渐进式披露失败记录。",
                             role=ReadOnlyFileRole.REFERENCE,
                         )
                         return SolveProblemReport(
@@ -467,7 +467,7 @@ class SolveProblemService:
                                 current_context, task, iteration_number, "modeling",
                                 f"preliminary-{preliminary_report.branch_id}-after-disclosure",
                                 _preliminary_markdown(preliminary_report),
-                                purpose=f"Model Agent preliminary route {preliminary_report.branch_id} after file disclosure for {task.task_id}, iteration {iteration_number}.",
+                                purpose=f"题目 {task.task_id} 第 {iteration_number} 轮文件披露后的 Model Agent 初步路线 {preliminary_report.branch_id}。",
                                 role=ReadOnlyFileRole.REFERENCE,
                             )
             if not preliminary:
@@ -506,31 +506,34 @@ class SolveProblemService:
                 current_context = self._archive(
                     current_context, task, iteration_number, "modeling", "modeling_report",
                     _modeling_markdown(modeling),
-                    purpose=f"Unified Model Agent modeling plan for {task.task_id}, iteration {iteration_number}.",
+                    purpose=f"题目 {task.task_id} 第 {iteration_number} 轮 Model Agent 统一建模方案。",
                     role=ReadOnlyFileRole.REFERENCE,
                 )
                 current_context = self._record_conversation(
                     current_context, task, iteration_number, "Model Agent",
                     f"统一建模已完成。主方案：{modeling.main_scheme[:1800]}；验证项：{', '.join(modeling.required_validations[:12])}。",
                 )
-            # Make the exact Model -> Code contract an explicit, durable
-            # handoff.  The Code Agent still receives the typed modeling
-            # object, but the artifact makes the boundary inspectable and
-            # gives it a verified path it may read through the tool lane.
-            current_context = self._archive(
-                current_context, task, iteration_number, "handoff", "model-to-code",
-                _compact_model_to_code_handoff(
-                    task, current_context, preliminary, modeling, iteration_number,
-                    max_revision_rounds=self.revision_round_limit,
-                ),
-                purpose=f"Explicit Model Agent to Code Agent handoff for {task.task_id}, iteration {iteration_number}.",
-                role=ReadOnlyFileRole.REFERENCE,
-            )
-            self._probe(current_context, task, iteration_number, "model_to_code_handoff", "Model Agent", "completed", {
-                "handoff": "model-to-code.md",
-                "required_validations": list(modeling.required_validations),
-                "expected_outputs": list(modeling.expected_outputs),
-            })
+            # The full Model→Code contract is written exactly once.  On a
+            # repair iteration the previous iteration's delta handoff is
+            # already in the allowlist; re-emitting the modeling report here
+            # only creates a second full copy and makes the Code context
+            # drift.  Code receives the same typed ``modeling`` object plus
+            # the latest delta instructions.
+            if iteration_number == start_iteration and not resume_mode:
+                current_context = self._archive(
+                    current_context, task, iteration_number, "handoff", "model-to-code",
+                    _compact_model_to_code_handoff(
+                        task, current_context, preliminary, modeling, iteration_number,
+                        max_revision_rounds=self.revision_round_limit,
+                    ),
+                    purpose=f"题目 {task.task_id} 的初始 Model Agent→Code Agent 建模契约。",
+                    role=ReadOnlyFileRole.REFERENCE,
+                )
+                self._probe(current_context, task, iteration_number, "model_to_code_handoff", "Model Agent", "completed", {
+                    "handoff": "model-to-code.md",
+                    "required_validations": list(modeling.required_validations),
+                    "expected_outputs": list(modeling.expected_outputs),
+                })
             if not set(modeling.selected_branch_ids).issubset(set(branch_ids)):
                 return SolveProblemReport(
                     task_id=task.task_id, status=SolveProblemStatus.FAILED,
@@ -564,12 +567,6 @@ class SolveProblemService:
                 known = {item.relative_path: item for item in current_context.readonly_files}
                 known.update({item.relative_path: item for item in coding.generated_files})
                 current_context = current_context.model_copy(update={"readonly_files": tuple(known.values())})
-            current_context = self._archive(
-                current_context, task, iteration_number, "coding", "coding_report",
-                _coding_markdown(coding),
-                purpose=f"Code Harness execution report for {task.task_id}, iteration {iteration_number}.",
-                role=ReadOnlyFileRole.DEPENDENCY_OUTPUT,
-            )
             current_context = self._record_conversation(
                 current_context, task, iteration_number, "Code Agent",
                 f"Code Agent 已提交本轮 Markdown 报告；验证索引仅作定位；生成文件：{', '.join(item.relative_path for item in coding.generated_files)}。",
@@ -581,7 +578,18 @@ class SolveProblemService:
                     task, current_context, modeling, coding, iteration_number,
                     max_revision_rounds=self.revision_round_limit,
                 ),
-                purpose=f"Explicit Code Harness to Model Agent repair handoff for {task.task_id}, iteration {iteration_number}.",
+                purpose=f"题目 {task.task_id} 第 {iteration_number} 轮 Code Harness→Model Agent 返修交接。",
+                role=ReadOnlyFileRole.DEPENDENCY_OUTPUT,
+            )
+            # Compatibility indexes keep legacy inspectors pointed at the one
+            # canonical report without writing a second copy of its body.
+            current_context = self._archive(
+                current_context, task, iteration_number, "coding", "coding_report",
+                _pointer_markdown(
+                    "Code→Model 报告索引",
+                    _current_exchange_path(current_context, task, iteration_number, "code-to-model.md"),
+                ),
+                purpose=f"题目 {task.task_id} 第 {iteration_number} 轮 Code→Model 报告正文索引。",
                 role=ReadOnlyFileRole.DEPENDENCY_OUTPUT,
             )
             self._probe(current_context, task, iteration_number, "code_to_model_handoff", "Code Agent", "completed", {
@@ -619,12 +627,6 @@ class SolveProblemService:
                 "revision_instruction_count": len(review.revision_instructions),
                 "requested_file_paths": list(review.requested_file_paths),
             })
-            current_context = self._archive(
-                current_context, task, iteration_number, "review", "review_report",
-                _review_markdown(review),
-                purpose=f"Model Agent Code→Model repair decision for {task.task_id}, iteration {iteration_number}.",
-                role=ReadOnlyFileRole.REFERENCE,
-            )
             self._probe(current_context, task, iteration_number, "model_to_code_revision_handoff", "Model Agent", "completed", {
                 "handoff": "model-to-code-revision.md",
                 "decision": review.decision.value,
@@ -641,15 +643,44 @@ class SolveProblemService:
                     task, current_context, modeling, coding, review, iteration_number,
                     max_revision_rounds=self.revision_round_limit,
                 ),
-                purpose=f"Explicit Model Agent to Code Agent repair handoff for {task.task_id}, iteration {iteration_number}.",
+                purpose=f"题目 {task.task_id} 第 {iteration_number} 轮 Model Agent→Code Agent 返修交接。",
                 role=ReadOnlyFileRole.REFERENCE,
             )
+            current_context = self._archive(
+                current_context, task, iteration_number, "review", "review_report",
+                _pointer_markdown(
+                    "Model Agent 返修意见索引",
+                    _current_exchange_path(current_context, task, iteration_number, "model-to-code-revision.md"),
+                ),
+                purpose=f"题目 {task.task_id} 第 {iteration_number} 轮 Model→Code 返修交接正文索引。",
+                role=ReadOnlyFileRole.REFERENCE,
+            )
+            if review.revision_instructions:
+                current_context = self._archive(
+                    current_context, task, iteration_number, "review", "revision_instructions",
+                    _pointer_markdown(
+                        "Model Agent→Code Agent 返修指令索引",
+                        _current_exchange_path(current_context, task, iteration_number, "model-to-code-revision.md"),
+                    ),
+                    purpose=f"题目 {task.task_id} 第 {iteration_number} 轮 Code 返修指令正文索引。",
+                    role=ReadOnlyFileRole.REFERENCE,
+                )
             snapshot = SolveProblemIteration(
-                iteration=iteration_number, preliminary_reports=preliminary,
-                modeling_report=modeling, coding_report=coding, review=review,
+                iteration=iteration_number,
+                # A revision snapshot keeps only a compact pointer to the
+                # already accepted model.  The first snapshot is the single
+                # full modeling record; later snapshots must not serialize it
+                # again into every report/handoff.
+                preliminary_reports=(preliminary if iteration_number == start_iteration else ()),
+                modeling_report=_modeling_snapshot(modeling, iteration_number, first_iteration=start_iteration),
+                coding_report=coding, review=review,
             )
             iterations.append(snapshot)
-            if review.decision == ModelReviewDecision.APPROVE:
+            # A successful review, or the final allowed iteration, closes this
+            # one-shot solve call.  At the cap the Model Agent still writes a
+            # total question report with explicit limitations; Main Harness
+            # must not call solve again to manufacture another review loop.
+            if review.decision == ModelReviewDecision.APPROVE or iteration_number == iteration_limit:
                 try:
                     final_report = self.model_agent.compose_final_report(
                         task, current_context, modeling, coding, review,
@@ -670,16 +701,13 @@ class SolveProblemService:
                     final_report=final_report, artifacts=list(coding.artifacts),
                     archive_files=self._archive_files(current_context, task),
                     research_report=current_context.research_report,
+                    # The cap is a normal terminal outcome of this atomic
+                    # solve call, not an outer failure/retry signal.  Any
+                    # unresolved item belongs in the Chinese final report.
+                    error=None,
                 )
             revision_instructions = review.revision_instructions
             revision_target = review.revision_target
-            if revision_instructions:
-                current_context = self._archive(
-                    current_context, task, iteration_number, "review", "revision_instructions",
-                    "# Model Agent → Code Agent 返修指令\n\n" + "\n".join(f"- {item}" for item in revision_instructions) + "\n",
-                    purpose=f"Model Agent Code repair instructions for {task.task_id}, after iteration {iteration_number}.",
-                    role=ReadOnlyFileRole.REFERENCE,
-                )
             if review.requested_file_paths and self.file_reader is not None:
                 disclosed = self.file_reader.disclose(current_context, review.requested_file_paths)
                 if disclosed:
@@ -687,14 +715,19 @@ class SolveProblemService:
                         "disclosed_text_files": (*current_context.disclosed_text_files, *disclosed),
                     })
 
+        # The repair budget belongs to solve_problem.  Never leak a
+        # ``revision_required`` state to Main Harness: that would make the
+        # outer DAG dispatch the same problem again and duplicate the whole
+        # Model↔Code exchange.  The final internal snapshot and instructions
+        # remain available in the archived handoff for operator recovery.
         return SolveProblemReport(
-            task_id=task.task_id, status=SolveProblemStatus.REVISION_REQUIRED,
+            task_id=task.task_id, status=SolveProblemStatus.FAILED,
             iteration_count=(start_iteration - 1) + len(iterations), iterations=tuple(iterations),
             revision_instructions=revision_instructions,
             artifacts=list(iterations[-1].coding_report.artifacts) if iterations else [],
             archive_files=self._archive_files(current_context, task),
             research_report=current_context.research_report,
-            error="solve_problem iteration budget exhausted",
+            error="solve_problem 内部返修额度已耗尽；主 Harness 不会再次调用本题。",
         )
 
     def _probe(
@@ -781,42 +814,68 @@ class SolveProblemService:
 
 def _preliminary_markdown(report: PreliminaryModelingReport) -> str:
     lines = [
-        f"# Preliminary Modeling Route: {report.branch_id}",
-        "", "## Candidate Scheme", "", report.candidate_scheme,
-        "", "## Assumptions", "", *(f"- {item}" for item in report.assumptions),
-        "", "## Expected Outputs", "", *(f"- {item}" for item in report.expected_outputs),
-        "", "## Risks", "", *(f"- {item}" for item in report.risks),
-        "", "## Model Agent Report", "", report.report.markdown,
+        f"# 初步建模路线：{report.branch_id}",
+        "", "## 候选方案", "", report.candidate_scheme,
+        "", "## 假设", "", *(f"- {item}" for item in report.assumptions),
+        "", "## 预期输出", "", *(f"- {item}" for item in report.expected_outputs),
+        "", "## 风险", "", *(f"- {item}" for item in report.risks),
+        "", "## Model Agent 报告", "", report.report.markdown,
     ]
     if report.requested_file_paths:
-        lines.extend(["", "## Requested Read-only Files", "", *(f"- `{item}`" for item in report.requested_file_paths)])
+        lines.extend(["", "## 请求的只读文件", "", *(f"- `{item}`" for item in report.requested_file_paths)])
     return "\n".join(lines).strip() + "\n"
 
 
 def _modeling_markdown(report: UnifiedModelingReport) -> str:
     return "\n".join([
-        f"# Unified Modeling Report: {report.report.title}", "", report.report.markdown,
-        "", "## Main Scheme", "", report.main_scheme,
-        "", "## Selected Branches", "", *(f"- `{item}`" for item in report.selected_branch_ids),
-        "", "## Required Validations", "", *(f"- {item}" for item in report.required_validations),
-        "", "## Expected Outputs", "", *(f"- {item}" for item in report.expected_outputs),
-        "", "## Coding Instructions", "", *(f"- {item}" for item in report.coding_instructions),
+        f"# 统一建模报告：{report.report.title}", "", report.report.markdown,
+        "", "## 主方案", "", report.main_scheme,
+        "", "## 选中路线", "", *(f"- `{item}`" for item in report.selected_branch_ids),
+        "", "## 必须验证", "", *(f"- {item}" for item in report.required_validations),
+        "", "## 预期输出", "", *(f"- {item}" for item in report.expected_outputs),
+        "", "## 编码指令", "", *(f"- {item}" for item in report.coding_instructions),
     ]).strip() + "\n"
+
+
+def _modeling_snapshot(
+    modeling: UnifiedModelingReport,
+    iteration: int,
+    *,
+    first_iteration: int,
+) -> UnifiedModelingReport:
+    """Return the full model once, then a typed path-only continuation view."""
+
+    if iteration == first_iteration:
+        return modeling
+    return modeling.model_copy(update={
+        "report": ReportPayload(
+            title="统一建模契约索引",
+            summary="本轮沿用首轮已锁定的统一建模契约；未重新建模。",
+            markdown=(
+                "# 统一建模契约索引\n\n"
+                "本轮为 Code 返修延续。完整建模报告只在首轮交接保存；"
+                "请按白名单路径读取首轮 `model-to-code.md`。\n"
+            ),
+            limitations=["本对象是返修快照索引，不是新的建模报告。"],
+        ),
+        "main_scheme": "（沿用首轮统一建模契约；详见首轮 model-to-code.md）",
+        "coding_instructions": (),
+    })
 
 
 def _coding_markdown(report: CodingHarnessReport) -> str:
     lines = [
-        f"# Coding Harness Report: {report.report.title}", "", report.report.markdown,
+        f"# Code Harness 执行报告：{report.report.title}", "", report.report.markdown,
         "", "## 本轮观察证据", "",
         "- 本文件是 Code→Model 的主交接报告；Model Agent 应以 Markdown、源代码、输出文件和探针为准。",
         "- 结构化验证索引仅用于定位，不作为独立成功/失败裁决。",
-        "", "## Validations（辅助索引）", "", *(f"- `{key}`: `{value}`" for key, value in report.validations.items()),
-        "", "## Validation Evidence Index（辅助索引）", "", *(f"- `{key}`: {value}" for key, value in report.validation_evidence.items()),
+        "", "## 验证索引（辅助）", "", *(f"- `{key}`：`{value}`" for key, value in report.validations.items()),
+        "", "## 验证证据索引（辅助）", "", *(f"- `{key}`：{value}" for key, value in report.validation_evidence.items()),
         "", "## 原始 Markdown 报告", "",
         "代码 stdout 已由 Code Harness 原样嵌入上面的 `report.markdown`；Model Agent 应以该 Markdown、源代码、输出和探针为主，不得因孤立的 false 字段直接否决。",
-        "", "## Metrics", "", *(f"- `{key}`: `{value}`" for key, value in report.metrics.items()),
-        "", "## Issues", "", *(f"- {item}" for item in report.issues),
-        "", "## Generated Files", "", *(f"- `{item.relative_path}` — {item.purpose}" for item in report.generated_files),
+        "", "## 指标", "", *(f"- `{key}`：`{value}`" for key, value in report.metrics.items()),
+        "", "## 问题", "", *(f"- {item}" for item in report.issues),
+        "", "## 生成文件", "", *(f"- `{item.relative_path}` — {item.purpose}" for item in report.generated_files),
     ]
     return "\n".join(lines).strip() + "\n"
 
@@ -888,6 +947,22 @@ def _handoff_file_table(context: SolveProblemContext, task_id: str) -> list[str]
             f"sha256=`{item.sha256 or 'not-recorded'}`, size={item.size_bytes if item.size_bytes is not None else 'unknown'} bytes"
         )
     return sorted(rows)
+
+
+def _current_exchange_path(context: SolveProblemContext, task: SolveProblemTask, iteration: int, filename: str) -> str:
+    marker = f"/tasks/{task.task_id}/"
+    candidates = [
+        item.relative_path for item in context.readonly_files
+        if marker in ("/" + item.relative_path.replace("\\", "/"))
+        and f"/exchanges/iteration-{iteration}/handoff/{filename}" in item.relative_path.replace("\\", "/")
+    ]
+    if candidates:
+        return sorted(candidates)[-1]
+    return f"exchanges/iteration-{iteration}/handoff/{filename}"
+
+
+def _pointer_markdown(title: str, target: str) -> str:
+    return f"# {title}\n\n正文已归档于 `{target}`；本文件仅作索引，不复制正文。\n"
 
 
 def _model_to_code_handoff(
@@ -998,7 +1073,12 @@ def _compact_model_to_code_handoff(
     *,
     max_revision_rounds: int = MAX_REVISION_ROUNDS,
 ) -> str:
-    """Detailed Model→Code report and handoff in one durable Markdown file."""
+    """Write the one-time full Model→Code contract.
+
+    This is intentionally the only handoff that embeds the selected model.
+    Repair rounds refer back to this path and carry only a delta instruction;
+    they never replay the preliminary routes, PDF extraction, or full model.
+    """
 
     lines = [
         "# 交接：Model Agent → Code Agent", "",
@@ -1014,14 +1094,11 @@ def _compact_model_to_code_handoff(
         f"- 编码指令：{'; '.join(modeling.coding_instructions[:16])}",
         f"- 初步路线数：{len(preliminary)}",
         "", "## 原始题面 PDF（只读原文输入）", "", *_problem_pdf_lines(context),
-        "", "## 已披露题面文本（与原始 PDF 对应）", "", *_disclosed_text_lines(context),
         "", "## 只读文件索引", "", *_handoff_file_table(context, task.task_id),
-        "", "## 本轮完整建模报告（与本交接同时归档）", "",
+        "", "## 本轮完整建模报告与契约（仅此初次交接完整展开）", "",
         *_modeling_markdown(modeling).splitlines(),
-        "", "## 初步路线报告全文", "",
-        *[line for item in preliminary for line in (
-            [f"### 路线 `{item.branch_id}`", "", *_preliminary_markdown(item).splitlines(), ""]
-        )],
+        "", "## 初步路线索引", "",
+        *(f"- `{item.branch_id}`：{item.candidate_scheme[:600]}" for item in preliminary),
         "", "## Model Agent 上下文最近事件", "", *_conversation_lines(context, "model"),
         "", "## Code Agent 必须完成", "",
         "- 只实现本题范围；使用受限工具写入、读取和验证源代码。",
@@ -1039,7 +1116,16 @@ def _compact_code_to_model_handoff(
     *,
     max_revision_rounds: int = MAX_REVISION_ROUNDS,
 ) -> str:
-    """Detailed Code→Model report and handoff in one durable Markdown file."""
+    """Write exactly one Code→Model execution report for this iteration.
+
+    The report is the complete evidence for the current Code run.  The
+    accepted modeling contract and earlier reports are paths, not duplicated
+    prose; Model Agent can request those allowlisted files when needed.
+    """
+    previous = [
+        path for path in _handoff_paths(context, task_id=task.task_id)
+        if path.endswith("model-to-code.md") or path.endswith("model-to-code-revision.md")
+    ]
     lines = [
         "# 交接：Code Harness → Model Agent（代码返修阶段）", "",
         f"- 题目：`{task.task_id}` — {task.title}", f"- 迭代：`{iteration}`",
@@ -1058,13 +1144,14 @@ def _compact_code_to_model_handoff(
         "", "## 产物索引", "",
         *(f"- `{item.logical_name}` ({item.kind.value})" for item in coding.artifacts[:16]),
         *(f"- `{item.relative_path}` ({item.role.value})" for item in coding.generated_files),
-        "", "## 原始题面 PDF（只读原文输入）", "", *_problem_pdf_lines(context),
-        "", "## 已披露题面文本（与原始 PDF 对应）", "", *_disclosed_text_lines(context),
-        "", "## 只读文件索引", "", *_handoff_file_table(context, task.task_id),
+        "", "## 只读输入与既有契约（按需打开，不复制正文）", "",
+        *_problem_pdf_lines(context),
+        *(f"- 既有交接：`{path}`" for path in previous[-8:]),
+        *(f"- 当前产物：`{item.relative_path}`（{item.purpose}）" for item in coding.generated_files),
         "", "## 可观察探针", "",
         f"- 本运行探针：`reports/runs/{context.metadata.get('run_id', '当前运行')}/probe.ndjson`",
         "- 操作员可实时 tail 该 NDJSON 或阅读同目录 `probe.md`；探针只记录边界、状态和路径，不替代本报告。",
-        "", "## 本轮完整 Code Harness 报告（与本交接同时归档）", "",
+        "", "## 本轮唯一 Code→Model 报告（本轮完整 Code Harness 报告）", "",
         *_coding_markdown(coding).splitlines(),
         "", "## Code Agent 上下文最近事件", "", *_conversation_lines(context, "code"),
         "", "## Model Agent 代码返修阶段必须完成", "",
@@ -1086,7 +1173,13 @@ def _compact_model_to_code_revision_handoff(
     *,
     max_revision_rounds: int = MAX_REVISION_ROUNDS,
 ) -> str:
-    """Detailed Model→Code repair handoff retaining the reports it judged."""
+    """Write a delta-only Model→Code repair handoff.
+
+    It names the prior report and source paths, states why the transfer is
+    happening, and lists executable changes.  Full modeling and execution
+    reports remain in their original iteration files and are never copied
+    into every subsequent repair document.
+    """
     instruction_lines = [f"- {item}" for item in review.revision_instructions] or [
         "- 无返修指令；若执行成功，进入最终报告。"
     ]
@@ -1107,11 +1200,10 @@ def _compact_model_to_code_revision_handoff(
         "", "## Model Agent 代码返修结论", "", f"- 理由：{review.rationale[:2400]}",
         "", "## 必须执行的返修指令", "", *instruction_lines,
         "", "## 请求披露的文件", "", *requested_lines,
-        "", "## 原始题面 PDF（只读原文输入）", "", *_problem_pdf_lines(context),
-        "", "## 已披露题面文本（与原始 PDF 对应）", "", *_disclosed_text_lines(context),
-        "", "## 被审查的完整建模报告", "", *_modeling_markdown(modeling).splitlines(),
-        "", "## 被审查的完整执行报告", "", *_coding_markdown(coding).splitlines(),
-        "", "## 本轮完整 Model Agent 返修报告", "", *_review_markdown(review).splitlines(),
+        "", "## 只读题面与证据路径", "", *_problem_pdf_lines(context),
+        "- 建模契约（初次交接，正文不复制）：`model-to-code.md`。",
+        f"- 本轮 Code→Model 报告（正文不复制）：`reports/runs/{context.metadata.get('run_id', '当前运行')}/tasks/{task.task_id}/attempt-{task.revision + 1}/exchanges/iteration-{iteration}/handoff/code-to-model.md`。",
+        "- 被审查的完整执行报告已归档在上述 Code→Model 文件；本返修文档只保留增量意见。",
         "", "## 本轮 Model Agent 代码返修上下文", "", *_conversation_lines(context, "model"),
         "", "## 仍可见的文件索引", "", *_handoff_file_table(context, task.task_id),
     ]

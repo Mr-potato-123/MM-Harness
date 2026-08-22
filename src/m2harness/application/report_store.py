@@ -153,22 +153,42 @@ class RunReportStore:
             model_dir = base / "modeling" / f"iteration-{snapshot.iteration}"
             for preliminary in snapshot.preliminary_reports:
                 name = "preliminary-" + self._safe_name(preliminary.branch_id) + ".md"
+                canonical = base / "exchanges" / f"iteration-{snapshot.iteration}" / "modeling" / name
+                content = _pointer_or_fallback(
+                    self.workspace_root,
+                    canonical,
+                    title=f"建模路线 `{preliminary.branch_id}` 索引",
+                    fallback=preliminary.report.markdown,
+                )
                 records.append(self._write(
-                    model_dir / name, preliminary.report.markdown,
-                    purpose=f"Preliminary modeling route {preliminary.branch_id} for {report.task_id}.",
+                    model_dir / name, content,
+                    purpose=f"题目 {report.task_id} 的初步建模路线 {preliminary.branch_id} 正文索引。",
                     role=ReadOnlyFileRole.REFERENCE, task_id=report.task_id,
                     attempt=attempt, iteration=snapshot.iteration, media_type="text/markdown",
                 ))
+            canonical_model = base / "exchanges" / f"iteration-{snapshot.iteration}" / "modeling" / "modeling_report.md"
             records.append(self._write(
-                model_dir / "modeling_report.md", snapshot.modeling_report.report.markdown,
-                purpose=f"Unified Modeling Report for {report.task_id}, iteration {snapshot.iteration}.",
+                model_dir / "modeling_report.md",
+                _pointer_or_fallback(
+                    self.workspace_root,
+                    canonical_model,
+                    title="统一建模报告索引",
+                    fallback=snapshot.modeling_report.report.markdown,
+                ),
+                purpose=f"题目 {report.task_id} 第 {snapshot.iteration} 轮统一建模报告正文索引。",
                 role=ReadOnlyFileRole.REFERENCE, task_id=report.task_id,
                 attempt=attempt, iteration=snapshot.iteration, media_type="text/markdown",
             ))
             coding_dir = base / "coding" / f"run-{snapshot.iteration:03d}"
+            # The canonical Code→Model report lives in the exchange handoff
+            # written by solve_problem.  Keep this legacy index tiny so old
+            # readers can discover it without creating a second full report.
+            code_handoff = base / "exchanges" / f"iteration-{snapshot.iteration}" / "handoff" / "code-to-model.md"
             records.append(self._write(
-                coding_dir / "coding_report.md", snapshot.coding_report.report.markdown,
-                purpose=f"Coding Report and execution findings for {report.task_id}, run {snapshot.iteration}.",
+                coding_dir / "coding_report.md",
+                "# Code→Model 报告索引\n\n"
+                f"本文件不复制执行报告正文；请读取 `{code_handoff.as_posix()}`。\n",
+                purpose=f"题目 {report.task_id} 第 {snapshot.iteration} 轮 Code→Model 正文索引。",
                 role=ReadOnlyFileRole.DEPENDENCY_OUTPUT, task_id=report.task_id,
                 attempt=attempt, iteration=snapshot.iteration, media_type="text/markdown",
             ))
@@ -194,26 +214,21 @@ class RunReportStore:
                     f"审查未批准当前产物；按最窄目标 `{snapshot.review.revision_target.value}` "
                     "转回返修，并执行下方具体指令。"
                 )
+            revision_handoff = base / "exchanges" / f"iteration-{snapshot.iteration}" / "handoff" / "model-to-code-revision.md"
             records.append(self._write(
-                review_dir / "review_report.md", "\n".join([
-                    f"# Model Agent 代码返修意见：{snapshot.review.decision.value}", "",
-                    "本报告来自同一 Model Agent 读取 Code→Model 交接后的返修阶段；不重新建模。",
-                    "## 转接理由", "", transfer_reason,
-                    "## 理由", "", snapshot.review.rationale,
-                    "", "## 返修目标", "", f"`{snapshot.review.revision_target.value}`",
-                    "", "## 已接受声明", "", *(f"- {item}" for item in snapshot.review.accepted_claims),
-                    "", "## 返修指令", "", *(f"- {item}" for item in snapshot.review.revision_instructions),
-                    "", "## 请求读取的只读文件", "", *(f"- `{item}`" for item in snapshot.review.requested_file_paths),
-                ]).strip() + "\n",
-                purpose=f"Model Agent Code repair decision for {report.task_id}, iteration {snapshot.iteration}.",
+                review_dir / "review_report.md",
+                "# Model Agent 返修意见索引\n\n"
+                f"本文件不复制返修报告正文；请读取 `{revision_handoff.as_posix()}`。\n",
+                purpose=f"题目 {report.task_id} 第 {snapshot.iteration} 轮 Model→Code 返修交接正文索引。",
                 role=ReadOnlyFileRole.REFERENCE, task_id=report.task_id,
                 attempt=attempt, iteration=snapshot.iteration, media_type="text/markdown",
             ))
             if snapshot.review.revision_instructions:
                 records.append(self._write(
                     review_dir / "revision_instructions.md",
-                    "# Model Agent → Code Agent 返修指令\n\n" + "\n".join(f"- {item}" for item in snapshot.review.revision_instructions) + "\n",
-                    purpose=f"Model Agent 在 {report.task_id} 第 {snapshot.iteration} 轮后的 Code 返修指令。",
+                    "# Model Agent → Code Agent 返修指令索引\n\n"
+                    f"正文已合并到 `{revision_handoff.as_posix()}`，此处不重复展开。\n",
+                    purpose=f"题目 {report.task_id} 第 {snapshot.iteration} 轮 Code 返修指令正文索引。",
                     role=ReadOnlyFileRole.REFERENCE, task_id=report.task_id,
                     attempt=attempt, iteration=snapshot.iteration, media_type="text/markdown",
                 ))
@@ -225,15 +240,28 @@ class RunReportStore:
         if report.final_report is not None:
             records.append(self._write(
                 base / "final" / "solution_report.md", report.final_report.markdown,
-                purpose=f"Accepted final solution report for upstream task {report.task_id}.",
+                purpose=f"上游题目 {report.task_id} 的最终单题报告。",
                 role=ReadOnlyFileRole.DEPENDENCY_SOLUTION, task_id=report.task_id,
                 attempt=attempt, iteration=report.iteration_count or None, media_type="text/markdown",
             ))
         records.append(self._write(
             base / "solve_problem_report.json", report.model_dump_json(indent=2),
-            purpose=f"Complete typed solve_problem audit snapshot for {report.task_id}.",
+            purpose=f"题目 {report.task_id} 的 solve_problem 完整结构化审计快照。",
             role=ReadOnlyFileRole.REFERENCE, task_id=report.task_id,
             attempt=attempt, iteration=None, media_type="application/json",
+        ))
+        # This is the single upstream package index for the question.  It is
+        # deliberately an index, not another copy of any report: Main Harness
+        # discloses it to the next serial question, and the next Model Agent
+        # opens only the listed read-only paths it actually needs.
+        package_path = base / "question-package.md"
+        package_records = tuple(dict.fromkeys(item.relative_path for item in records))
+        records.append(self._write(
+            package_path,
+            _question_package_markdown(report, package_records, base=base),
+            purpose=f"Read-only question output package index for upstream task {report.task_id}.",
+            role=ReadOnlyFileRole.DEPENDENCY_SOLUTION, task_id=report.task_id,
+            attempt=attempt, iteration=report.iteration_count or None, media_type="text/markdown",
         ))
         run_base = Path("reports") / "runs" / str(run_id)
         for relative, media_type in ((run_base / "probe.md", "text/markdown"), (run_base / "probe.ndjson", "application/x-ndjson")):
@@ -309,6 +337,60 @@ class RunReportStore:
         name = Path(value).name
         sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
         return sanitized[:200] or "artifact"
+
+
+def _pointer_or_fallback(workspace_root: Path, canonical: Path, *, title: str, fallback: str) -> str:
+    """Avoid copying a canonical exchange into a second legacy directory."""
+
+    target = (workspace_root / canonical).resolve()
+    if target.is_file() and not target.is_symlink():
+        relative = canonical.as_posix()
+        return f"# {title}\n\n正文已归档于 `{relative}`；本文件仅作索引，不复制正文。\n"
+    return fallback if fallback.endswith("\n") else fallback + "\n"
+
+
+def _question_package_markdown(
+    report: SolveProblemReport,
+    record_paths: tuple[str, ...],
+    *,
+    base: Path,
+) -> str:
+    """Render the compact, read-only output index returned between questions."""
+
+    prefix = base.as_posix().rstrip("/") + "/"
+    paths = [path for path in record_paths if path.startswith(prefix)]
+    handoffs = [path for path in paths if "/exchanges/" in path]
+    generated = [path for path in paths if "/coding/" in path and "/artifacts/" in path]
+    source_files = [path for path in paths if ".m2harness-code/" in path or path.endswith(".py")]
+    final_path = f"{base.as_posix()}/final/solution_report.md" if report.final_report is not None else None
+    lines = [
+        "# 单题输出包（只读索引）",
+        "",
+        f"- 题目：`{report.task_id}`",
+        f"- 状态：`{report.status.value}`",
+        f"- 总迭代数：`{report.iteration_count}`（初始实现 + 最多两轮 Code 返修）",
+        f"- 总题目报告：`{final_path or '未生成'}`",
+        "- 使用规则：Main Harness 只把本索引和下方路径作为下一题的只读输入；不要把整套历史正文复制进下一题上下文。",
+        "- 交接规则：首轮 Model→Code 契约完整保存；后续 Model→Code 文档只保存本轮增量返修指令；每轮仅有一个 Code→Model 完整执行报告。",
+        "",
+        "## 关键交接路径",
+        "",
+        *(f"- `{path}`" for path in handoffs if path.endswith(("model-to-code.md", "model-to-code-revision.md", "code-to-model.md"))),
+        "",
+        "## 代码与结果",
+        "",
+        *(f"- `{path}`" for path in sorted(dict.fromkeys((*source_files, *generated)))),
+        "",
+        "## 可按需读取的其他文件",
+        "",
+        *(f"- `{path}`" for path in paths if path not in set(handoffs) and path not in set(source_files) and path not in set(generated) and not path.endswith("question-package.md")),
+        "",
+        "## 下游交接说明",
+        "",
+        "- 下一题只接收本题总报告的摘要、声明的 downstream_outputs，以及本索引列出的只读路径。",
+        "- 图片、数据和源代码不嵌入本文件；需要时按路径只读打开并核对 sha256。",
+    ]
+    return "\n".join(lines).strip() + "\n"
 
 
 def _archive_iteration(relative_path: str) -> int | None:

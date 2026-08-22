@@ -31,8 +31,6 @@ from m2harness.domain.solve_problem import (
     SolveProblemReport,
     SolveProblemStatus,
     SolveProblemTask,
-    MAX_REVISION_ROUNDS,
-    ModelReviewDecision,
 )
 from m2harness.domain.tool import ToolCall
 from m2harness.models import ArtifactKind, ProducedArtifact, ReportPayload, StrictModel, utc_now
@@ -129,7 +127,7 @@ class MainHarness:
         result: list[str] = []
         for node in state.dag.tasks:
             record = by_id[node.id]
-            if record.status not in {MainTaskStatus.READY, MainTaskStatus.REVISION_REQUIRED}:
+            if record.status != MainTaskStatus.READY:
                 continue
             if all(by_id[dependency].status == MainTaskStatus.COMPLETED for dependency in node.depends_on):
                 result.append(node.id)
@@ -181,12 +179,11 @@ class MainHarness:
             raise ValueError("only solve_problem DAG tasks are executable by dispatch()")
         by_id = {item.task_id: item for item in state.tasks}
         record = by_id[task_id]
-        if record.status not in {MainTaskStatus.READY, MainTaskStatus.REVISION_REQUIRED}:
+        # ``solve_problem`` owns its complete Model↔Code repair loop. Main
+        # Harness dispatches one atomic call per TODO node and never replays a
+        # node because an internal review requested repair.
+        if record.status != MainTaskStatus.READY:
             raise ValueError(f"DAG task {task_id} is not ready: {record.status.value}")
-        if record.status == MainTaskStatus.REVISION_REQUIRED and self._revision_rounds_consumed(state, task_id) >= MAX_REVISION_ROUNDS:
-            raise ValueError(
-                f"DAG task {task_id} exhausted the maximum of {MAX_REVISION_ROUNDS} review-driven revision rounds"
-            )
         if not all(by_id[dependency].status == MainTaskStatus.COMPLETED for dependency in node.depends_on):
             raise ValueError(f"DAG task {task_id} has incomplete dependencies")
         definition = self.tool_runtime.registry.get("solve_problem")
@@ -242,12 +239,36 @@ class MainHarness:
         except Exception as exc:
             failed = running_record.model_copy(update={"status": MainTaskStatus.FAILED, "last_error": f"durable report persistence failed: {exc}"})
             return self._commit(self._replace_task(working, failed), state.version)
+        # Attach the durable output region to the report object that is kept
+        # in Main Harness state.  The Markdown body remains unchanged; these
+        # are only read-only paths for the next serial question to open on
+        # demand.
+        if report.final_report is not None and persisted_files:
+            final_file = next((item for item in persisted_files if item.relative_path.endswith("/final/solution_report.md")), None)
+            solve_files = tuple(
+                item.as_readonly() for item in persisted_files
+                if item.task_id == report.task_id
+                and item.attempt == attempt
+                and item.role in {
+                    ReadOnlyFileRole.DEPENDENCY_SOLUTION,
+                    ReadOnlyFileRole.DEPENDENCY_OUTPUT,
+                    ReadOnlyFileRole.GENERATED,
+                }
+            )
+            report = report.model_copy(update={
+                "final_report": report.final_report.model_copy(update={
+                    "solution_report_path": final_file.relative_path if final_file is not None else report.final_report.solution_report_path,
+                    "solve_files": solve_files,
+                }),
+            })
         if report.status == SolveProblemStatus.COMPLETED:
             status = MainTaskStatus.COMPLETED
             error = None
         elif report.status == SolveProblemStatus.REVISION_REQUIRED:
-            status = MainTaskStatus.REVISION_REQUIRED
-            error = report.error
+            # Compatibility for older solve adapters.  A revision_required
+            # result is unfinished internal work, not an outer TODO retry.
+            status = MainTaskStatus.FAILED
+            error = report.error or "solve_problem returned an unfinished internal revision; no outer retry is permitted"
         elif report.status == SolveProblemStatus.BLOCKED:
             status = MainTaskStatus.BLOCKED
             error = report.error
@@ -397,20 +418,6 @@ class MainHarness:
         return state.model_copy(update={"tasks": tuple(by_id[item.id] for item in state.dag.tasks), "updated_at": utc_now()})
 
     @staticmethod
-    def _revision_rounds_consumed(state: MainHarnessState, task_id: str) -> int:
-        """Count durable non-approval review decisions across resumed dispatches."""
-
-        consumed = 0
-        for report in state.reports:
-            if report.task_id != task_id:
-                continue
-            consumed += sum(
-                1 for iteration in report.iterations
-                if iteration.review.decision in {ModelReviewDecision.REVISE, ModelReviewDecision.REJECT}
-            )
-        return consumed
-
-    @staticmethod
     def _replace_task(state: MainHarnessState, task: MainHarnessTask) -> MainHarnessState:
         tasks = tuple(task if item.task_id == task.task_id else item for item in state.tasks)
         return state.model_copy(update={"tasks": tasks, "updated_at": utc_now()})
@@ -488,8 +495,6 @@ class MainHarness:
         for _, report in reversed(report_pairs):
             if report.task_id != task_id:
                 continue
-            if report.status == SolveProblemStatus.REVISION_REQUIRED:
-                instructions.extend(item for item in report.revision_instructions if item not in instructions)
             if research_report is None and report.research_report is not None:
                 research_report = report.research_report
             break
