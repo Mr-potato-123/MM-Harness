@@ -76,8 +76,10 @@ class RunWorkspaceIsolationTest(unittest.TestCase):
             SolveProblemContext(metadata={"run_id": "run-a", "run_name": "traceable-run", "task_attempt": 1}),
             _modeling(), iteration=1, target_relative=".m2harness-code/runs/run-a/task-q1/attempt-1/iteration-1/solve_q1.py",
         )
-        self.assertIn("locked_model", prompt)
-        self.assertIn("output_directory", prompt)
+        self.assertIn("Code Agent 任务信封", prompt)
+        self.assertNotIn("locked_model", prompt)
+        self.assertNotIn("Skill:", prompt)
+        self.assertIn("输出目录", prompt)
 
     def test_session_managed_prompt_bootstraps_once_then_sends_delta(self) -> None:
         task = SolveProblemTask(task_id="q1", title="Q1", problem="P", requested_outputs=("result.md",))
@@ -96,10 +98,10 @@ class RunWorkspaceIsolationTest(unittest.TestCase):
             target_relative=".m2harness-code/runs/run-a/task-q1/attempt-1/iteration-2/solve_q1.py",
             session_managed=True,
         )
-        self.assertIn("Use the accepted model exactly and preserve the balance equation.", first)
+        self.assertNotIn("Use the accepted model exactly and preserve the balance equation.", first)
         self.assertNotIn("Use the accepted model exactly and preserve the balance equation.", later)
-        self.assertIn("persistent agent session", later)
-        self.assertIn("repair existing implementation", later)
+        self.assertIn("持久 Code Agent 会话", later)
+        self.assertIn("Code 返修", later)
 
     def test_dsh_session_manifest_and_prompt_index_are_traceable(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

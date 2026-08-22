@@ -132,6 +132,42 @@ class LocalSandboxClient:
         self._sandboxes[sandbox_id] = spec
         return sandbox_id
 
+    def start_process(
+        self,
+        argv: tuple[str, ...],
+        *,
+        env: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> subprocess.Popen:
+        """Start a host-backed process without imposing a wall-clock limit.
+
+        The local tool layer uses this only for its explicit soft-checkpoint
+        protocol.  DockerSandboxClient does not use this host implementation;
+        it keeps its container-specific execution path in ``run``.
+        """
+
+        if not self.available:
+            raise RuntimeError("host_execution_disabled: enable the trusted local backend or configure Docker/VM")
+        if not argv or any(not item or "\x00" in item for item in argv):
+            raise ValueError("sandbox argv must be non-empty and NUL-free")
+        inherited = ("PATH", "SystemRoot", "WINDIR", "TEMP", "TMP")
+        safe_env = {name: os.environ[name] for name in inherited if name in os.environ}
+        allowed_overrides = {"PATH", "PYTHONIOENCODING", "M2HARNESS_NETWORK"}
+        safe_env.update({key: value for key, value in (env or {}).items() if key in allowed_overrides})
+        working_directory = self.workspace_root if cwd is None else cwd.resolve()
+        if self.workspace_root != working_directory and self.workspace_root not in working_directory.parents:
+            raise ValueError("sandbox working directory escapes workspace")
+        working_directory.mkdir(parents=True, exist_ok=True)
+        return subprocess.Popen(
+            tuple(argv),
+            cwd=working_directory,
+            env=safe_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+        )
+
     def run(self, argv: tuple[str, ...], *, timeout_seconds: int | None = None, env: Mapping[str, str] | None = None, cwd: Path | None = None, cancel_check: Callable[[], bool] | None = None) -> LocalExecOutput:
         if not self.available:
             raise RuntimeError("host_execution_disabled: enable the trusted local backend or configure Docker/VM")

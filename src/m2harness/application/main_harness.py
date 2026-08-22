@@ -220,7 +220,9 @@ class MainHarness:
             "run_id": str(state.run_id),
             "task_attempt": attempt,
         })
-        if "run_name" in solve_metadata:
+        if "run_path_key" in solve_metadata:
+            solve_metadata["context_event_log"] = f"reports/runs/{solve_metadata['run_path_key']}/probe.ndjson"
+        elif "run_name" in solve_metadata:
             solve_metadata["context_event_log"] = f"reports/runs/{solve_metadata['run_name']}/probe.ndjson"
         else:
             solve_metadata["context_event_log"] = f"reports/runs/{state.run_id}/probe.ndjson"

@@ -109,7 +109,7 @@ class MainHarnessToolBridge:
     ALLOWED_TOOLS = frozenset({
         "workspace_list", "workspace_read", "workspace_search", "workspace_write",
         "workspace_edit", "artifact_inspect", "pdf_inspect", "data_profile",
-        "python_execute", "validation_run",
+        "python_execute", "python_continue", "python_cancel", "validation_run",
     })
     # Implementation-level planning is deliberately separate from the Main
     # Harness DAG.  These two tools are available to the legacy provider too;
@@ -123,7 +123,8 @@ class MainHarnessToolBridge:
         self.workspace_root = workspace_root.resolve() if workspace_root is not None else None
         self.run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id or "unscoped")
         self.task_attempt = task_attempt
-        self._todo_ledgers: dict[str, TodoLedger] = {}
+        self._todo_ledgers: dict[tuple[str, int], TodoLedger] = {}
+        self._source_written: set[tuple[str, int]] = set()
 
     def definitions(self) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
@@ -151,7 +152,7 @@ class MainHarnessToolBridge:
                 "type": "function",
                 "function": {
                     "name": "todo_write",
-                    "description": "Atomically replace the Code Agent implementation todo list; at most one item may be in_progress.",
+                    "description": "Update the Harness-preloaded Code Agent implementation todo list; preserve task content and change statuses only.",
                     "parameters": {
                         "type": "object", "additionalProperties": False, "required": ["todos"],
                         "properties": {"todos": {"type": "array", "maxItems": 100, "items": {
@@ -166,22 +167,48 @@ class MainHarnessToolBridge:
 
     def execute(self, name: str, arguments: dict[str, Any], *, task_id: str, iteration: int, turn: int) -> dict[str, Any]:
         if name in self.TODO_TOOLS:
-            ledger = self._todo_ledgers.get(task_id)
+            todo_key = (task_id, iteration)
+            ledger = self._todo_ledgers.get(todo_key)
             if ledger is None:
                 todo_root = None
                 if self.workspace_root is not None:
                     todo_root = self.workspace_root / ".m2harness-code" / "runs" / self.run_id / f"task-{task_id}" / f"attempt-{self.task_attempt}" / "todo.json"
                 ledger = TodoLedger(task_id, todo_root)
-                self._todo_ledgers[task_id] = ledger
+                ledger.write(self._canonical_todos(iteration), iteration=iteration)
+                self._todo_ledgers[todo_key] = ledger
             if name == "todo_read":
                 return {"ok": True, "tool_name": name, "output": {"todos": ledger.render()}}
             try:
-                snapshot = ledger.write(arguments.get("todos"), iteration=iteration)
+                raw_todos = arguments.get("todos")
+                expected = [item.content for item in ledger.read()]
+                submitted = [item.get("content") for item in raw_todos] if isinstance(raw_todos, list) and all(isinstance(item, dict) for item in raw_todos) else []
+                if submitted != expected:
+                    return {
+                        "ok": False,
+                        "tool_name": name,
+                        "error_code": "todo_plan_locked",
+                        "error_message": "Code Agent TODO 由 Harness 预置；只能更新既有任务的 status，不得改写、删除或增加任务。",
+                        "required_todos": ledger.render(),
+                    }
+                snapshot = ledger.write(raw_todos, iteration=iteration)
             except (TypeError, ValueError) as exc:
                 return {"ok": False, "tool_name": name, "error_code": "invalid_todo", "error_message": str(exc)}
             return {"ok": True, "tool_name": name, "output": snapshot.model_dump(mode="json")}
         if name not in self.ALLOWED_TOOLS:
             return {"ok": False, "error_code": "tool_not_allowed", "error_message": f"Code Agent tool is not allowed: {name}"}
+        # The initial implementation must become a reproducible artifact
+        # before the Code Agent spends turns on open-ended experiments.  This
+        # prevents an agent from replacing delivery with repeated inline DP /
+        # solver searches.  Repair iterations already have a source file and
+        # may execute before their first edit.
+        source_key = (task_id, iteration)
+        if iteration == 1 and name in {"python_execute", "validation_run"} and source_key not in self._source_written:
+            return {
+                "ok": False,
+                "tool_name": name,
+                "error_code": "source_write_required",
+                "error_message": "首轮必须先用 workspace_write 写入目标 Python 源文件；源文件存在后才能执行 python_execute 或 validation_run。",
+            }
         definition = self.runtime.registry.get(name)
         if definition is None:
             return {"ok": False, "error_code": "tool_not_found", "error_message": f"tool is not registered: {name}"}
@@ -195,8 +222,64 @@ class MainHarnessToolBridge:
         )
         result = self.runtime.execute(call, resolution)
         if result.ok:
-            return {"ok": True, "tool_name": name, "output": result.output or {}}
+            output = result.output or {}
+            # A sandbox timeout is a completed tool invocation, but it is not
+            # a successful code execution.  Preserve the full evidence while
+            # surfacing a hard semantic failure to the Code Agent; otherwise
+            # the model sees ``ok=true`` and can mistake ``timed_out=true``
+            # for an ordinary empty result.
+            if name in {"python_execute", "python_continue", "validation_run"} and isinstance(output, dict) and output.get("timed_out"):
+                requested_timeout = arguments.get("timeout_seconds")
+                return {
+                    "ok": False,
+                    "tool_name": name,
+                    "error_code": "execution_timeout",
+                    "error_message": (
+                        f"Generated script exceeded timeout_seconds={requested_timeout}. "
+                        "This is a failed validation, not a successful tool call. "
+                        "Increase timeout_seconds when the algorithm is sound, or optimize the algorithm before retrying; "
+                        "do not repeat the same source with the same timeout."
+                    ),
+                    "output": output,
+                    "next_action": "increase_timeout_or_optimize",
+                }
+            if name in {"python_execute", "python_continue", "validation_run"} and isinstance(output, dict) and output.get("execution_checkpoint"):
+                return {
+                    "ok": False,
+                    "tool_name": name,
+                    "error_code": "execution_checkpoint",
+                    "error_message": (
+                        "The generated script is still running after the soft checkpoint. "
+                        "Decide whether to continue the same job with python_continue or cancel it with python_cancel; "
+                        "this is not a failed computation and the process has not been terminated."
+                    ),
+                    "output": output,
+                    "next_action": "decide_continue_or_cancel",
+                }
+            if name == "workspace_write":
+                self._source_written.add(source_key)
+            return {"ok": True, "tool_name": name, "output": output}
         return {"ok": False, "tool_name": name, "error_code": result.error_code, "error_message": result.error_message}
+
+    @staticmethod
+    def _canonical_todos(iteration: int) -> list[dict[str, str]]:
+        """Return the bounded implementation lifecycle for this iteration."""
+
+        if iteration == 1:
+            return [
+                {"content": "读取 Model→Code 交接、统一建模报告和原始题面", "status": "in_progress"},
+                {"content": "写入完整目标 Python 源文件", "status": "pending"},
+                {"content": "执行脚本并完成建模报告要求的验证", "status": "pending"},
+                {"content": "整理 outputs 中的结果文件和图片", "status": "pending"},
+                {"content": "返回 CodeProposal 交接对象", "status": "pending"},
+            ]
+        return [
+            {"content": "读取最新返修交接、代码报告和已有源文件", "status": "in_progress"},
+            {"content": "按返修点修改目标 Python 源文件", "status": "pending"},
+            {"content": "重新执行脚本并完成相关验证", "status": "pending"},
+            {"content": "整理 outputs 中的最新结果文件和图片", "status": "pending"},
+            {"content": "返回 CodeProposal 交接对象", "status": "pending"},
+        ]
 
 
 def _content_parts(context: SolveProblemContext, prompt: str, *, deepseek: bool = False) -> list[dict[str, Any]]:
@@ -387,14 +470,20 @@ class QwenChatClient:
             }
         return {"enable_thinking": enabled}
 
-    def _max_output_tokens(self) -> int:
+    def _max_output_tokens(self, *, code_agent: bool = False) -> int:
         """Honor the configured output budget up to the provider's documented cap."""
 
         provider_limit = 384_000 if self._deepseek_mode else 64_000
-        return max(256, min(int(os.environ.get("QWEN_MAX_OUTPUT_TOKENS", str(provider_limit))), provider_limit))
+        env_name = "QWEN_CODE_MAX_OUTPUT_TOKENS" if code_agent else "QWEN_MAX_OUTPUT_TOKENS"
+        fallback = os.environ.get("QWEN_MAX_OUTPUT_TOKENS", str(provider_limit))
+        return max(256, min(int(os.environ.get(env_name, fallback)), provider_limit))
 
     def _http_timeout(self) -> httpx.Timeout | None:
-        return None if self.timeout_seconds is None else httpx.Timeout(self.timeout_seconds, connect=30.0)
+        configured = self.timeout_seconds
+        if configured is None:
+            raw = os.environ.get("QWEN_HTTP_TIMEOUT_SECONDS", "").strip()
+            configured = float(raw) if raw else None
+        return None if configured is None else httpx.Timeout(configured, connect=30.0)
 
     def _stream_json(self, client: httpx.Client, url: str, headers: dict[str, str], payload: dict[str, Any]) -> tuple[str, str | None]:
         """Read one OpenAI-compatible SSE response, with JSON fallback."""
@@ -511,17 +600,25 @@ class QwenChatClient:
         ]
         url = self.base_url.rstrip("/") + "/chat/completions"
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        max_tokens = self._max_output_tokens()
+        max_tokens = self._max_output_tokens(code_agent=True)
+        code_thinking_enabled = os.environ.get(
+            "QWEN_CODE_ENABLE_THINKING",
+            os.environ.get("QWEN_ENABLE_THINKING", "1"),
+        ) != "0"
+        code_timeout_raw = os.environ.get("QWEN_CODE_HTTP_TIMEOUT_SECONDS", "")
+        code_timeout = self._http_timeout()
+        if code_timeout_raw:
+            code_timeout = httpx.Timeout(float(code_timeout_raw), connect=30.0)
         turn = 1
         while max_turns is None or turn <= max_turns:
             payload = {
                 "model": self.model, "messages": messages, "stream": True,
                 "tools": tool_bridge.definitions(), "tool_choice": "auto", "max_tokens": max_tokens,
             }
-            payload.update(self._thinking_fields(os.environ.get("QWEN_ENABLE_THINKING", "1") != "0"))
+            payload.update(self._thinking_fields(code_thinking_enabled))
             _stream_progress(f"tool_turn_start turn={turn} tools={len(payload['tools'])}")
             try:
-                with httpx.Client(timeout=self._http_timeout()) as client:
+                with httpx.Client(timeout=code_timeout) as client:
                     answer, calls, finish_reason = self._stream_tool_turn(client, url, headers, payload)
             except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
                 raise ActivityExecutionError(f"Qwen Code Agent tool turn failed: {exc}") from exc
@@ -754,47 +851,35 @@ class QwenCodeProposalProvider(CodeProposalProvider):
     def propose(self, task, context, modeling, *, iteration):
         raw_run_id = str(context.metadata.get("run_id", "unscoped")) if isinstance(context.metadata, dict) else "unscoped"
         raw_run_name = str(context.metadata.get("run_name", raw_run_id)) if isinstance(context.metadata, dict) else raw_run_id
-        safe_run_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw_run_name)
+        run_path_key = str(context.metadata.get("run_path_key", raw_run_id)) if isinstance(context.metadata, dict) else raw_run_id
+        safe_run_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_path_key)
         attempt = int(context.metadata.get("task_attempt", 1)) if isinstance(context.metadata, dict) else 1
         logical_name = "solve_" + re.sub(r"[^A-Za-z0-9_-]+", "_", task.task_id) + ".py"
         source_path = f".m2harness-code/runs/{safe_run_name}/task-{task.task_id}/attempt-{attempt}/iteration-{iteration}/{logical_name}"
-        system = build_agent_system_prompt(
-            AgentRole.CODE,
-            output_contract=(
-                "Return one CodeProposal JSON object containing a complete deterministic Python script. The script must "
-                "print a short, readable Chinese Markdown result with the conclusion, key numbers, limitations and "
-                "generated file/image locations; do not print a full JSON or a large daily table. A JSON summary is optional and its false fields are "
-                "advisory only. Write the report and result files only under "
-                f"{source_path.rsplit('/', 1)[0]}/outputs."
-            ),
-        ) + _scope_instruction(task)
         system = CODE_AGENT_SYSTEM_PROMPT + _scope_instruction(task)
-        exchange_paths = sorted(
-            item.relative_path for item in context.readonly_files
-            if "/exchanges/" in item.relative_path.replace("\\", "/")
+        task_contract = build_code_agent_task_prompt(
+            task,
+            context,
+            modeling,
+            iteration=iteration,
+            target_relative=source_path,
+            output_relative=source_path.rsplit("/", 1)[0] + "/outputs",
         )
-        repair_handoffs = [path for path in exchange_paths if path.endswith("model-to-code-revision.md")]
-        initial_handoffs = [path for path in exchange_paths if path.endswith("model-to-code.md")]
-        # A repair Code Agent receives the newest delta instruction first. The
-        # initial full contract is included only as a fallback/reference; the
-        # provider must not mistake an old modeling report for a new repair.
-        handoff_paths = ([repair_handoffs[-1]] if repair_handoffs else ([initial_handoffs[-1]] if initial_handoffs else []))
-        handoff_paths.extend(path for path in exchange_paths if path not in handoff_paths and path.endswith("code-to-model.md"))
-        prompt = json.dumps({
-            "task_contract": build_code_agent_task_prompt(
-                task,
-                context,
-                modeling,
-                iteration=iteration,
-                target_relative=source_path,
-                output_relative=source_path.rsplit("/", 1)[0] + "/outputs",
-            ),
-            "handoff_paths": handoff_paths,
-            # Keep the selected implementation skills discoverable, but no
-            # longer concatenate the complete Model/Code policy stack into
-            # the same prompt.
-            "skill_context": _skill_context(self.skills, ("modeling-core", "coding-contract", "code-debugging", "numerical-validation")),
-        }, ensure_ascii=False)
+        # Keep the provider content readable and single-sourced.  The model
+        # is told where the contract lives; it is not given a second embedded
+        # copy of the model or the entire Skill catalog.
+        tool_prompt = task_contract + "\n" + "\n".join([
+            "## 工具协议",
+            "",
+            "- 只使用提供的 workspace 工具检查、编辑和执行；全过程用中文说明。",
+            f"- 用 `workspace_write` 将完整源文件写入 `{source_path}`；源文件过长时按有序片段写入，不能省略代码。",
+            "- 使用 `workspace_read`/`workspace_search` 读取白名单来源，使用 `python_execute` 或 `validation_run` 执行检查。",
+            "- 不得静默替换建模报告中的主方案；若实现偏离，必须在结果中说明。",
+            "- 首次完整实现后，执行建模报告要求的验证，并确认输出文件实际存在。",
+            "",
+            "完成后沿用上面的「返回要求」；不要在最终 JSON 中粘贴源代码。",
+        ]) + "\n"
+        prompt = tool_prompt
         prompt_path: Path | None = None
         if self.workspace_root is not None:
             prompt_path = self.workspace_root / Path(*source_path.split("/")).parent / "code-agent-prompt.md"
@@ -806,36 +891,6 @@ class QwenCodeProposalProvider(CodeProposalProvider):
                 raw_run_id = str(context.metadata.get("run_id", "unscoped")) if isinstance(context.metadata, dict) else "unscoped"
                 attempt = int(context.metadata.get("task_attempt", 1)) if isinstance(context.metadata, dict) else 1
                 source_path = f".m2harness-code/runs/{safe_run_name}/task-{task.task_id}/attempt-{attempt}/iteration-{iteration}/{logical_name}"
-                tool_prompt = prompt + json.dumps({
-                    "tool_protocol": [
-                        "You are a small Code Agent Harness. Use the supplied workspace tools for all file inspection and edits.",
-                        "全过程使用中文交流、注释和验证说明；只在代码标识符中保留必要英文。",
-                        "Continue from the current typed projection and newest allowlisted handoff paths; do not reset the accepted modeling contract on a revision iteration.",
-                        "首轮读取 model-to-code.md；返修轮优先读取最新的 model-to-code-revision.md。返修交接只包含增量修改指令，旧建模全文只能按路径按需读取，不得把旧报告当成新的返修要求。",
-                        f"Write the complete deterministic Python source with workspace_write to {source_path}.",
-                        "If the source is too large for one tool call, write it in ordered chunks: first workspace_write with overwrite=true, then workspace_write with append=true; never omit or summarize source chunks.",
-                        "Use workspace_read/workspace_search to inspect staged inputs and existing files, and python_execute or validation_run for checks.",
-                        "Do not replace the accepted modeling main scheme with a materially different algorithm or search space. If an implementation deviation is unavoidable, record it explicitly and do not claim stronger optimality than the evidence supports.",
-                        "After the first complete implementation, run the checks needed for the required validations; do not silently replace the accepted model. Once a reproducible feasible result and its optimality/convergence evidence are available, write the final script and return the handoff JSON.",
-                        "Do not put source code in the final JSON. Return logical_name, source_path, expected_validations, and a finite timeout_seconds integer (1..86400) after the file is written and checked. The timeout is mandatory.",
-                    ],
-                    "final_schema": {
-                        "type": "object", "additionalProperties": False,
-                        "required": ["logical_name", "source_path", "expected_validations", "timeout_seconds"],
-                        "properties": {
-                            "logical_name": {"type": "string", "pattern": r"^[A-Za-z0-9._-]+\\.py$"},
-                            "source_path": {"type": "string"},
-                            "expected_validations": {"type": "array", "items": {"type": "string"}},
-                            "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
-                        },
-                    },
-                }, ensure_ascii=False)
-                tool_prompt = prompt + "\n\n" + json.dumps({
-                    "tool_protocol": "Use only the supplied workspace tools. Write the complete source to the exact target path, run a changed-source validation when repairing, and then return one handoff JSON. Never repeat an identical tool call.",
-                    "target_source": source_path,
-                    "output_directory": source_path.rsplit("/", 1)[0] + "/outputs",
-                    "final_schema": {"required": ["logical_name", "source_path", "expected_validations", "timeout_seconds"]},
-                }, ensure_ascii=False)
                 if prompt_path is not None:
                     prompt_path.write_text(tool_prompt, encoding="utf-8")
                 bridge = MainHarnessToolBridge(
@@ -847,8 +902,17 @@ class QwenCodeProposalProvider(CodeProposalProvider):
                 )
                 value = self.client.tool_agent_json(
                     system=system + "\nThis Code Agent has a Main Harness tool lane. Never claim a file was written unless a workspace_write tool result confirms it.",
-                    content=_content_parts(context, tool_prompt, deepseek=bool(getattr(self.client, "_deepseek_mode", False))), schema=CodeProposal.model_json_schema(),
+                    # The PDF is a referenced read-only input at this
+                    # boundary.  The Code Agent can inspect it with
+                    # pdf_inspect; attaching every rendered page here made
+                    # the initial prompt large and obscured the contract.
+                    content=_content_parts(
+                        context.model_copy(update={"multimodal_inputs": ()}),
+                        tool_prompt,
+                        deepseek=bool(getattr(self.client, "_deepseek_mode", False)),
+                    ), schema=CodeProposal.model_json_schema(),
                     tool_bridge=bridge, task_id=task.task_id, iteration=iteration,
+                    max_turns=max(1, int(os.environ.get("QWEN_CODE_MAX_TURNS", "32"))),
                 )
                 if "source_path" in value:
                     read_result = bridge.execute(str("workspace_read"), {"path": str(value["source_path"]), "max_bytes": 2_000_000}, task_id=task.task_id, iteration=iteration, turn=0)

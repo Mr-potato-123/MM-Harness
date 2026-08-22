@@ -407,6 +407,9 @@ class SolveProblemHarnessTest(unittest.TestCase):
             model_to_code_revision = next(exchange_root.rglob("model-to-code-revision.md")).read_text(encoding="utf-8")
             self.assertIn("题目", model_to_code)
             self.assertIn("建模", model_to_code)
+            self.assertIn("modeling_report.md", model_to_code)
+            self.assertIn("problem.pdf", model_to_code)
+            self.assertNotIn("route 0", model_to_code)
             self.assertIn("产生的文件/图片", code_to_model)
             self.assertIn("结果", code_to_model)
             self.assertIn("请修改", model_to_code_revision)
@@ -583,7 +586,7 @@ class SolveProblemHarnessTest(unittest.TestCase):
             self.assertGreaterEqual(len(result.archive_files), 7)
             exchange_root = root / "reports" / "runs" / str(run_id) / "tasks" / "q1" / "attempt-1" / "exchanges"
             expected = {
-                "preliminary-route-0.md", "modeling_report.md", "coding_report.md",
+                "modeling_report.md", "coding_report.md",
                 "review_report.md", "revision_instructions.md",
             }
             names = {path.name for path in exchange_root.rglob("*.md")}
@@ -593,11 +596,12 @@ class SolveProblemHarnessTest(unittest.TestCase):
             code_to_model = next(exchange_root.rglob("code-to-model.md"))
             self.assertLess(model_to_code.stat().st_size, 12_000)
             self.assertLess(code_to_model.stat().st_size, 12_000)
-            self.assertIn("输出", model_to_code.read_text(encoding="utf-8"))
+            self.assertIn("生成文件", model_to_code.read_text(encoding="utf-8"))
             self.assertIn("产生的文件/图片", code_to_model.read_text(encoding="utf-8"))
             self.assertIn("结果", code_to_model.read_text(encoding="utf-8"))
             model_to_code_text = model_to_code.read_text(encoding="utf-8")
             code_to_model_text = code_to_model.read_text(encoding="utf-8")
+            self.assertNotIn("preliminary", model_to_code_text.lower())
             model_to_code_revision = next(exchange_root.rglob("model-to-code-revision.md")).read_text(encoding="utf-8")
             self.assertIn("建模", model_to_code_text)
             self.assertIn("产生的文件/图片", code_to_model_text)
@@ -783,15 +787,67 @@ class SolveProblemHarnessTest(unittest.TestCase):
             first_prompt = json.loads(client.calls[0][-1]["text"])
             self.assertIn("Skill: problem-intake", first_prompt["skill_context"])
             self.assertIn("Skill: coding-contract", first_prompt["skill_context"])
-            code_prompt = json.loads(client.calls[4][-1]["text"])
-            self.assertIn("Skill: modeling-core", code_prompt["skill_context"])
-            self.assertNotIn("## Explicit omissions", code_prompt["skill_context"])
+            code_prompt = client.calls[4][-1]["text"]
+            self.assertIn("Code Agent 任务信封", code_prompt)
+            self.assertIn("唯一来源", code_prompt)
+            self.assertNotIn("Skill: modeling-core", code_prompt)
+            self.assertNotIn("locked_model", code_prompt)
             self.assertIn("The Main Harness owns", client.systems[0])
             self.assertIn("同一个 Model Agent", json.dumps(client.calls[2], ensure_ascii=False))
             self.assertIn("Code Agent", client.systems[4])
             self.assertEqual(final.title, "final")
             self.assertEqual(proposal.logical_name, "generated_solution.py")
             self.assertGreaterEqual(len(client.calls), 5)
+
+    def test_code_tool_prompt_is_one_readable_reference_envelope(self) -> None:
+        class ToolPromptClient(FakeQwenClient):
+            def tool_agent_json(self, *, content, **kwargs):
+                self.tool_prompt = content[-1]["text"]
+                return {
+                    "source": "print('# result')",
+                    "logical_name": "solve_q1.py",
+                    "expected_validations": ["sanity"],
+                    "timeout_seconds": 60,
+                }
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = build_local_runtime(workspace_root=root / "w", artifact_root=root / "a", database_path=root / "r.db")
+            client = ToolPromptClient()
+            provider = QwenCodeProposalProvider(
+                client,
+                skills=bundle.skills,
+                tool_runtime=bundle.tool_runtime,
+                capabilities=bundle.capabilities,
+                workspace_root=root / "w",
+            )
+            task = SolveProblemTask(task_id="q1", title="Q1", problem="P")
+            context = SolveProblemContext(
+                metadata={"run_id": "run-a", "run_name": "traceable-run", "task_attempt": 1},
+                readonly_files=(
+                    ReadOnlyFileReference(
+                        relative_path="reports/runs/run-a/tasks/q1/attempt-1/exchanges/iteration-1/modeling/modeling_report.md",
+                        purpose="model", role=ReadOnlyFileRole.REFERENCE, media_type="text/markdown",
+                    ),
+                    ReadOnlyFileReference(
+                        relative_path="inputs/problem.pdf",
+                        purpose="problem", role=ReadOnlyFileRole.PROBLEM, media_type="application/pdf",
+                    ),
+                ),
+            )
+            modeling = UnifiedModelingReport(
+                report=_report("model"), selected_branch_ids=("route-0",), main_scheme="scheme",
+                required_validations=("sanity",), expected_outputs=("result",),
+            )
+            proposal = provider.propose(task, context, modeling, iteration=1)
+            prompt = client.tool_prompt
+            self.assertIn("Code Agent 任务信封", prompt)
+            self.assertIn("modeling_report.md", prompt)
+            self.assertIn("inputs/problem.pdf", prompt)
+            self.assertIn("timeout_seconds", prompt)
+            self.assertNotIn('"task_contract"', prompt)
+            self.assertNotIn("Skill: modeling-core", prompt)
+            self.assertEqual(proposal.timeout_seconds, 60)
 
     def test_qwen_client_retries_truncated_json_without_synthetic_repair(self) -> None:
         class Response:
@@ -889,9 +945,40 @@ class SolveProblemHarnessTest(unittest.TestCase):
             result = bridge.execute("workspace_search", {"pattern": "alpha", "path": "."}, task_id="q1", iteration=1, turn=1)
             self.assertTrue(result["ok"])
             self.assertEqual(result["output"]["matches"][0]["path"], "sample.py")
+            todo = bridge.execute("todo_read", {}, task_id="q1", iteration=1, turn=1)
+            self.assertTrue(todo["ok"])
+            self.assertEqual(len(todo["output"]["todos"]), 5)
+            wrong_todo = bridge.execute(
+                "todo_write", {"todos": [{"content": "反复穷举 DP 状态", "status": "in_progress"}]},
+                task_id="q1", iteration=1, turn=1,
+            )
+            self.assertFalse(wrong_todo["ok"])
+            self.assertEqual(wrong_todo["error_code"], "todo_plan_locked")
+            execution_before_source = bridge.execute(
+                "python_execute", {"code": "print(1)", "timeout_seconds": 10}, task_id="q1", iteration=1, turn=1,
+            )
+            self.assertFalse(execution_before_source["ok"])
+            self.assertEqual(execution_before_source["error_code"], "source_write_required")
             first = bridge.execute("workspace_write", {"path": "chunks.txt", "content": "one\n", "overwrite": True}, task_id="q1", iteration=1, turn=1)
             second = bridge.execute("workspace_write", {"path": "chunks.txt", "content": "two\n", "append": True}, task_id="q1", iteration=1, turn=2)
             self.assertTrue(first["ok"] and second["ok"])
+            execution_after_source = bridge.execute(
+                "python_execute", {"code": "print(1)", "timeout_seconds": 10}, task_id="q1", iteration=1, turn=3,
+            )
+            self.assertTrue(execution_after_source["ok"])
+            with patch.dict("os.environ", {"M2HARNESS_EXECUTION_CHECKPOINT_SECONDS": "1"}):
+                checkpoint = bridge.execute(
+                    "python_execute", {"code": "while True: pass", "timeout_seconds": 1}, task_id="q1", iteration=1, turn=4,
+                )
+            self.assertFalse(checkpoint["ok"])
+            self.assertEqual(checkpoint["error_code"], "execution_checkpoint")
+            self.assertTrue(checkpoint["output"]["execution_checkpoint"])
+            self.assertTrue(checkpoint["output"]["still_running"])
+            cancelled = bridge.execute(
+                "python_cancel", {"job_id": checkpoint["output"]["job_id"]}, task_id="q1", iteration=1, turn=5,
+            )
+            self.assertTrue(cancelled["ok"])
+            self.assertTrue(cancelled["output"]["execution_cancelled"])
             read_back = bridge.execute("workspace_read", {"path": "chunks.txt"}, task_id="q1", iteration=1, turn=3)
             self.assertEqual(read_back["output"]["content"], "one\ntwo\n")
             denied = bridge.execute("report_render", {"markdown": "bad"}, task_id="q1", iteration=1, turn=1)

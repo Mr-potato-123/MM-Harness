@@ -86,6 +86,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         self._checkpoint_context: Any | None = None
         self._checkpointer: Any | None = None
         self._forced_handoff_targets: set[str] = set()
+        self._python_environments: dict[Path, Any] = {}
 
     def propose(self, task: SolveProblemTask, context: SolveProblemContext, modeling: UnifiedModelingReport, *, iteration: int) -> CodeProposal:
         target_relative = self._target_path(task, context, iteration)
@@ -204,9 +205,12 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             )
         try:
             todo_write, todo_read = self._todo_tools(target_relative)
+            python_execute = self._python_execute_tool(target_relative, run_id)
+            python_continue = self._python_continue_tool(target_relative)
+            python_cancel = self._python_cancel_tool(target_relative)
             self._agent = create_deep_agent(
                 model=self.model,
-                tools=[todo_write, todo_read, self._write_code_source_tool(target_relative), self._python_execute_tool(target_relative, run_id)],
+                tools=[todo_write, todo_read, self._write_code_source_tool(target_relative), python_execute, python_continue, python_cancel],
                 backend=backend,
                 permissions=permissions,
                 skills=self.skills or None,
@@ -391,14 +395,27 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
 
         return write_todos, read_todos
 
+    def _python_tool_environment(self, target_directory: Path) -> Any:
+        """Return the shared soft-checkpoint job registry for one source lane."""
+
+        from m2harness.application.local_tools import LocalToolEnvironment
+
+        target_directory = target_directory.resolve()
+        environment = self._python_environments.get(target_directory)
+        if environment is None:
+            environment = LocalToolEnvironment(target_directory, sandbox=self.sandbox)
+            self._python_environments[target_directory] = environment
+        return environment
+
     def _python_execute_tool(self, target_relative: str, run_id: str = "unscoped") -> Any:
-        """Expose only the fixed local Python boundary to DeepAgents."""
+        """Expose the fixed local Python boundary with a 30-minute soft checkpoint."""
         from langchain_core.tools import tool
+        from m2harness.application.local_tools import _run_python
 
         sandbox = self.sandbox
-        workspace_root = self.workspace_root
         target_path = self._resolve_agent_path(target_relative)
         target_directory = target_path.parent
+        tool_environment = self._python_tool_environment(target_directory)
         call_count = 0
         last_source_hash: str | None = None
         rewrite_required = False
@@ -423,37 +440,25 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                         "call_count": call_count,
                         "next_action": "source_change_required_before_next_execution; use stderr evidence to make a targeted correction",
                     }, ensure_ascii=False)
-                result = sandbox.run(
-                    # ``-I`` ignores PYTHON* environment variables, so make
-                    # UTF-8 explicit for Chinese diagnostics from the inner
-                    # validation probe as well as the outer execution lane.
-                    (sys.executable, "-I", "-X", "utf8", "-c", code),
-                    timeout_seconds=timeout_seconds,
-                    cwd=target_directory,
-                    env={"PYTHONIOENCODING": "utf-8", "M2HARNESS_NETWORK": "deny"},
-                    cancel_check=(
-                        (lambda: self.human_control.is_interrupted(run_id))
-                        if self.human_control is not None and run_id != "unscoped" else None
-                    ),
-                )
-                payload = {
-                        "ok": result.exit_code == 0 and not result.timed_out and not result.cancelled,
-                        "exit_code": result.exit_code,
-                        "timed_out": result.timed_out,
-                        "cancelled": result.cancelled,
-                        "interrupted": result.cancelled,
-                        "stdout": result.stdout.decode("utf-8", errors="replace")[:200_000],
-                        "stderr": result.stderr.decode("utf-8", errors="replace")[:200_000],
-                        "call_count": call_count,
-                    }
+                result = _run_python(tool_environment, code, timeout_seconds, 200_000)
+                payload = dict(result)
+                payload.update({
+                    "ok": result.get("exit_code") == 0 and not result.get("timed_out") and not result.get("cancelled") and not result.get("execution_checkpoint"),
+                    "interrupted": bool(result.get("cancelled")),
+                    "call_count": call_count,
+                })
                 last_source_hash = source_hash
-                # Any non-zero execution result, including an operator-observed
-                # resource stop, is a source-level failure.  Require a
-                # materially changed source before the agent can blindly rerun
-                # it; otherwise a long-running bad algorithm can repeat forever
-                # without giving the Model/Code loop a chance to repair it.
-                rewrite_required = bool(result.exit_code not in (0, None) or result.timed_out or result.cancelled)
-                if not payload["ok"]:
+                # A soft checkpoint is not a source-level failure: the process
+                # is still alive and the next valid action is to decide whether
+                # to continue the same job or cancel it.  Actual failures keep
+                # the existing source-change gate against blind retries.
+                rewrite_required = bool(
+                    not result.get("execution_checkpoint")
+                    and (result.get("exit_code") not in (0, None) or result.get("timed_out") or result.get("cancelled"))
+                )
+                if result.get("execution_checkpoint"):
+                    payload["next_action"] = "decide_continue_or_cancel; use python_continue(job_id) or python_cancel(job_id)"
+                elif not payload["ok"]:
                     payload["next_action"] = "source_change_required_before_next_execution; use stderr evidence to make a targeted correction"
                 return json.dumps(payload, ensure_ascii=False)
             except Exception as exc:
@@ -464,6 +469,43 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                 }, ensure_ascii=False)
 
         return python_execute
+
+    def _python_continue_tool(self, target_relative: str) -> Any:
+        """Continue a job that reached the soft checkpoint without restarting it."""
+        from langchain_core.tools import tool
+        from m2harness.application.local_tools import _python_continue
+
+        target_directory = self._resolve_agent_path(target_relative).parent
+        tool_environment = self._python_tool_environment(target_directory)
+
+        @tool("python_continue")
+        def python_continue(job_id: str, max_output_bytes: int = 200_000) -> str:
+            """Continue the same generated Python job after a soft checkpoint."""
+            result = _python_continue(tool_environment, {"job_id": job_id, "max_output_bytes": max_output_bytes})
+            result["ok"] = bool(result.get("execution_checkpoint") is not True and result.get("exit_code") == 0 and not result.get("cancelled"))
+            if result.get("execution_checkpoint"):
+                result["next_action"] = "decide_continue_or_cancel; use python_continue(job_id) or python_cancel(job_id)"
+            return json.dumps(result, ensure_ascii=False)
+
+        return python_continue
+
+    def _python_cancel_tool(self, target_relative: str) -> Any:
+        """Cancel a still-running job and preserve its partial evidence."""
+        from langchain_core.tools import tool
+        from m2harness.application.local_tools import _python_cancel
+
+        target_directory = self._resolve_agent_path(target_relative).parent
+        tool_environment = self._python_tool_environment(target_directory)
+
+        @tool("python_cancel")
+        def python_cancel(job_id: str, max_output_bytes: int = 200_000) -> str:
+            """Cancel the same generated Python job and return partial evidence."""
+            result = _python_cancel(tool_environment, {"job_id": job_id, "max_output_bytes": max_output_bytes})
+            result["ok"] = False
+            result["next_action"] = "rewrite the target source before another execution"
+            return json.dumps(result, ensure_ascii=False)
+
+        return python_cancel
 
     def _run_agent(self, task: SolveProblemTask, context: SolveProblemContext, modeling: UnifiedModelingReport, *, iteration: int, prompt: str, event_path: Path) -> dict[str, Any]:
         target_relative = self._target_path(task, context, iteration)
@@ -652,7 +694,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         run_name = "unscoped"
         if isinstance(context.metadata, dict):
             run_id = str(context.metadata.get("run_id", run_id))
-            run_name = str(context.metadata.get("run_name", run_id))
+            run_name = str(context.metadata.get("run_path_key", context.metadata.get("run_name", run_id)))
             attempt = int(context.metadata.get("task_attempt", 1))
         else:
             attempt = 1

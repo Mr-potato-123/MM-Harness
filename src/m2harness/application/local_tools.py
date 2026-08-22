@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import ast
+import atexit
 import csv
 import hashlib
 import html
@@ -20,13 +21,15 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 
@@ -51,6 +54,19 @@ MAX_TOOL_READ_BYTES = 10 * 1024 * 1024
 MAX_PREVIEW_CHARS = 12_000
 MAX_CODE_BYTES = 2 * 1024 * 1024
 MAX_SEARCH_RESPONSE_BYTES = 5 * 1024 * 1024
+DEFAULT_EXECUTION_CHECKPOINT_SECONDS = 1_800
+
+
+@dataclass
+class _PythonExecutionJob:
+    job_id: str
+    process: subprocess.Popen
+    script_path: Path
+    started_at: float
+    stdout: bytearray
+    stderr: bytearray
+    stdout_thread: threading.Thread
+    stderr_thread: threading.Thread
 
 DAG_TASK_NODE_SCHEMA = {
     "type": "object",
@@ -94,6 +110,11 @@ class LocalToolEnvironment:
     def __post_init__(self) -> None:
         self.workspace_root = self.workspace_root.resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
+        self._python_jobs: dict[str, _PythonExecutionJob] = {}
+        self._python_jobs_lock = threading.RLock()
+        # A long-running generated process must not survive the Harness
+        # interpreter if the agent/session terminates unexpectedly.
+        atexit.register(self.cancel_python_jobs)
         if self.media is None:
             self.media = MediaInventory()
         if self.network is None:
@@ -110,6 +131,25 @@ class LocalToolEnvironment:
         if self.artifact_store is None:
             raise RuntimeError("artifact store is not configured")
         return _resolve_under(self.artifact_store.root, relative)
+
+    def cancel_python_jobs(self) -> None:
+        """Terminate any still-running soft-checkpoint jobs at process exit."""
+
+        with self._python_jobs_lock:
+            jobs = list(self._python_jobs.values())
+            self._python_jobs.clear()
+        for job in jobs:
+            try:
+                if job.process.poll() is None:
+                    job.process.terminate()
+                    try:
+                        job.process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        job.process.kill()
+                        job.process.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            job.script_path.unlink(missing_ok=True)
 
 
 def _resolve_under(root: Path, relative: str, *, allow_root: bool = False) -> Path:
@@ -417,14 +457,97 @@ def _data_profile(env: LocalToolEnvironment, args: dict[str, Any]) -> dict[str, 
     return {"path": args["path"], "sha256": _digest(data), "rows": len(rows), "columns": columns, "stats": stats, "preview": rows[: min(int(args.get("preview_rows", 10)), 50)]}
 
 
-def _run_python(env: LocalToolEnvironment, code: str, timeout_seconds: int, max_output_bytes: int) -> dict[str, Any]:
-    if not code.strip():
-        raise ValueError("code must not be empty")
-    if len(code.encode("utf-8")) > MAX_CODE_BYTES:
-        raise ValueError(f"code exceeds execution budget ({MAX_CODE_BYTES} bytes)")
-    _validate_local_code_policy(code)
-    if not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool) or not 1 <= timeout_seconds <= 86_400:
-        raise ValueError("timeout_seconds is required and must be an integer between 1 and 86,400")
+def _execution_checkpoint_seconds() -> int:
+    raw = os.environ.get("M2HARNESS_EXECUTION_CHECKPOINT_SECONDS", str(DEFAULT_EXECUTION_CHECKPOINT_SECONDS)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = DEFAULT_EXECUTION_CHECKPOINT_SECONDS
+    return max(1, min(value, 86_400))
+
+
+def _drain_python_stream(stream: Any, target: bytearray) -> None:
+    try:
+        while True:
+            chunk = stream.read(64 * 1024)
+            if not chunk:
+                return
+            target.extend(chunk)
+    except (OSError, ValueError):
+        return
+
+
+def _job_output(job: _PythonExecutionJob, max_output_bytes: int, *, checkpoint: bool = False) -> dict[str, Any]:
+    stdout_bytes = bytes(job.stdout)
+    stderr_bytes = bytes(job.stderr)
+    result: dict[str, Any] = {
+        "exit_code": None if checkpoint else job.process.returncode,
+        "timed_out": False,
+        "cancelled": False,
+        "stdout": stdout_bytes[:max_output_bytes].decode("utf-8", errors="replace"),
+        "stderr": stderr_bytes[:max_output_bytes].decode("utf-8", errors="replace"),
+        "duration_ms": int((time.monotonic() - job.started_at) * 1000),
+        "output_truncated": len(stdout_bytes) > max_output_bytes or len(stderr_bytes) > max_output_bytes,
+    }
+    if checkpoint:
+        result.update({
+            "execution_checkpoint": True,
+            "still_running": True,
+            "job_id": job.job_id,
+            "checkpoint_seconds": _execution_checkpoint_seconds(),
+        })
+    return result
+
+
+def _finish_python_job(env: LocalToolEnvironment, job: _PythonExecutionJob, max_output_bytes: int) -> dict[str, Any]:
+    job.stdout_thread.join(timeout=2)
+    job.stderr_thread.join(timeout=2)
+    result = _job_output(job, max_output_bytes)
+    with env._python_jobs_lock:
+        env._python_jobs.pop(job.job_id, None)
+    job.script_path.unlink(missing_ok=True)
+    return result
+
+
+def _wait_python_job(env: LocalToolEnvironment, job: _PythonExecutionJob, max_output_bytes: int) -> dict[str, Any]:
+    try:
+        job.process.wait(timeout=_execution_checkpoint_seconds())
+    except subprocess.TimeoutExpired:
+        return _job_output(job, max_output_bytes, checkpoint=True)
+    return _finish_python_job(env, job, max_output_bytes)
+
+
+def _start_python_job(env: LocalToolEnvironment, code: str) -> _PythonExecutionJob:
+    if env.sandbox is None:
+        raise RuntimeError("local sandbox is not configured")
+    if type(env.sandbox) is not LocalSandboxClient:
+        raise RuntimeError("soft execution checkpoints require the trusted local host sandbox")
+    descriptor, script_name = tempfile.mkstemp(prefix="m2h-code-", suffix=".py", dir=env.workspace_root)
+    script = Path(script_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(code)
+            stream.flush()
+        safe_env = {"PATH": os.environ.get("PATH", ""), "PYTHONIOENCODING": "utf-8", "M2HARNESS_NETWORK": "deny"}
+        process = env.sandbox.start_process((sys.executable, "-I", str(script)), env=safe_env)
+        stdout = bytearray()
+        stderr = bytearray()
+        stdout_thread = threading.Thread(target=_drain_python_stream, args=(process.stdout, stdout), daemon=True)
+        stderr_thread = threading.Thread(target=_drain_python_stream, args=(process.stderr, stderr), daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+        job = _PythonExecutionJob(uuid4().hex, process, script, time.monotonic(), stdout, stderr, stdout_thread, stderr_thread)
+        with env._python_jobs_lock:
+            env._python_jobs[job.job_id] = job
+        return job
+    except Exception:
+        script.unlink(missing_ok=True)
+        raise
+
+
+def _run_python_bounded(env: LocalToolEnvironment, code: str, timeout_seconds: int, max_output_bytes: int) -> dict[str, Any]:
+    """Compatibility fallback for non-host sandbox implementations."""
+
     script = None
     started = time.monotonic()
     try:
@@ -443,6 +566,57 @@ def _run_python(env: LocalToolEnvironment, code: str, timeout_seconds: int, max_
     finally:
         if script and script.exists():
             script.unlink(missing_ok=True)
+
+
+def _run_python(env: LocalToolEnvironment, code: str, timeout_seconds: int, max_output_bytes: int) -> dict[str, Any]:
+    if not code.strip():
+        raise ValueError("code must not be empty")
+    if len(code.encode("utf-8")) > MAX_CODE_BYTES:
+        raise ValueError(f"code exceeds execution budget ({MAX_CODE_BYTES} bytes)")
+    _validate_local_code_policy(code)
+    if not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool) or not 1 <= timeout_seconds <= 86_400:
+        raise ValueError("timeout_seconds is required and must be an integer between 1 and 86,400")
+    if type(env.sandbox) is LocalSandboxClient:
+        # ``timeout_seconds`` remains required for auditability, but it is no
+        # longer a hard kill budget.  Every host execution gets a 30-minute
+        # soft checkpoint and can be continued by the Code Agent.
+        job = _start_python_job(env, code)
+        result = _wait_python_job(env, job, max_output_bytes)
+        result["requested_timeout_seconds"] = timeout_seconds
+        return result
+    return _run_python_bounded(env, code, timeout_seconds, max_output_bytes)
+
+
+def _python_continue(env: LocalToolEnvironment, args: dict[str, Any]) -> dict[str, Any]:
+    job_id = args["job_id"]
+    with env._python_jobs_lock:
+        job = env._python_jobs.get(job_id)
+    if job is None:
+        raise ValueError(f"unknown or finished python execution job: {job_id}")
+    return _wait_python_job(env, job, min(int(args.get("max_output_bytes", 100_000)), 1_000_000))
+
+
+def _python_cancel(env: LocalToolEnvironment, args: dict[str, Any]) -> dict[str, Any]:
+    job_id = args["job_id"]
+    with env._python_jobs_lock:
+        job = env._python_jobs.pop(job_id, None)
+    if job is None:
+        raise ValueError(f"unknown or finished python execution job: {job_id}")
+    try:
+        if job.process.poll() is None:
+            job.process.terminate()
+            try:
+                job.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                job.process.kill()
+                job.process.wait(timeout=2)
+        job.stdout_thread.join(timeout=2)
+        job.stderr_thread.join(timeout=2)
+        result = _job_output(job, min(int(args.get("max_output_bytes", 100_000)), 1_000_000))
+        result.update({"cancelled": True, "execution_cancelled": True, "job_id": job_id})
+        return result
+    finally:
+        job.script_path.unlink(missing_ok=True)
 
 
 def _validate_local_code_policy(code: str) -> None:
@@ -675,9 +849,13 @@ def register_local_tools(registry: ToolRegistry, env: LocalToolEnvironment) -> T
                      {"required": ["path"], "properties": {"path": {"type": "string"}, "max_bytes": {"type": "integer"}}}), _image_inspect),
         (_definition("data_profile", "data.profile", "Profile CSV, JSON, or JSONL data with deterministic basic statistics.",
                      {"required": ["path"], "properties": {"path": {"type": "string"}, "max_bytes": {"type": "integer"}, "preview_rows": {"type": "integer"}}}), _data_profile),
-        (_definition("python_execute", "python.execute", "Execute Python in the trusted local workspace with no shell and a required finite timeout.",
+        (_definition("python_execute", "python.execute", "Start Python in the trusted local workspace with no shell; timeout_seconds is required for auditability, but host execution has a soft 30-minute checkpoint and no hard kill.",
                      {"required": ["code", "timeout_seconds"], "properties": {"code": {"type": "string"}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400}, "max_output_bytes": {"type": "integer"}}}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write"), timeout=None), _python_execute),
-        (_definition("validation_run", "validation.numerical", "Run a validation script in the trusted local workspace with a required finite timeout.",
+        (_definition("python_continue", "python.execute", "Continue a still-running Python job after a soft checkpoint; the job is not restarted.",
+                     {"required": ["job_id"], "properties": {"job_id": {"type": "string", "minLength": 1}, "max_output_bytes": {"type": "integer"}}}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write"), timeout=None), _python_continue),
+        (_definition("python_cancel", "python.execute", "Cancel a still-running Python job and return its partial evidence.",
+                     {"required": ["job_id"], "properties": {"job_id": {"type": "string", "minLength": 1}, "max_output_bytes": {"type": "integer"}}}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write"), timeout=None), _python_cancel),
+        (_definition("validation_run", "validation.numerical", "Start a validation script in the trusted local workspace; timeout_seconds is required for auditability, but host execution has a soft 30-minute checkpoint and no hard kill.",
                      {"required": ["code", "timeout_seconds"], "properties": {"code": {"type": "string"}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400}, "max_output_bytes": {"type": "integer"}}}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write"), timeout=None), _validation_run),
         (_definition("report_render", "report.finalize", "Render a reviewed Markdown report, escaped HTML, and optionally validated LaTeX into the workspace.",
                      {"required": ["markdown"], "properties": {"markdown": {"type": "string"}, "title": {"type": "string"}, "path": {"type": "string"}, "latex": {"type": "string"}, "latex_path": {"type": "string"}, "overwrite": {"type": "boolean"}}}, side_effect="sandboxed-write", policy=ToolPolicy(filesystem="workspace-write")), _report_render),

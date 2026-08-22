@@ -93,7 +93,12 @@ class RunWorkspace:
 
     @classmethod
     def create(cls, parent: Path, identity: RunIdentity) -> "RunWorkspace":
-        root = (parent.resolve() / identity.run_name).resolve()
+        # Keep the full traceable run_name in the manifest, but use a compact
+        # physical directory. The full name is repeated in report paths and
+        # provider workspaces; repeating it on Windows can exceed MAX_PATH.
+        run_parts = identity.run_name.split("__")
+        physical_name = "__".join((run_parts[0], run_parts[1], run_parts[-1])) if len(run_parts) >= 3 else f"run-{identity.run_id.hex[:8]}"
+        root = (parent.resolve() / physical_name).resolve()
         if root.exists():
             raise FileExistsError(f"run workspace already exists: {root}")
         workspace = cls(identity=identity, root=root)
@@ -116,6 +121,7 @@ class RunWorkspace:
             "input_name": self.identity.input_name,
             "model": self.identity.model,
             "code_agent": self.identity.code_agent,
+            "physical_workspace": self.root.name,
             "paths": {
                 "workspace": ".m2harness/workspace",
                 "artifacts": ".m2harness/artifacts",
@@ -128,4 +134,3 @@ class RunWorkspace:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return target
-

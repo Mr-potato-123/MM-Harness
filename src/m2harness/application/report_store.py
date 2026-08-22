@@ -46,6 +46,7 @@ class RunReportStore:
         self.workspace_root = workspace_root.resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self._run_names: dict[str, str] = {}
+        self._run_paths: dict[str, str] = {}
         self._probe_locks: dict[str, threading.Lock] = {}
         self._probe_locks_guard = threading.Lock()
 
@@ -60,11 +61,19 @@ class RunReportStore:
         if existing is not None and existing != safe_name:
             raise ValueError(f"run {key} is already registered as {existing}")
         self._run_names[key] = safe_name
+        # The outer RunWorkspace directory keeps the full human trace name.
+        # Internal report paths may already live below that directory, so a
+        # long name must not be repeated below ``reports/runs`` on Windows.
+        path_name = safe_name
+        if len(path_name) > 48:
+            path_name = f"{path_name[:32].rstrip('.-_')}-{key.replace('-', '')[:8]}"
+        self._run_paths[key] = path_name
         base = self._run_base(run_id)
         payload = {
             "schema_version": 1,
             "run_id": key,
             "run_name": safe_name,
+            "report_path": base.as_posix(),
             "registered_at": datetime.now(timezone.utc).isoformat(),
             "metadata": _probe_value(metadata or {}),
         }
@@ -77,7 +86,17 @@ class RunReportStore:
         return base
 
     def _run_base(self, run_id: UUID) -> Path:
-        return Path("reports") / "runs" / self._run_names.get(str(run_id), str(run_id))
+        return Path("reports") / "runs" / self._run_paths.get(str(run_id), str(run_id))
+
+    def run_path_key(self, run_id: UUID) -> str:
+        """Return the compact internal path key for one registered run."""
+
+        return self._run_paths.get(str(run_id), str(run_id))
+
+    def run_base_relative(self, run_id: UUID) -> Path:
+        """Return the report root relative to the run workspace."""
+
+        return self._run_base(run_id)
 
     def archive_markdown(
         self,
@@ -182,21 +201,6 @@ class RunReportStore:
         records: list[ReportFileRecord] = []
         for snapshot in report.iterations:
             model_dir = base / "modeling" / f"iteration-{snapshot.iteration}"
-            for preliminary in snapshot.preliminary_reports:
-                name = "preliminary-" + self._safe_name(preliminary.branch_id) + ".md"
-                canonical = base / "exchanges" / f"iteration-{snapshot.iteration}" / "modeling" / name
-                content = _pointer_or_fallback(
-                    self.workspace_root,
-                    canonical,
-                    title=f"建模路线 `{preliminary.branch_id}` 索引",
-                    fallback=preliminary.report.markdown,
-                )
-                records.append(self._write(
-                    model_dir / name, content,
-                    purpose=f"题目 {report.task_id} 的初步建模路线 {preliminary.branch_id} 正文索引。",
-                    role=ReadOnlyFileRole.REFERENCE, task_id=report.task_id,
-                    attempt=attempt, iteration=snapshot.iteration, media_type="text/markdown",
-                ))
             canonical_model = base / "exchanges" / f"iteration-{snapshot.iteration}" / "modeling" / "modeling_report.md"
             records.append(self._write(
                 model_dir / "modeling_report.md",

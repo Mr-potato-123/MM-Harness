@@ -4,8 +4,8 @@
     one ``CodeProposal`` from a ``UnifiedModelingReport``; this adapter validates,
     materializes, executes, captures a Markdown report, and returns that report
     to the same Model Agent through Code→Model. Execution is observable and may
-    run within the finite timeout carried by the proposal; the local operator
-    can also interrupt it.
+    run without reimposing the Code Agent's audit field as a hard wall-clock
+    limit; the local operator can also interrupt it.
 """
 
 from __future__ import annotations
@@ -75,7 +75,11 @@ class LocalPythonCodeHarness:
                 # ``-I`` deliberately ignores PYTHON* environment variables;
                 # add ``-X utf8`` explicitly so Chinese Markdown reports stay
                 # UTF-8 on the Windows host as well as in Docker.
-                (sys.executable, "-I", "-X", "utf8", str(script_path)), timeout_seconds=proposal.timeout_seconds,
+                # The Code Agent has already made the continue/cancel decision
+                # through the 30-minute soft-checkpoint protocol.  Reusing the
+                # proposal field here would silently restore the old 120s hard
+                # kill during the final acceptance pass.
+                (sys.executable, "-I", "-X", "utf8", str(script_path)), timeout_seconds=None,
                 env={"PYTHONIOENCODING": "utf-8", "M2HARNESS_NETWORK": "deny"},
                 # Relative outputs belong to the exact task/attempt/iteration
                 # lane that produced the source.  Using the workspace root

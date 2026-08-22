@@ -324,7 +324,8 @@ class DshCodeProposalProvider(CodeProposalProvider):
     def propose(self, task: SolveProblemTask, context: SolveProblemContext, modeling: UnifiedModelingReport, *, iteration: int) -> CodeProposal:
         raw_run_id = str(context.metadata.get("run_id", "unscoped")) if isinstance(context.metadata, dict) else "unscoped"
         raw_run_name = str(context.metadata.get("run_name", raw_run_id)) if isinstance(context.metadata, dict) else raw_run_id
-        safe_run_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw_run_name)
+        run_path_key = str(context.metadata.get("run_path_key", raw_run_id)) if isinstance(context.metadata, dict) else raw_run_id
+        safe_run_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_path_key)
         safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw_run_id)
         attempt = int(context.metadata.get("task_attempt", 1)) if isinstance(context.metadata, dict) else 1
         session_key = f"{safe_run_id}:{task.task_id}:attempt-{attempt}"

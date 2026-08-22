@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from m2harness.infrastructure.deepagents_code_harness import DeepAgentsCodeProposalProvider
 from m2harness.infrastructure.deepagents_code_harness import CodeAgentHandoff
@@ -79,15 +80,17 @@ class CodeAgentHarnessContractTest(unittest.TestCase):
             target = root / ".m2harness-code" / "q1" / "iteration-1" / "solve_q1.py"
             target.parent.mkdir(parents=True)
             target.write_text("while True:\n    pass\n", encoding="utf-8")
-            tool = self._provider(root)._python_execute_tool(
-                ".m2harness-code/q1/iteration-1/solve_q1.py"
-            )
+            provider = self._provider(root)
+            target_relative = ".m2harness-code/q1/iteration-1/solve_q1.py"
+            tool = provider._python_execute_tool(target_relative)
 
-            first = json.loads(tool.invoke({"code": "while True: pass", "timeout_seconds": 1}))
-            self.assertTrue(first["timed_out"])
-            second = json.loads(tool.invoke({"code": "while True: pass", "timeout_seconds": 1}))
-            self.assertFalse(second["ok"])
-            self.assertIn("rewrite the target source", second["error"])
+            with patch.dict("os.environ", {"M2HARNESS_EXECUTION_CHECKPOINT_SECONDS": "1"}):
+                first = json.loads(tool.invoke({"code": "while True: pass", "timeout_seconds": 1}))
+                self.assertTrue(first["execution_checkpoint"])
+                self.assertTrue(first["still_running"])
+                cancel = json.loads(provider._python_cancel_tool(target_relative).invoke({"job_id": first["job_id"]}))
+            self.assertTrue(cancel["execution_cancelled"])
+            self.assertFalse(cancel["ok"])
 
     def test_nonzero_execution_requires_source_change_before_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

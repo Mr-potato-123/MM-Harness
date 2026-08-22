@@ -428,17 +428,9 @@ class SolveProblemService:
                     "branch_ids": [item.branch_id for item in preliminary],
                     "requested_file_paths": [path for item in preliminary for path in item.requested_file_paths],
                 })
-                for preliminary_report in preliminary:
-                    current_context = self._archive(
-                        current_context, task, iteration_number, "modeling",
-                        f"preliminary-{preliminary_report.branch_id}",
-                        _preliminary_markdown(preliminary_report),
-                        purpose=f"题目 {task.task_id} 第 {iteration_number} 轮 Model Agent 初步路线 {preliminary_report.branch_id}。",
-                        role=ReadOnlyFileRole.REFERENCE,
-                    )
                 current_context = self._record_context_marker(
                     current_context, task, iteration_number, "Model Agent",
-                    "已完成初步路线；路线报告已保存，等待统一建模。",
+                    "已完成内部初步路线比较；不对外另存路线报告，等待统一建模。",
                 )
                 requested = tuple(dict.fromkeys(
                     path for report in preliminary for path in report.requested_file_paths
@@ -484,14 +476,6 @@ class SolveProblemService:
                                 "error": str(exc)[:2_000], "after_disclosure": True,
                             })
                             raise
-                        for preliminary_report in preliminary:
-                            current_context = self._archive(
-                                current_context, task, iteration_number, "modeling",
-                                f"preliminary-{preliminary_report.branch_id}-after-disclosure",
-                                _preliminary_markdown(preliminary_report),
-                                purpose=f"题目 {task.task_id} 第 {iteration_number} 轮文件披露后的 Model Agent 初步路线 {preliminary_report.branch_id}。",
-                                role=ReadOnlyFileRole.REFERENCE,
-                            )
             if not preliminary:
                 return SolveProblemReport(
                     task_id=task.task_id, status=SolveProblemStatus.FAILED,
@@ -1175,18 +1159,36 @@ def _compact_model_to_code_handoff(
     *,
     max_revision_rounds: int = MAX_REVISION_ROUNDS,
 ) -> str:
-    """Write a small, human-readable first Model→Code handoff."""
+    """Write a reference-only first Model→Code handoff.
 
-    del context, preliminary, iteration, max_revision_rounds
+    The accepted model is a single canonical ``modeling_report.md``.  This
+    boundary must not copy its body (or a preliminary route) into a second
+    report; it only tells Code Agent which allowlisted files to read.
+    """
+
+    del preliminary, iteration, max_revision_rounds
+    available = [item for item in context.readonly_files if "/exchanges/" in item.relative_path.replace("\\", "/")]
+    modeling_paths = [item.relative_path for item in available if item.relative_path.endswith("/modeling/modeling_report.md")]
+    problem_paths = [
+        item.relative_path for item in context.readonly_files
+        if getattr(getattr(item, "role", None), "value", getattr(item, "role", "")) == "problem"
+        or item.relative_path.lower().endswith(".pdf")
+    ]
     lines = [
         "# Model → Code", "",
         f"题目：{task.title}（{task.task_id}）", "",
-        "建模：", modeling.main_scheme[:6_000], "",
-        "求解要求：",
-        "；".join((*modeling.coding_instructions[:12], *modeling.required_validations[:12])) or "按建模方案完成求解并检查结果。",
+        "建模报告（唯一建模来源）：",
+        *(f"- `{path}`" for path in dict.fromkeys(modeling_paths)),
+        "" if modeling_paths else "- 建模报告未在白名单中找到；不得自行补写模型。",
         "",
-        "预期输出：", "；".join(modeling.expected_outputs[:12]), "",
-        "预期图：", "；".join(modeling.expected_figures) if modeling.expected_figures else "如题目需要，请生成能说明结果的图并保存到 outputs 目录。",
+        "原始题面（只读来源）：",
+        *(f"- `{path}`" for path in dict.fromkeys(problem_paths)),
+        "" if problem_paths else "- 原始题面未在白名单中找到。",
+        "",
+        "交接要求：",
+        "- Code Agent 先按白名单读取上述建模报告和题面；本文件不重复建模正文。",
+        "- 只处理当前题目，按建模报告实现、执行和验证。",
+        "- 生成文件、图片和执行结果由 Code→Model 交接直接汇报；不在本文件重复。",
     ]
     return "\n".join(lines).strip() + "\n"
 

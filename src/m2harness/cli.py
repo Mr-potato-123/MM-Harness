@@ -340,6 +340,7 @@ def main(argv: list[str] | None = None) -> int:
             metadata={
                 "run_id": str(run_identity.run_id),
                 "run_name": run_identity.run_name,
+                "run_path_key": runtime.main_harness.report_store.run_path_key(run_identity.run_id),
                 "staged_input_relative_path": str(Path("inputs") / staged_name),
                 "scope": args.scope,
             },
@@ -358,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
             run_id=run_identity.run_id,
         )
         if state.final_report is None or state.final_latex_paper is None:
-            run_report_root = runtime.tool_environment.workspace_root / "reports" / "runs" / run_identity.run_name
+            run_report_root = runtime.tool_environment.workspace_root / runtime.main_harness.report_store.run_base_relative(run_identity.run_id)
             raise RuntimeError(
                 "Main Harness paper composer returned no final publication; "
                 f"run_id={state.run_id}; probe={run_report_root / 'probe.md'}; "
@@ -456,7 +457,6 @@ def main(argv: list[str] | None = None) -> int:
         readonly.append(original_ref)
         for relative_path, role, purpose in (
             (f"{q1_prefix}/iteration-1/modeling/modeling_report.md", ReadOnlyFileRole.REFERENCE, "上一轮已接受的完整建模报告。"),
-            (f"{q1_prefix}/iteration-1/modeling/preliminary-q1-mip-baseline.md", ReadOnlyFileRole.REFERENCE, "上一轮初步路线报告。"),
             (f"{q1_prefix}/iteration-1/review/review_report.md", ReadOnlyFileRole.REFERENCE, "上一轮 Review 决定与理由。"),
             (f"{q1_prefix}/iteration-1/review/revision_instructions.md", ReadOnlyFileRole.REFERENCE, "上一轮 Review 的具体返修指令。"),
             (f"{q1_prefix}/iteration-1/handoff/review-to-next-stage.md", ReadOnlyFileRole.REFERENCE, "上一轮 Review→返修交接。"),
