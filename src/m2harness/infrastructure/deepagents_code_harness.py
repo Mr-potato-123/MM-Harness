@@ -445,10 +445,12 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                 "m2h_run_id": str(context.metadata.get("run_id", "unscoped")) if isinstance(context.metadata, dict) else "unscoped",
                 "m2h_runtime": "deepagents",
             },
-            # This is an agent-loop safety ceiling, not a model output-token
-            # cap.  It prevents a malformed tool loop from running forever;
-            # an observation timeout never terminates the active process.
-            "recursion_limit": int(os.environ.get("M2HARNESS_DEEPAGENTS_RECURSION_LIMIT", "64")),
+            # LangGraph requires a finite integer, but the Code Agent must not
+            # be cut off after an arbitrary 64/100 tool steps.  The default is
+            # intentionally very high; operators may lower it explicitly for
+            # an emergency stop while the append-only event stream remains
+            # the normal way to observe a difficult long-running solve.
+            "recursion_limit": max(1_000, int(os.environ.get("M2HARNESS_DEEPAGENTS_RECURSION_LIMIT", "100000"))),
         }
         event_path.parent.mkdir(parents=True, exist_ok=True)
         final_state: dict[str, Any] | None = None

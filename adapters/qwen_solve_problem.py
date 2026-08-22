@@ -336,7 +336,10 @@ class QwenChatClient:
     base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     model: str = "qwen3.8-max"
     api_key: str | None = None
-    timeout_seconds: float = 1_800.0
+    # Model/provider calls are observed through the stream and probe ledger;
+    # no wall-clock cutoff is imposed unless an operator explicitly supplies
+    # ``timeout_seconds``.
+    timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
         # DeepSeek's public catalog names the vision-capable experimental
@@ -381,6 +384,9 @@ class QwenChatClient:
 
         provider_limit = 384_000 if self._deepseek_mode else 64_000
         return max(256, min(int(os.environ.get("QWEN_MAX_OUTPUT_TOKENS", str(provider_limit))), provider_limit))
+
+    def _http_timeout(self) -> httpx.Timeout | None:
+        return None if self.timeout_seconds is None else httpx.Timeout(self.timeout_seconds, connect=30.0)
 
     def _stream_json(self, client: httpx.Client, url: str, headers: dict[str, str], payload: dict[str, Any]) -> tuple[str, str | None]:
         """Read one OpenAI-compatible SSE response, with JSON fallback."""
@@ -487,7 +493,7 @@ class QwenChatClient:
         tool_bridge: MainHarnessToolBridge,
         task_id: str,
         iteration: int,
-        max_turns: int = 64,
+        max_turns: int | None = None,
     ) -> dict[str, Any]:
         """Run a bounded tool-calling Code Agent session and return final JSON."""
 
@@ -498,7 +504,8 @@ class QwenChatClient:
         url = self.base_url.rstrip("/") + "/chat/completions"
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         max_tokens = self._max_output_tokens()
-        for turn in range(1, max_turns + 1):
+        turn = 1
+        while max_turns is None or turn <= max_turns:
             payload = {
                 "model": self.model, "messages": messages, "stream": True,
                 "tools": tool_bridge.definitions(), "tool_choice": "auto", "max_tokens": max_tokens,
@@ -506,7 +513,7 @@ class QwenChatClient:
             payload.update(self._thinking_fields(os.environ.get("QWEN_ENABLE_THINKING", "1") != "0"))
             _stream_progress(f"tool_turn_start turn={turn} tools={len(payload['tools'])}")
             try:
-                with httpx.Client(timeout=httpx.Timeout(self.timeout_seconds, connect=30.0)) as client:
+                with httpx.Client(timeout=self._http_timeout()) as client:
                     answer, calls, finish_reason = self._stream_tool_turn(client, url, headers, payload)
             except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
                 raise ActivityExecutionError(f"Qwen Code Agent tool turn failed: {exc}") from exc
@@ -529,7 +536,8 @@ class QwenChatClient:
                     result = {"ok": False, "error_code": "invalid_tool_arguments", "error_message": str(exc)}
                 _stream_progress(f"tool_call name={call['name']} ok={result.get('ok', False)}")
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, ensure_ascii=False)})
-        raise ActivityExecutionError(f"Qwen Code Agent exceeded tool turn budget ({max_turns})")
+            turn += 1
+        raise ActivityExecutionError(f"Qwen Code Agent exceeded explicitly configured tool turn budget ({max_turns})")
 
     def json(self, *, system: str, content: list[dict[str, Any]], schema: dict[str, Any]) -> dict[str, Any]:
         requested_max_tokens = self._max_output_tokens()
@@ -573,7 +581,7 @@ class QwenChatClient:
             answer = ""
             finish_reason: str | None = None
             try:
-                with httpx.Client(timeout=httpx.Timeout(self.timeout_seconds, connect=30.0)) as client:
+                with httpx.Client(timeout=self._http_timeout()) as client:
                     url = self.base_url.rstrip("/") + "/chat/completions"
                     headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
                     if use_stream:
