@@ -46,6 +46,17 @@ class CodeAgentHarnessContractTest(unittest.TestCase):
             self.assertFalse(rejected["ok"])
             self.assertIn("1..180", rejected["error"])
 
+    def test_forced_handoff_freezes_source_tools_after_validation_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            provider = self._provider(root)
+            target = ".m2harness-code/q1/iteration-1/solve_q1.py"
+            provider._forced_handoff_targets.add(target)
+            tool = provider._write_code_source_tool(target)
+            result = json.loads(tool.invoke({"source": "print(1)"}))
+            self.assertTrue(result["forced_stop"])
+            self.assertIn("return the structured CodeAgentHandoff", result["next_action"])
+
     def test_timeout_requires_source_change_before_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

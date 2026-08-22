@@ -83,6 +83,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         self._agent_target: str | None = None
         self._checkpoint_context: Any | None = None
         self._checkpointer: Any | None = None
+        self._forced_handoff_targets: set[str] = set()
 
     def propose(self, task: SolveProblemTask, context: SolveProblemContext, modeling: UnifiedModelingReport, *, iteration: int) -> CodeProposal:
         target_relative = self._target_path(task, context, iteration)
@@ -162,8 +163,10 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             "Model→Code 交接契约已经完整放在本次用户消息中，不需要再次读取文件。只能生成一个目标 Python 文件，禁止创建辅助源码文件。"
             "python_execute 的当前工作目录就是目标源码所在的 iteration 目录；使用相对路径检查该文件和 outputs，不要把 Windows 绝对路径传给任何工具。"
             "源码写入后最多执行四次语法/运行验证；若失败，立即修复并再次写入完整源码，禁止重复读取同一输出或循环诊断。第四次验证工具返回后必须立即输出结构化交接，不得再次调用工具。"
+            "如果任何工具结果包含 forced_stop=true 或 next_action 要求返回 CodeAgentHandoff，必须立刻返回结构化交接，绝对不能再次调用 write_code_source、python_execute、Todo 或其他工具。"
             "python_execute 已经负责外部超时；Windows 没有 signal.SIGALRM，验证代码禁止自行安装 SIGALRM 或假设 solve_dp 等不存在的函数。验证源码时只运行 import runpy; runpy.run_path('solve_q1.py', run_name='__main__')，并读取其 stdout JSON。"
             "资源补给不得对三种资源做无界三重数量枚举；必须使用候选边界、需求驱动枚举或支配剪枝，并在超时后改变算法复杂度。"
+            "建立 MILP 后必须先做小规模可行性烟雾检查；到达终点后的活动标志约束不得与 a_0=1、a_T=0 和终点位置约束互相矛盾，禁止使用会令到达终点后 a_t<0 的不等式。"
             "最终脚本必须在 stdout 返回一份可审查的中文 Markdown 执行报告，内容包括完整路径、每日行动与 O/H/F/M/Z、目标值、算法偏差、验证过程和限制；可以附带 JSON，但 JSON 中的 false 只是待审查提示，不是 Harness 失败信号。"
             "必须把同一份可审查结果保存到当前 iteration 的 outputs/result.md（必要时另存 outputs/result.json）；不要只返回 all_valid 或孤立的 true/false。"
         )
@@ -225,6 +228,14 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         @tool("write_code_source")
         def write_code_source(source: str, append: bool = False) -> str:
             """将 Python 源码首块或后续块写入本轮交接指定的固定路径。"""
+            if target_relative in self._forced_handoff_targets:
+                return json.dumps({
+                    "ok": False,
+                    "forced_stop": True,
+                    "path": target_relative,
+                    "error": "validation budget exhausted; source is frozen for handoff",
+                    "next_action": "return the structured CodeAgentHandoff now; do not call another tool",
+                }, ensure_ascii=False)
             if not isinstance(source, str) or not source.strip():
                 return json.dumps({"ok": False, "error": "source must be non-empty"}, ensure_ascii=False)
             if len(source.encode("utf-8")) > 2_000_000:
@@ -286,13 +297,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                     ensure_ascii=False,
                 )
             except Exception as exc:
-                payload = {"ok": False, "error": str(exc)[:4_000], "call_count": call_count}
-                if call_count >= 4:
-                    payload.update({
-                        "next_action": "return the structured CodeAgentHandoff now; do not call another tool",
-                        "forced_stop": True, "source_path": "/" + target_relative,
-                        "logical_name": Path(target_relative).name,
-                    })
+                payload = {"ok": False, "error": str(exc)[:4_000]}
                 return json.dumps(payload, ensure_ascii=False)
 
         return write_code_source
@@ -380,6 +385,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                         "next_action": "call write_code_source with a materially simpler algorithm, then run python_execute",
                     }
                     if call_count >= 4:
+                        self._forced_handoff_targets.add(target_relative)
                         payload.update({
                             "next_action": "return the structured CodeAgentHandoff now; do not call another tool",
                             "forced_stop": True,
@@ -405,13 +411,21 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                 last_source_hash = source_hash
                 rewrite_required = result.timed_out
                 if call_count >= 4:
+                    self._forced_handoff_targets.add(target_relative)
                     payload["next_action"] = "return the structured CodeAgentHandoff now; do not call another tool"
                     payload["forced_stop"] = True
                     payload["source_path"] = "/" + target_relative
                     payload["logical_name"] = Path(target_relative).name
                 return json.dumps(payload, ensure_ascii=False)
             except Exception as exc:
-                return json.dumps({"ok": False, "error": str(exc)[:4_000]}, ensure_ascii=False)
+                if call_count >= 4:
+                    self._forced_handoff_targets.add(target_relative)
+                return json.dumps({
+                    "ok": False,
+                    "error": str(exc)[:4_000],
+                    "forced_stop": call_count >= 4,
+                    "next_action": "return the structured CodeAgentHandoff now; do not call another tool" if call_count >= 4 else "rewrite source and retry",
+                }, ensure_ascii=False)
 
         return python_execute
 
@@ -429,7 +443,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             # This is an agent-loop safety ceiling, not a model output-token
             # cap.  It prevents a malformed tool loop from running forever;
             # an observation timeout never terminates the active process.
-            "recursion_limit": int(os.environ.get("M2HARNESS_DEEPAGENTS_RECURSION_LIMIT", "32")),
+            "recursion_limit": int(os.environ.get("M2HARNESS_DEEPAGENTS_RECURSION_LIMIT", "64")),
         }
         event_path.parent.mkdir(parents=True, exist_ok=True)
         final_state: dict[str, Any] | None = None
