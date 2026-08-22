@@ -395,7 +395,10 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                     return json.dumps(payload, ensure_ascii=False)
                 rewrite_required = False
                 result = sandbox.run(
-                    (sys.executable, "-I", "-c", code),
+                    # ``-I`` ignores PYTHON* environment variables, so make
+                    # UTF-8 explicit for Chinese diagnostics from the inner
+                    # validation probe as well as the outer execution lane.
+                    (sys.executable, "-I", "-X", "utf8", "-c", code),
                     timeout_seconds=timeout_seconds,
                     cwd=target_directory,
                     env={"PYTHONIOENCODING": "utf-8", "M2HARNESS_NETWORK": "deny"},

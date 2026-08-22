@@ -419,6 +419,32 @@ class SolveProblemHarnessTest(unittest.TestCase):
             assert model.review_context is not None
             self.assertTrue(any(item.role == ReadOnlyFileRole.GENERATED for item in model.review_context.readonly_files))
 
+    def test_append_only_code_event_log_is_not_pinned_to_stale_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            event = root / ".m2harness-code" / "deepagents-events" / "run-q1.ndjson"
+            event.parent.mkdir(parents=True, exist_ok=True)
+            event.write_text('{"event":"tool.called"}\n', encoding="utf-8")
+            harness = LocalPythonCodeHarness(
+                FakeCodeProposalProvider("print('# report')"),
+                build_local_runtime(workspace_root=root / "w", artifact_root=root / "a", database_path=root / "db.sqlite").sandbox,
+                root,
+            )
+            references = harness._generated_files(
+                SolveProblemTask(task_id="q1", title="Q1", problem="P"), 1,
+                metadata={"event_log": event.relative_to(root).as_posix()},
+            )
+            self.assertEqual(len(references), 1)
+            self.assertIsNone(references[0].sha256)
+            self.assertIsNone(references[0].size_bytes)
+            event.write_text('{"event":"tool.called"}\n{"event":"handoff"}\n', encoding="utf-8")
+            # The same allowlisted live audit stream remains readable after
+            # later tool events append; persistence snapshots its new bytes.
+            disclosed = WorkspaceReadOnlyFileReader(root).disclose(
+                SolveProblemContext(readonly_files=references), (references[0].relative_path,)
+            )
+            self.assertIn("handoff", disclosed[0].content)
+
     def test_each_model_code_review_revision_is_archived_before_next_stage(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
