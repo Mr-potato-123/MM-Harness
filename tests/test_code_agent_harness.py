@@ -57,6 +57,20 @@ class CodeAgentHarnessContractTest(unittest.TestCase):
             self.assertTrue(result["forced_stop"])
             self.assertIn("return the structured CodeAgentHandoff", result["next_action"])
 
+    def test_todo_write_is_idempotent_and_directs_agent_to_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            tool, _ = self._provider(root)._todo_tools(
+                ".m2harness-code/q1/iteration-1/solve_q1.py"
+            )
+            todos = [{"id": "1", "content": "run validation", "status": "in_progress"}]
+            first = json.loads(tool.invoke({"todos": todos}))
+            second = json.loads(tool.invoke({"todos": todos}))
+            self.assertTrue(first["ok"])
+            self.assertTrue(second["ok"])
+            self.assertTrue(second["unchanged"])
+            self.assertIn("python_execute", second["next_action"])
+
     def test_timeout_requires_source_change_before_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

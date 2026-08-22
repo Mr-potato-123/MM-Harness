@@ -155,6 +155,7 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             "只能通过文件工具访问已授权路径；授权路径是逐项清单，不等于整个工作区。禁止网络、密钥、主 Harness 数据库和后续题目。\n"
             "源代码必须写入交接中指定的 target_source_path，验证输出只能写入同一 iteration 目录的 outputs 子目录。\n"
             "交接信息已经包含建模契约和必要路径，不要循环读取报告清单。第一步直接调用 write_code_source 写入完整源代码（尽量不超过 350 行）；若工具返回 complete=false，必须用 append=true 继续写后续源码块，直到 complete=true，再调用 python_execute 验证。必要时用 read_file 读取一次源文件，不要在写源代码前连续调用 ls/read_file。"
+            "write_todos 只在初始化或状态真正变化时调用；相同清单不要重复写入。python_execute 超时或重写源码后，禁止再次调用 write_todos，直接运行 python_execute；若工具返回 next_action，严格按其下一步执行。"
             "完成后必须使用结构化输出字段 source_path、logical_name、timeout_seconds、expected_validations；不要把源代码放进最终回答。"
         )
         system_prompt += (
@@ -310,6 +311,8 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         from langchain_core.tools import tool
 
         todo_path = self._resolve_agent_path(target_relative).parent.parent / "todo.json"
+        todo_write_count = 0
+        last_todo_payload: str | None = None
 
         def _read() -> list[dict[str, Any]]:
             if not todo_path.is_file() or todo_path.is_symlink():
@@ -323,6 +326,8 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
         @tool("write_todos")
         def write_todos(todos: list[dict[str, Any]]) -> str:
             """写入本轮 Code Agent 的最小 TODO 清单；只能有一个 in_progress 项。"""
+
+            nonlocal todo_write_count, last_todo_payload
 
             if not isinstance(todos, list) or len(todos) > 20:
                 return json.dumps({"ok": False, "error": "todos must be a list of at most 20 items"}, ensure_ascii=False)
@@ -342,9 +347,24 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
                 })
             if in_progress > 1:
                 return json.dumps({"ok": False, "error": "only one todo may be in_progress"}, ensure_ascii=False)
+            normalized_json = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            todo_write_count += 1
+            if normalized_json == last_todo_payload:
+                return json.dumps({
+                    "ok": True, "unchanged": True, "call_count": todo_write_count,
+                    "path": todo_path.relative_to(self.workspace_root).as_posix(),
+                    "todos": normalized,
+                    "next_action": "do not call write_todos again; run python_execute or return the structured CodeAgentHandoff",
+                }, ensure_ascii=False)
             todo_path.parent.mkdir(parents=True, exist_ok=True)
             todo_path.write_text(json.dumps(normalized, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            return json.dumps({"ok": True, "path": todo_path.relative_to(self.workspace_root).as_posix(), "todos": normalized}, ensure_ascii=False)
+            last_todo_payload = normalized_json
+            return json.dumps({
+                "ok": True, "call_count": todo_write_count,
+                "path": todo_path.relative_to(self.workspace_root).as_posix(),
+                "todos": normalized,
+                "next_action": "call python_execute after the source is complete",
+            }, ensure_ascii=False)
 
         @tool("read_todos")
         def read_todos() -> str:
