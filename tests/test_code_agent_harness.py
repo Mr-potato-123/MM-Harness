@@ -36,15 +36,17 @@ class CodeAgentHarnessContractTest(unittest.TestCase):
             self.assertTrue(accepted["ok"])
             self.assertTrue(accepted["complete"])
 
-    def test_python_validation_timeout_is_bounded(self) -> None:
+    def test_python_validation_accepts_agent_selected_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             tool = self._provider(root)._python_execute_tool(
                 ".m2harness-code/q1/iteration-1/solve_q1.py"
             )
-            rejected = json.loads(tool.invoke({"code": "print(1)", "timeout_seconds": 181}))
+            accepted = json.loads(tool.invoke({"code": "print(1)", "timeout_seconds": 181}))
+            self.assertTrue(accepted["ok"])
+            rejected = json.loads(tool.invoke({"code": "print(1)", "timeout_seconds": 0}))
             self.assertFalse(rejected["ok"])
-            self.assertIn("1..180", rejected["error"])
+            self.assertIn("正整数", rejected["error"])
 
     def test_forced_handoff_freezes_source_tools_after_validation_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

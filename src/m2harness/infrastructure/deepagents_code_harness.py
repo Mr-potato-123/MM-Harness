@@ -43,8 +43,9 @@ class CodeAgentHandoff(BaseModel):
     source_path: str = Field(min_length=1, max_length=1_000)
     logical_name: str = Field(pattern=r"^[A-Za-z0-9._-]+\.py$", max_length=200)
     # No default wall-clock limit is part of the Code→Model report contract.
-    # An explicit value is accepted only as an operator emergency stop.
-    timeout_seconds: int | None = Field(default=None, ge=1, le=86_400)
+    # An explicit value is a per-execution budget chosen by the Code Agent;
+    # there is no global Code Agent wall-clock or step limit.
+    timeout_seconds: int | None = Field(default=None, ge=1)
     # JSON structured-output providers emit arrays, not Python tuples.  Keep
     # the wire contract JSON-native here and normalize to a tuple at the
     # domain boundary in ``propose``.  ``strict=True`` is intentional for the
@@ -154,15 +155,15 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             "只能通过文件工具访问已授权路径；授权路径是逐项清单，不等于整个工作区。禁止网络、密钥、主 Harness 数据库和后续题目。\n"
             "源代码必须写入交接中指定的 target_source_path，验证输出只能写入同一 iteration 目录的 outputs 子目录。\n"
             "交接信息已经包含建模契约和必要路径，不要循环读取报告清单。第一步直接调用 write_code_source 写入完整源代码（尽量不超过 350 行）；若工具返回 complete=false，必须用 append=true 继续写后续源码块，直到 complete=true，再调用 python_execute 验证。必要时用 read_file 读取一次源文件，不要在写源代码前连续调用 ls/read_file。"
-            "write_todos 只在初始化或状态真正变化时调用；相同清单不要重复写入。python_execute 超时或重写源码后，禁止再次调用 write_todos，直接运行 python_execute；若工具返回 next_action，严格按其下一步执行。"
-            "完成后必须使用结构化输出字段 source_path、logical_name、expected_validations；不要把源代码放进最终回答。默认不设置执行时限。"
+            "write_todos 只在初始化或状态真正变化时调用；相同清单不要重复写入。默认不设置单次执行时限；Code Agent 可根据时间感知主动为 python_execute 传入 timeout_seconds，让该次工具调用停止并返回反馈。工具返回 next_action 时严格按其下一步执行。"
+            "完成后必须使用结构化输出字段 source_path、logical_name、expected_validations；不要把源代码放进最终回答。Code Agent 本身不设总时长或步数上限。"
         )
         system_prompt += (
             "\n\nM2Harness 运行约束：本 Code Agent 只可使用 write_todos、write_code_source 和 python_execute。"
             "不要调用 ls、read_file、write_file、edit_file、glob、grep、execute 或 delete；这些文件工具已被运行时移除。"
             "Model→Code 交接契约已经完整放在本次用户消息中，不需要再次读取文件。只能生成一个目标 Python 文件，禁止创建辅助源码文件。"
             "python_execute 的当前工作目录就是目标源码所在的 iteration 目录；使用相对路径检查该文件和 outputs，不要把 Windows 绝对路径传给任何工具。"
-            "源码写入后持续执行必要的语法/运行验证；若失败，依据探针和实际报告修复后再运行，不设置固定次数或墙钟时限。"
+            "源码写入后持续执行必要的语法/运行验证；若失败，依据探针和实际报告修复后再运行，不设置固定次数或 Code Agent 墙钟时限。若某次运行预计过久，可由你自主传入 timeout_seconds 作为该次工具预算。"
             "如果任何工具结果包含 forced_stop=true 或 next_action 要求返回 CodeAgentHandoff，必须立刻返回结构化交接，绝对不能再次调用 write_code_source、python_execute、Todo 或其他工具。"
             "python_execute 只负责可观测执行；Windows 没有 signal.SIGALRM，验证代码禁止自行安装 SIGALRM 或假设 solve_dp 等不存在的函数。验证源码时只运行 import runpy; runpy.run_path('solve_q1.py', run_name='__main__')，并读取其 stdout Markdown。"
             "资源补给不得对三种资源做无界三重数量枚举；必须使用候选边界、需求驱动枚举或支配剪枝，并在探针显示资源异常或操作员显式停止后改变算法复杂度。"
@@ -390,8 +391,8 @@ class DeepAgentsCodeProposalProvider(CodeProposalProvider):
             """在本地受控沙箱中执行一段 Python 验证代码；不得联网或运行 shell。"""
             if not isinstance(code, str) or not code.strip():
                 return json.dumps({"ok": False, "error": "code must be non-empty"}, ensure_ascii=False)
-            if timeout_seconds is not None and (not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool) or not 1 <= timeout_seconds <= 180):
-                return json.dumps({"ok": False, "error": "显式紧急停止值必须为 1..180；默认省略 timeout_seconds"}, ensure_ascii=False)
+            if timeout_seconds is not None and (not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool) or timeout_seconds < 1):
+                return json.dumps({"ok": False, "error": "timeout_seconds 必须是正整数；默认省略表示不设单次时限"}, ensure_ascii=False)
             nonlocal call_count
             nonlocal last_source_hash, rewrite_required
             call_count += 1
