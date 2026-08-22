@@ -319,6 +319,28 @@ class SolveProblemHarnessTest(unittest.TestCase):
             self.assertIn("code_to_review_handoff", names)
             self.assertIn("review_to_next_stage_handoff", names)
 
+    def test_probe_records_model_failure_reason(self) -> None:
+        class FailingModel(FakeModelAgent):
+            def explore(self, task, context, *, branch_count, iteration):
+                raise RuntimeError("provider returned 401")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_id = uuid4()
+            store = RunReportStore(root)
+            with self.assertRaises(RuntimeError):
+                SolveProblemService(
+                    FailingModel(), FakeCodeHarness(), max_iterations=1,
+                    archive_writer=store, probe_writer=store,
+                ).solve(
+                    SolveProblemTask(task_id="q1", title="Q", problem="P"),
+                    SolveProblemContext(metadata={"run_id": str(run_id)}),
+                )
+            events = [json.loads(line) for line in (root / "reports" / "runs" / str(run_id) / "probe.ndjson").read_text(encoding="utf-8").splitlines()]
+            failed = [item for item in events if item["event"] == "model_explore_failed"]
+            self.assertEqual(len(failed), 1)
+            self.assertIn("401", failed[0]["details"]["error"])
+
     def test_solve_loop_discloses_requested_file_then_reexplores(self) -> None:
         class RequestingModel(FakeModelAgent):
             def __init__(self):
